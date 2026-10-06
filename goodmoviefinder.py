@@ -700,6 +700,423 @@ def _markdown_table_section(title: str, movies: list[Movie]) -> list[str]:
     return lines
 
 
+def _rating_class(rating: float | None) -> str:
+    if rating is None:
+        return "rating-none"
+    if rating >= 4.2:
+        return "rating-excellent"
+    if rating >= 3.8:
+        return "rating-great"
+    if rating >= 3.4:
+        return "rating-good"
+    if rating >= 3.0:
+        return "rating-ok"
+    return "rating-low"
+
+
+def _format_html_movie_row(m: Movie, row_class: str = "") -> str:
+    rating_text = f"{m.rating:.2f}" if m.rating is not None else "—"
+    rating_cls = _rating_class(m.rating)
+    title = html.escape(m.title)
+    if m.note:
+        note_esc = html.escape(m.note)
+        title += f' <span class="note" title="{note_esc}">⚠</span>'
+    directors = html.escape(_format_directors(m))
+    genres = _format_genres(m)
+    genre_html = " ".join(
+        f'<span class="genre">{html.escape(g.strip())}</span>'
+        for g in genres.split(", ")
+        if g.strip() and g != "—"
+    )
+    if not genre_html:
+        genre_html = '<span class="muted">—</span>'
+    year = html.escape(_format_year(m))
+    if m.letterboxd_url:
+        lb_label = html.escape(m.letterboxd_title or m.title)
+        lb_cell = (
+            f'<a class="link-lb" href="{html.escape(m.letterboxd_url)}">'
+            f"{lb_label}</a>"
+        )
+    else:
+        lb_cell = '<span class="muted">—</span>'
+    ns_url = html.escape(nonstop_display_url(m.nonstop_url))
+    ns_cell = f'<a class="link-ns" href="{ns_url}">Showtimes</a>'
+    extra = f' class="{row_class}"' if row_class else ""
+    search_blob = html.escape(
+        f"{m.title} {_format_directors(m)} {genres} {m.year or ''}".lower()
+    )
+    return (
+        f'<tr data-movie-row{extra} data-search="{search_blob}">'
+        f'<td class="col-rating"><span class="rating-badge {rating_cls}">'
+        f"{rating_text}</span></td>"
+        f"<td class=\"col-year\">{year}</td>"
+        f"<td class=\"col-director\">{directors}</td>"
+        f"<td class=\"col-genres\">{genre_html}</td>"
+        f"<td class=\"col-title\"><strong>{title}</strong></td>"
+        f"<td class=\"col-links\">{lb_cell}</td>"
+        f"<td class=\"col-links\">{ns_cell}</td>"
+        f"</tr>"
+    )
+
+
+def _html_table_section(
+    section_id: str,
+    title: str,
+    subtitle: str,
+    movies: list[Movie],
+    row_class: str = "",
+) -> str:
+    if not movies:
+        return ""
+    rows = "\n".join(_format_html_movie_row(m, row_class) for m in movies)
+    count = len(movies)
+    return f"""
+<section class="program-section" id="{section_id}">
+  <div class="section-head">
+    <h2>{html.escape(title)}</h2>
+    <p class="section-sub">{html.escape(subtitle)}</p>
+    <span class="section-count">{count} film{"s" if count != 1 else ""}</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Rating</th>
+          <th>Year</th>
+          <th>Director</th>
+          <th>Genres</th>
+          <th>Film</th>
+          <th>Letterboxd</th>
+          <th>Nonstop</th>
+        </tr>
+      </thead>
+      <tbody>
+{rows}
+      </tbody>
+    </table>
+  </div>
+</section>"""
+
+
+def _average_rating(movies: list[Movie]) -> float | None:
+    rated = [m.rating for m in movies if m.rating is not None]
+    if not rated:
+        return None
+    return sum(rated) / len(rated)
+
+
+def format_html(
+    watchlist: list[Movie],
+    watched: list[Movie],
+    program: list[Movie],
+) -> str:
+    all_movies = watchlist + watched + program
+    total = len(all_movies)
+    rated_count = sum(1 for m in all_movies if m.rating is not None)
+    avg = _average_rating(all_movies)
+    avg_display = f"{avg:.2f}" if avg is not None else "—"
+
+    sections = []
+    if watchlist:
+        sections.append(
+            _html_table_section(
+                "watchlist",
+                "Watchlist",
+                "On your Letterboxd watchlist and playing at Nonstop Wien",
+                watchlist,
+                row_class="row-watchlist",
+            )
+        )
+    if watched:
+        sections.append(
+            _html_table_section(
+                "watched",
+                "Already watched",
+                "You've seen these — they're back on the program",
+                watched,
+                row_class="row-watched",
+            )
+        )
+    sections.append(
+        _html_table_section(
+            "program",
+            "Full program",
+            "Nonstop Kino Wien — sorted by Letterboxd community rating",
+            program,
+        )
+    )
+    sections_html = "\n".join(sections)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nonstop Kino — Letterboxd rankings</title>
+  <style>
+    :root {{
+      --bg: #0f0f12;
+      --surface: #1a1a22;
+      --surface2: #24242e;
+      --border: #333342;
+      --text: #e8e6e3;
+      --muted: #9a9590;
+      --accent: #e8b84a;
+      --lb: #40bcf4;
+      --ns: #c45c4a;
+      --excellent: #3d9a6e;
+      --great: #6aab4a;
+      --good: #a8b84a;
+      --ok: #c9a227;
+      --low: #c45c4a;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }}
+    .hero {{
+      background: linear-gradient(135deg, #1a1520 0%, #0f1418 50%, #12101a 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 2rem 1.5rem 1.75rem;
+    }}
+    .hero-inner {{ max-width: 1200px; margin: 0 auto; }}
+    h1 {{
+      margin: 0 0 0.35rem;
+      font-size: 1.75rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }}
+    .hero p.tagline {{
+      margin: 0 0 1.25rem;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }}
+    .stats {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }}
+    .stat {{
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.65rem 1rem;
+      min-width: 7rem;
+    }}
+    .stat-value {{
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: var(--accent);
+    }}
+    .stat-label {{
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }}
+    .toolbar {{
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 1rem 1.5rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      background: rgba(15, 15, 18, 0.92);
+      backdrop-filter: blur(8px);
+      z-index: 10;
+      border-bottom: 1px solid var(--border);
+    }}
+    #search {{
+      flex: 1;
+      min-width: 200px;
+      padding: 0.55rem 0.85rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.95rem;
+    }}
+    #search:focus {{
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }}
+    .nav-pills {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+    }}
+    .nav-pills a {{
+      font-size: 0.8rem;
+      padding: 0.35rem 0.65rem;
+      border-radius: 6px;
+      background: var(--surface2);
+      color: var(--text);
+      text-decoration: none;
+      border: 1px solid var(--border);
+    }}
+    .nav-pills a:hover {{ border-color: var(--accent); color: var(--accent); }}
+    main {{ max-width: 1200px; margin: 0 auto; padding: 0 1.5rem 3rem; }}
+    .program-section {{ margin-top: 2rem; }}
+    .section-head {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 0.5rem 1rem;
+      margin-bottom: 0.75rem;
+    }}
+    .section-head h2 {{
+      margin: 0;
+      font-size: 1.25rem;
+      font-weight: 600;
+    }}
+    .section-sub {{
+      margin: 0;
+      flex: 1;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }}
+    .section-count {{
+      font-size: 0.75rem;
+      padding: 0.2rem 0.5rem;
+      background: var(--surface2);
+      border-radius: 4px;
+      color: var(--muted);
+    }}
+    .table-wrap {{
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }}
+    th {{
+      text-align: left;
+      padding: 0.65rem 0.75rem;
+      background: var(--surface2);
+      color: var(--muted);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }}
+    th:first-child {{ text-align: center; }}
+    td {{
+      padding: 0.55rem 0.75rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }}
+    tr:last-child td {{ border-bottom: none; }}
+    tr:hover td {{ background: rgba(255,255,255,0.03); }}
+    tr.row-watchlist td {{ border-left: 3px solid var(--lb); }}
+    tr.row-watched td {{ border-left: 3px solid var(--accent); }}
+    .col-rating {{ text-align: center; width: 4.5rem; }}
+    .col-year {{ width: 4rem; color: var(--muted); }}
+    .col-director {{ max-width: 11rem; }}
+    .col-genres {{ max-width: 14rem; }}
+    .col-title {{ min-width: 12rem; }}
+    .rating-badge {{
+      display: inline-block;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      padding: 0.15rem 0.45rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+    }}
+    .rating-excellent {{ background: rgba(61,154,110,0.25); color: #6fd4a8; }}
+    .rating-great {{ background: rgba(106,171,74,0.22); color: #9fd86a; }}
+    .rating-good {{ background: rgba(168,184,74,0.2); color: #d4de7a; }}
+    .rating-ok {{ background: rgba(201,162,39,0.2); color: #e8c85a; }}
+    .rating-low {{ background: rgba(196,92,74,0.22); color: #e88a7a; }}
+    .rating-none {{ background: var(--surface2); color: var(--muted); }}
+    .genre {{
+      display: inline-block;
+      font-size: 0.72rem;
+      padding: 0.12rem 0.4rem;
+      margin: 0.1rem 0.15rem 0.1rem 0;
+      background: var(--surface2);
+      border-radius: 4px;
+      color: var(--muted);
+    }}
+    .muted {{ color: var(--muted); }}
+    .note {{ color: var(--ok); cursor: help; }}
+    a.link-lb {{ color: var(--lb); text-decoration: none; }}
+    a.link-lb:hover {{ text-decoration: underline; }}
+    a.link-ns {{
+      color: var(--ns);
+      text-decoration: none;
+      font-size: 0.82rem;
+      font-weight: 500;
+    }}
+    a.link-ns:hover {{ text-decoration: underline; }}
+    .empty-hint {{
+      color: var(--muted);
+      font-size: 0.85rem;
+      padding: 1rem 0;
+    }}
+    footer {{
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 1.5rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+      border-top: 1px solid var(--border);
+    }}
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <h1>Nonstop Kino × Letterboxd</h1>
+      <p class="tagline">Wien program ranked by community ratings — find what to see next.</p>
+      <div class="stats">
+        <div class="stat"><div class="stat-value">{total}</div><div class="stat-label">In program</div></div>
+        <div class="stat"><div class="stat-value">{rated_count}</div><div class="stat-label">With rating</div></div>
+        <div class="stat"><div class="stat-value">{avg_display}</div><div class="stat-label">Avg rating</div></div>
+        <div class="stat"><div class="stat-value">{len(watchlist)}</div><div class="stat-label">Watchlist</div></div>
+        <div class="stat"><div class="stat-value">{len(watched)}</div><div class="stat-label">Watched</div></div>
+      </div>
+    </div>
+  </header>
+  <div class="toolbar">
+    <input type="search" id="search" placeholder="Filter by title, director, genre…" autocomplete="off">
+    <nav class="nav-pills">
+      {"<a href=\"#watchlist\">Watchlist</a>" if watchlist else ""}
+      {"<a href=\"#watched\">Watched</a>" if watched else ""}
+      <a href="#program">Program</a>
+    </nav>
+  </div>
+  <main>
+{sections_html}
+  </main>
+  <footer>
+    Generated by goodmoviefinder. Ratings from Letterboxd; showtimes from Nonstop Kino Wien.
+  </footer>
+  <script>
+    const search = document.getElementById("search");
+    search.addEventListener("input", () => {{
+      const q = search.value.trim().toLowerCase();
+      document.querySelectorAll("[data-movie-row]").forEach((row) => {{
+        const blob = row.getAttribute("data-search") || "";
+        row.hidden = q.length > 0 && !blob.includes(q);
+      }});
+    }});
+  </script>
+</body>
+</html>"""
+
+
 def format_markdown(
     watchlist: list[Movie],
     watched: list[Movie],
@@ -791,7 +1208,12 @@ def main() -> int:
     parser.add_argument(
         "--markdown",
         action="store_true",
-        help="Print Markdown table instead of plain text",
+        help="Output Markdown tables",
+    )
+    parser.add_argument(
+        "--html",
+        action="store_true",
+        help="Output a styled HTML page (also used when -o ends with .html)",
     )
     parser.add_argument(
         "-o",
@@ -916,11 +1338,21 @@ def main() -> int:
         watchlist_movies = []
         watched_movies = []
 
-    output = (
-        format_markdown(watchlist_movies, watched_movies, program_movies)
-        if args.markdown
-        else format_plain(watchlist_movies, watched_movies, program_movies)
+    use_html = args.html or (
+        args.output is not None and args.output.suffix.lower() == ".html"
     )
+    use_markdown = args.markdown or (
+        args.output is not None and args.output.suffix.lower() in {".md", ".markdown"}
+    )
+    if use_html and use_markdown:
+        print("Use only one of --html and --markdown.", file=sys.stderr)
+        return 2
+    if use_html:
+        output = format_html(watchlist_movies, watched_movies, program_movies)
+    elif use_markdown:
+        output = format_markdown(watchlist_movies, watched_movies, program_movies)
+    else:
+        output = format_plain(watchlist_movies, watched_movies, program_movies)
 
     if args.output:
         args.output.write_text(output, encoding="utf-8")

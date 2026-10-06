@@ -15,10 +15,10 @@ python3 goodmoviefinder.py
 Common options:
 
 ```bash
-# Markdown table with links
-python3 goodmoviefinder.py --markdown
+# Styled HTML page (search, stats, color-coded ratings)
+python3 goodmoviefinder.py --html -o program-ranked.html
 
-# Save to a file
+# Markdown table with links
 python3 goodmoviefinder.py --markdown -o program-ranked.md
 
 # Try only a few films first (faster)
