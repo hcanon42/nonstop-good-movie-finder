@@ -16,7 +16,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +27,7 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 NONSTOP_LINK_QUERY = "weekday=all&time=all&location=wien"
 DEFAULT_LETTERBOXD_USER = "hcanon"
 PROFILE_CACHE_MAX_AGE = 6 * 60 * 60  # seconds
@@ -138,6 +138,8 @@ class Movie:
     letterboxd_title: str | None = None
     rating: float | None = None
     year: int | None = None
+    directors: list[str] = field(default_factory=list)
+    genres: list[str] = field(default_factory=list)
     note: str | None = None
 
 
@@ -305,11 +307,13 @@ def parse_program(html_text: str) -> list[tuple[str, str]]:
     return movies
 
 
-def parse_nonstop_movie_page(html_text: str) -> tuple[str | None, int | None]:
+def parse_nonstop_movie_page(
+    html_text: str,
+) -> tuple[str | None, int | None, str | None]:
     h1 = re.search(r"<h1>\s*(.*?)\s*</h1>", html_text, re.IGNORECASE | re.DOTALL)
     title = None
     if h1:
-        title = re.sub(r"\s+", " ", html.unescape(h1.group(1))).strip()
+        title = normalize_title_chars(re.sub(r"\s+", " ", h1.group(1)).strip())
 
     year_match = re.search(
         r'class="releaseYear".*?class="value">\s*(\d{4})\s*<',
@@ -317,13 +321,29 @@ def parse_nonstop_movie_page(html_text: str) -> tuple[str | None, int | None]:
         re.IGNORECASE | re.DOTALL,
     )
     year = int(year_match.group(1)) if year_match else None
-    return title, year
+
+    director_match = re.search(
+        r'class="director".*?class="value">\s*(.*?)\s*<',
+        html_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    director = None
+    if director_match:
+        director = normalize_title_chars(
+            re.sub(r"\s+", " ", html.unescape(director_match.group(1))).strip()
+        )
+
+    return title, year, director
 
 
-def parse_letterboxd_film(html_text: str) -> tuple[str | None, int | None, float | None]:
+def parse_letterboxd_film(
+    html_text: str,
+) -> tuple[str | None, int | None, float | None, list[str], list[str]]:
     name = None
     year = None
     rating = None
+    genres: list[str] = []
+    directors: list[str] = []
 
     name_match = re.search(r'"name":"([^"]+)","genre"', html_text)
     if name_match:
@@ -332,6 +352,20 @@ def parse_letterboxd_film(html_text: str) -> tuple[str | None, int | None, float
     year_match = re.search(r'"dateCreated":"(\d{4})', html_text)
     if year_match:
         year = int(year_match.group(1))
+
+    director_block = re.search(
+        r'"director":\s*(\[.*?\])\s*,\s*"description"',
+        html_text,
+    )
+    if director_block:
+        directors = [
+            html.unescape(n)
+            for n in re.findall(r'"name":"([^"]+)"', director_block.group(1))
+        ]
+
+    genre_block = re.search(r'"genre":(\[[^\]]+\])', html_text)
+    if genre_block:
+        genres = [html.unescape(g) for g in re.findall(r'"([^"]+)"', genre_block.group(1))]
 
     rating_match = re.search(
         r'"aggregateRating":\{[^}]*"ratingValue":([0-9.]+)',
@@ -347,7 +381,38 @@ def parse_letterboxd_film(html_text: str) -> tuple[str | None, int | None, float
         if twitter:
             rating = float(twitter.group(1))
 
-    return name, year, rating
+    return name, year, rating, genres, directors
+
+
+def apply_nonstop_metadata(
+    movie: Movie,
+    release_year: int | None,
+    nonstop_director: str | None,
+) -> None:
+    if release_year is not None and movie.year is None:
+        movie.year = release_year
+    if nonstop_director and not movie.directors:
+        movie.directors = [nonstop_director]
+
+
+def apply_letterboxd_candidate(
+    movie: Movie,
+    url: str,
+    lb_title: str | None,
+    lb_year: int | None,
+    rating: float | None,
+    genres: list[str],
+    directors: list[str],
+) -> None:
+    movie.letterboxd_url = url
+    movie.letterboxd_title = lb_title
+    if lb_year is not None:
+        movie.year = lb_year
+    movie.rating = rating
+    if genres:
+        movie.genres = genres
+    if directors:
+        movie.directors = directors
 
 
 def letterboxd_slug_candidates(
@@ -380,10 +445,20 @@ def letterboxd_slug_candidates(
     return ordered
 
 
+LetterboxdCandidate = tuple[
+    str,
+    str | None,
+    int | None,
+    float | None,
+    list[str],
+    list[str],
+]
+
+
 def _letterboxd_fetch_candidate(
     slug: str,
     delay: float,
-) -> tuple[tuple[str, str | None, int | None, float | None] | None, str | None]:
+) -> tuple[LetterboxdCandidate | None, str | None]:
     """Fetch a film page by slug. Returns (candidate, fatal_error_note)."""
     url = f"https://letterboxd.com/film/{slug}/"
     try:
@@ -398,8 +473,15 @@ def _letterboxd_fetch_candidate(
     if status != 200 or "/film/" not in final_url:
         return None, None
 
-    lb_title, lb_year, rating = parse_letterboxd_film(body)
-    candidate = (final_url.rstrip("/") + "/", lb_title, lb_year, rating)
+    lb_title, lb_year, rating, genres, directors = parse_letterboxd_film(body)
+    candidate = (
+        final_url.rstrip("/") + "/",
+        lb_title,
+        lb_year,
+        rating,
+        genres,
+        directors,
+    )
     time.sleep(delay)
     return candidate, None
 
@@ -412,7 +494,7 @@ def resolve_letterboxd(
     delay: float,
 ) -> Movie:
     movie = Movie(title=display_title, nonstop_url=nonstop_url, year=release_year)
-    candidates: list[tuple[str, str | None, int | None, float | None]] = []
+    candidates: list[LetterboxdCandidate] = []
     tried_slugs: set[str] = set()
 
     def consider_slug(slug: str) -> bool:
@@ -426,19 +508,17 @@ def resolve_letterboxd(
         if candidate is None:
             return False
         candidates.append(candidate)
-        lb_title, lb_year, rating = candidate[1], candidate[2], candidate[3]
+        url, lb_title, lb_year, rating, genres, directors = candidate
         year_ok = release_year is None or lb_year == release_year
         if year_ok and rating is not None:
-            movie.letterboxd_url = candidate[0]
-            movie.letterboxd_title = lb_title
-            movie.year = lb_year
-            movie.rating = rating
+            apply_letterboxd_candidate(
+                movie, url, lb_title, lb_year, rating, genres, directors
+            )
             return True
         if year_ok and movie.letterboxd_url is None:
-            movie.letterboxd_url = candidate[0]
-            movie.letterboxd_title = lb_title
-            movie.year = lb_year
-            movie.rating = rating
+            apply_letterboxd_candidate(
+                movie, url, lb_title, lb_year, rating, genres, directors
+            )
         return False
 
     for slug in letterboxd_slug_candidates(
@@ -462,16 +542,14 @@ def resolve_letterboxd(
         return movie
 
     if movie.letterboxd_url is None:
-        def score(
-            item: tuple[str, str | None, int | None, float | None],
-        ) -> tuple[int, int, int]:
-            _, _, lb_year, rating = item
+        def score(item: LetterboxdCandidate) -> tuple[int, int, int]:
+            _, _, lb_year, rating, _, _ = item
             year_match = 1 if release_year and lb_year == release_year else 0
             has_rating = 1 if rating is not None else 0
             return (year_match, has_rating, lb_year or 0)
 
         best = max(candidates, key=score)
-        movie.letterboxd_url, movie.letterboxd_title, movie.year, movie.rating = best
+        apply_letterboxd_candidate(movie, *best)
 
     if release_year and movie.year and movie.year != release_year:
         movie.note = f"Year mismatch (Nonstop {release_year}, Letterboxd {movie.year})"
@@ -506,6 +584,8 @@ def cache_get(cache: dict[str, Any], nonstop_url: str) -> Movie | None:
         letterboxd_title=entry.get("letterboxd_title"),
         rating=entry.get("rating"),
         year=entry.get("year"),
+        directors=entry.get("directors") or [],
+        genres=entry.get("genres") or [],
         note=entry.get("note"),
     )
 
@@ -517,6 +597,8 @@ def cache_put(cache: dict[str, Any], movie: Movie) -> None:
         "letterboxd_title": movie.letterboxd_title,
         "rating": movie.rating,
         "year": movie.year,
+        "directors": movie.directors,
+        "genres": movie.genres,
         "note": movie.note,
     }
 
@@ -534,20 +616,38 @@ def partition_program_movies(
     movies: list[Movie],
     watched_slugs: set[str],
     watchlist_slugs: set[str],
-) -> tuple[list[Movie], list[Movie]]:
+) -> tuple[list[Movie], list[Movie], list[Movie]]:
     watchlist: list[Movie] = []
+    watched: list[Movie] = []
     program: list[Movie] = []
 
     for movie in movies:
         slug = letterboxd_slug_from_url(movie.letterboxd_url)
         if slug and slug in watched_slugs:
+            watched.append(movie)
             continue
         if slug and slug in watchlist_slugs:
             watchlist.append(movie)
             continue
         program.append(movie)
 
-    return sort_movies(watchlist), sort_movies(program)
+    return (
+        sort_movies(watchlist),
+        sort_movies(watched),
+        sort_movies(program),
+    )
+
+
+def _format_year(m: Movie) -> str:
+    return str(m.year) if m.year is not None else "—"
+
+
+def _format_directors(m: Movie) -> str:
+    return ", ".join(m.directors) if m.directors else "—"
+
+
+def _format_genres(m: Movie) -> str:
+    return ", ".join(m.genres) if m.genres else "—"
 
 
 def _format_markdown_row(m: Movie) -> str:
@@ -560,7 +660,10 @@ def _format_markdown_row(m: Movie) -> str:
     title = m.title
     if m.note:
         title += f" ({m.note})"
-    return f"| {rating} | {title} | {lb} | {ns} |"
+    return (
+        f"| {rating} | {_format_year(m)} | {_format_directors(m)} | "
+        f"{_format_genres(m)} | {title} | {lb} | {ns} |"
+    )
 
 
 def _format_plain_movie(m: Movie) -> list[str]:
@@ -571,6 +674,10 @@ def _format_plain_movie(m: Movie) -> list[str]:
     else:
         rating = "no match"
     lines = [f"{rating:>8}  {m.title}"]
+    lines.append(
+        f"          Year: {_format_year(m)} | Director: {_format_directors(m)} | "
+        f"Genres: {_format_genres(m)}"
+    )
     if m.letterboxd_url:
         lines.append(f"          Letterboxd: {m.letterboxd_url}")
     if m.note:
@@ -580,37 +687,53 @@ def _format_plain_movie(m: Movie) -> list[str]:
     return lines
 
 
-def format_markdown(watchlist: list[Movie], program: list[Movie]) -> str:
-    lines: list[str] = []
-
-    if watchlist:
-        lines.extend(
-            [
-                "# Watchlist — now in Nonstop program",
-                "",
-                "| Rating | Film | Letterboxd | Nonstop |",
-                "| ---: | --- | --- | --- |",
-            ]
-        )
-        for m in watchlist:
-            lines.append(_format_markdown_row(m))
-        lines.append("")
-
-    lines.extend(
-        [
-            "# Nonstop Kino program — sorted by Letterboxd rating (unseen)",
-            "",
-            "| Rating | Film | Letterboxd | Nonstop |",
-            "| ---: | --- | --- | --- |",
-        ]
-    )
-    for m in program:
+def _markdown_table_section(title: str, movies: list[Movie]) -> list[str]:
+    lines = [
+        title,
+        "",
+        "| Rating | Year | Director | Genres | Film | Letterboxd | Nonstop |",
+        "| ---: | --- | --- | --- | --- | --- | --- |",
+    ]
+    for m in movies:
         lines.append(_format_markdown_row(m))
     lines.append("")
+    return lines
+
+
+def format_markdown(
+    watchlist: list[Movie],
+    watched: list[Movie],
+    program: list[Movie],
+) -> str:
+    lines: list[str] = []
+    if watchlist:
+        lines.extend(
+            _markdown_table_section(
+                "# Watchlist — now in Nonstop program",
+                watchlist,
+            )
+        )
+    if watched:
+        lines.extend(
+            _markdown_table_section(
+                "# Already watched — also in program",
+                watched,
+            )
+        )
+    lines.extend(
+        _markdown_table_section(
+            "# Nonstop Kino program — sorted by Letterboxd rating",
+            program,
+        )
+    )
     return "\n".join(lines)
 
 
-def format_plain(watchlist: list[Movie], program: list[Movie]) -> str:
+def format_plain(
+    watchlist: list[Movie],
+    watched: list[Movie],
+    program: list[Movie],
+) -> str:
     lines: list[str] = []
     if watchlist:
         lines.append("=== Watchlist — now in Nonstop program ===")
@@ -619,7 +742,14 @@ def format_plain(watchlist: list[Movie], program: list[Movie]) -> str:
             lines.extend(_format_plain_movie(m))
         lines.append("")
 
-    lines.append("=== Program (unseen) ===")
+    if watched:
+        lines.append("=== Already watched — also in program ===")
+        lines.append("")
+        for m in watched:
+            lines.extend(_format_plain_movie(m))
+        lines.append("")
+
+    lines.append("=== Program ===")
     lines.append("")
     for m in program:
         lines.extend(_format_plain_movie(m))
@@ -751,9 +881,12 @@ def main() -> int:
 
         page_title: str | None = None
         release_year: int | None = None
+        nonstop_director: str | None = None
         try:
             movie_html = fetch(nonstop_url)
-            page_title, release_year = parse_nonstop_movie_page(movie_html)
+            page_title, release_year, nonstop_director = parse_nonstop_movie_page(
+                movie_html
+            )
         except urllib.error.URLError as exc:
             movie = Movie(
                 title=title,
@@ -770,21 +903,23 @@ def main() -> int:
             release_year,
             delay=args.delay,
         )
+        apply_nonstop_metadata(movie, release_year, nonstop_director)
         cache_put(cache, movie)
         save_cache(args.cache, cache)
         results.append(movie)
 
-    watchlist_movies, program_movies = partition_program_movies(
+    watchlist_movies, watched_movies, program_movies = partition_program_movies(
         results, watched_slugs, watchlist_slugs
     )
     if args.no_letterboxd_profile:
         program_movies = sort_movies(results)
         watchlist_movies = []
+        watched_movies = []
 
     output = (
-        format_markdown(watchlist_movies, program_movies)
+        format_markdown(watchlist_movies, watched_movies, program_movies)
         if args.markdown
-        else format_plain(watchlist_movies, program_movies)
+        else format_plain(watchlist_movies, watched_movies, program_movies)
     )
 
     if args.output:
@@ -794,11 +929,10 @@ def main() -> int:
         print(output)
 
     rated = sum(1 for m in results if m.rating is not None)
-    skipped = len(results) - len(watchlist_movies) - len(program_movies)
     print(
-        f"Done: {len(program_movies)} unseen in program, "
-        f"{len(watchlist_movies)} watchlist matches, "
-        f"{skipped} already watched skipped, "
+        f"Done: {len(program_movies)} in main program, "
+        f"{len(watchlist_movies)} watchlist, "
+        f"{len(watched_movies)} already watched, "
         f"{rated}/{len(results)} with Letterboxd ratings.",
         file=sys.stderr,
     )

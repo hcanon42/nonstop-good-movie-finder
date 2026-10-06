@@ -30,7 +30,7 @@ python3 goodmoviefinder.py --program-url 'https://nonstopkino.at/en/program/?wee
 
 Results are cached in `~/.cache/goodmoviefinder/ratings.json` so re-runs are much quicker. Use `--no-cache` to refresh Letterboxd data.
 
-By default, films you have already logged on Letterboxd ([@hcanon’s films](https://letterboxd.com/hcanon/films/)) are omitted. Any program title that matches your [watchlist](https://letterboxd.com/hcanon/watchlist/) is listed first under **Watchlist — now in Nonstop program**. Profile data is cached for six hours; use `--refresh-profile` to update it.
+By default, program titles that match your [watchlist](https://letterboxd.com/hcanon/watchlist/) are listed first under **Watchlist — now in Nonstop program**. Films you have already logged ([@hcanon’s films](https://letterboxd.com/hcanon/films/)) appear in a separate **Already watched — also in program** section. Everything else stays in the main ranked program list. Profile data is cached for six hours; use `--refresh-profile` to update it.
 
 ```bash
 # Another Letterboxd account
