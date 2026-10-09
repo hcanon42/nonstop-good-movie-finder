@@ -16,6 +16,7 @@ from goodmoviefinder.config import (
 from goodmoviefinder.models import Movie, Screening
 from goodmoviefinder.program import (
     _MONTHS,
+    LOVED_RATING,
     _format_directors,
     _format_genres,
     _format_user_rating,
@@ -325,11 +326,20 @@ def _detail_panel_html(movie: Movie, detail_id: str, known: frozenset[str]) -> s
     )
 
 
+def _because_html(movie: Movie, css_class: str = "because") -> str:
+    if not movie.because:
+        return ""
+    return (
+        f'<span class="{css_class}">{html.escape(movie.because)}</span>'
+    )
+
+
 def _movie_search_blob(movie: Movie) -> str:
     versions = " ".join(movie.versions)
+    because = movie.because or ""
     return html.escape(
         f"{film_title(movie)} {movie.title} {_format_directors(movie)} {_format_genres(movie)} "
-        f"{movie.year or ''} {format_language(movie)} {versions}".lower()
+        f"{movie.year or ''} {format_language(movie)} {versions} {because}".lower()
     )
 
 
@@ -340,6 +350,7 @@ def _shift_month(year: int, month: int, delta: int = 1) -> tuple[int, int]:
 
 def _calendar_groups(
     watchlist: list[Movie],
+    recommendations: list[Movie],
     watched: list[Movie],
     program: list[Movie],
 ) -> list[tuple[str, str, list[tuple[str, Movie]]]]:
@@ -347,6 +358,7 @@ def _calendar_groups(
     rated, unrated, unfound = split_program_groups(program)
     labeled = (
         ("watchlist", "Watchlist", watchlist),
+        ("recommendations", "Recommended", recommendations),
         ("watched", "Watched", watched),
         ("program", "Program", rated),
         ("unrated", "Unrated", unrated),
@@ -368,19 +380,29 @@ def _calendar_groups(
 
 def _calendar_by_day(
     groups: list[tuple[str, str, list[tuple[str, Movie]]]],
-) -> dict[date, list[tuple[str, str, str, Movie, list[Screening]]]]:
-    by_day: dict[date, list[tuple[str, str, str, Movie, list[Screening]]]] = {}
+) -> dict[date, list[tuple[str, str, str, Movie, list[Screening], list[str]]]]:
+    """One calendar row per film. A watchlist or recommendation title also belongs to the full program."""
+    by_day: dict[date, list[tuple[str, str, str, Movie, list[Screening], list[str]]]] = {}
+    placed: dict[date, dict[str, list[str]]] = {}
     for section_id, label, movies in groups:
         for movie_id, movie in movies:
+            key = movie.nonstop_url or movie_id
             for day, screenings in _screenings_by_day(movie.screenings).items():
+                sections = placed.setdefault(day, {}).get(key)
+                if sections is not None:
+                    if section_id not in sections:
+                        sections.append(section_id)
+                    continue
+                sections = [section_id]
+                placed[day][key] = sections
                 by_day.setdefault(day, []).append(
-                    (section_id, label, movie_id, movie, screenings)
+                    (section_id, label, movie_id, movie, screenings, sections)
                 )
     return by_day
 
 
 def _day_preview_title(
-    entries: list[tuple[str, str, str, Movie, list[Screening]]],
+    entries: list[tuple[str, str, str, Movie, list[Screening], list[str]]],
 ) -> str:
     best = entries[0]
     best_rating = best[3].rating
@@ -432,7 +454,7 @@ def _day_screening_items_html(
 
 
 def _entry_followable(
-    entry: tuple[str, str, str, Movie, list[Screening]],
+    entry: tuple[str, str, str, Movie, list[Screening], list[str]],
     known: frozenset[str],
 ) -> bool:
     movie, screenings = entry[3], entry[4]
@@ -446,6 +468,7 @@ def _day_film_html(
     movie: Movie,
     screenings: list[Screening],
     known: frozenset[str],
+    sections: list[str],
 ) -> str:
     rating_text = f"{movie.rating:.2f}" if movie.rating is not None else "—"
     title = html.escape(film_title(movie))
@@ -460,6 +483,7 @@ def _day_film_html(
         f'<article class="day-film" data-movie-id="{html.escape(movie_id, quote=True)}" '
         f'data-plan-id="{plan_id}" '
         f'data-section="{html.escape(section_id, quote=True)}" '
+        f'data-sections="{html.escape(" ".join(sections), quote=True)}" '
         f'data-primary-language="{primary}" '
         f'data-rating="{rating_attr}" data-title="{title_attr}" '
         f'data-lang-hide="{lang_hide}"{hidden} '
@@ -471,6 +495,7 @@ def _day_film_html(
         f'<span class="chip section-chip chip-{html.escape(section_id, quote=True)}">'
         f"{html.escape(label)}</span>"
         f"</div>"
+        f"{_because_html(movie, 'day-because')}"
         f"{_day_times_line_html(movie, screenings, known)}"
         f'<ul class="day-times">{_day_screening_items_html(movie, screenings, known)}</ul>'
         f'<div class="day-film-detail" hidden></div>'
@@ -480,12 +505,12 @@ def _day_film_html(
 
 def _day_panel_html(
     day: date,
-    entries: list[tuple[str, str, str, Movie, list[Screening]]],
+    entries: list[tuple[str, str, str, Movie, list[Screening], list[str]]],
     known: frozenset[str],
 ) -> str:
     films = "".join(
-        _day_film_html(section_id, label, movie_id, movie, screenings, known)
-        for section_id, label, movie_id, movie, screenings in entries
+        _day_film_html(section_id, label, movie_id, movie, screenings, known, sections)
+        for section_id, label, movie_id, movie, screenings, sections in entries
     )
     iso = day.isoformat()
     return f'<div class="month-band panel panel-inset" id="day-{iso}" hidden>{films}</div>'
@@ -493,7 +518,7 @@ def _day_panel_html(
 
 def _calendar_day_button(
     day: date,
-    entries: list[tuple[str, str, str, Movie, list[Screening]]],
+    entries: list[tuple[str, str, str, Movie, list[Screening], list[str]]],
     today: date,
     known: frozenset[str],
 ) -> str:
@@ -525,7 +550,7 @@ def _calendar_day_button(
 def _month_board_html(
     year: int,
     month: int,
-    by_day: dict[date, list[tuple[str, str, str, Movie, list[Screening]]]],
+    by_day: dict[date, list[tuple[str, str, str, Movie, list[Screening], list[str]]]],
     today: date,
     known: frozenset[str],
 ) -> str:
@@ -559,7 +584,7 @@ def _month_board_html(
 
 def _also_showing_html(
     days: list[date],
-    by_day: dict[date, list[tuple[str, str, str, Movie, list[Screening]]]],
+    by_day: dict[date, list[tuple[str, str, str, Movie, list[Screening], list[str]]]],
     known: frozenset[str],
 ) -> str:
     if not days:
@@ -603,13 +628,16 @@ def _also_showing_html(
 
 def _program_calendar_html(
     watchlist: list[Movie],
+    recommendations: list[Movie],
     watched: list[Movie],
     program: list[Movie],
     known: frozenset[str],
     today: date | None = None,
 ) -> str:
     today = today or date.today()
-    by_day = _calendar_by_day(_calendar_groups(watchlist, watched, program))
+    by_day = _calendar_by_day(
+        _calendar_groups(watchlist, recommendations, watched, program)
+    )
     current = (today.year, today.month)
     following = _shift_month(*current)
     shown = {current, following}
@@ -632,6 +660,7 @@ def _format_html_movie_row(
     row_id: str = "",
     show_user_rating: bool = False,
     language_filter: bool = False,
+    show_because: bool = True,
 ) -> str:
     rating_text = f"{m.rating:.2f}" if m.rating is not None else "—"
     title = html.escape(film_title(m))
@@ -656,6 +685,7 @@ def _format_html_movie_row(
         'title="No screenings in a version you can follow."'
         f'{" hidden" if not show_badge else ""}>no followable version</span>'
     )
+    because_html = _because_html(m) if show_because else ""
     classes = " ".join(
         part for part in (row_class, "row-no-follow" if show_badge else "") if part
     )
@@ -709,7 +739,7 @@ def _format_html_movie_row(
         f'<td class="col-title"><span class="title-line">{_plan_add_button(m)}'
         f'<button type="button" class="expand" '
         f'aria-expanded="false" aria-controls="{html.escape(detail_id, quote=True)}">'
-        f"<strong>{title}</strong> {follow_badge}</button></span></td>"
+        f"<strong>{title}</strong> {follow_badge}{because_html}</button></span></td>"
         f"<td class=\"col-director\">{directors}</td>"
         f"<td class=\"col-genres\">{genre_html}</td>"
         f"<td class=\"col-language\">{language}</td>"
@@ -745,6 +775,7 @@ def _html_table_section(
     row_class: str = "",
     show_user_rating: bool = False,
     language_filter: bool = False,
+    show_because: bool = True,
 ) -> str:
     if not movies:
         return ""
@@ -756,6 +787,7 @@ def _html_table_section(
             row_id=f"{section_id}-{index}",
             show_user_rating=show_user_rating,
             language_filter=language_filter,
+            show_because=show_because,
         )
         for index, movie in enumerate(movies)
     )
@@ -858,6 +890,7 @@ def _nav_link(section_id: str, label: str, present: bool, visible: bool) -> str:
 
 def format_html(
     watchlist: list[Movie],
+    recommendations: list[Movie],
     watched: list[Movie],
     program: list[Movie],
     *,
@@ -870,7 +903,7 @@ def format_html(
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
     found = [
         movie.primary_language
-        for movie in (*watchlist, *watched, *program)
+        for movie in (*watchlist, *recommendations, *watched, *program)
         if movie.primary_language
     ]
     choices = language_choices(found, selected)
@@ -887,6 +920,21 @@ def format_html(
                 watchlist,
                 known,
                 row_class="row-watchlist",
+            )
+        )
+    if recommendations:
+        sections.append(
+            _html_table_section(
+                "recommendations",
+                "Recommendations",
+                (
+                    "Playing at Nonstop Wien, by a director of a film "
+                    f"{user_label} rated {LOVED_RATING:.1f} or higher"
+                ),
+                recommendations,
+                known,
+                row_class="row-recommend",
+                language_filter=True,
             )
         )
     if watched:
@@ -911,6 +959,7 @@ def format_html(
                 rated,
                 known,
                 language_filter=True,
+                show_because=False,
             )
         )
     if unrated:
@@ -922,6 +971,7 @@ def format_html(
                 unrated,
                 known,
                 language_filter=True,
+                show_because=False,
             )
         )
     if unfound:
@@ -933,11 +983,16 @@ def format_html(
                 unfound,
                 known,
                 language_filter=True,
+                show_because=False,
             )
         )
     sections_html = "\n".join(sections)
-    calendar_html = _program_calendar_html(watchlist, watched, program, known)
-    catalog_json = _plan_catalog_json([*watchlist, *watched, *program])
+    calendar_html = _program_calendar_html(
+        watchlist, recommendations, watched, program, known
+    )
+    catalog_json = _plan_catalog_json(
+        [*watchlist, *recommendations, *watched, *program]
+    )
     busy_json = json.dumps(
         {"intervals": busy_intervals or []},
         ensure_ascii=False,
@@ -960,6 +1015,12 @@ def format_html(
     nav_html = "".join(
         (
             _nav_link("watchlist", "Watchlist", bool(watchlist), bool(watchlist)),
+            _nav_link(
+                "recommendations",
+                "Recommended",
+                bool(recommendations),
+                any(movie_is_watchable(movie, known) for movie in recommendations),
+            ),
             _nav_link("watched", "Watched", bool(watched), bool(watched)),
             _nav_link(
                 "program",
@@ -1010,7 +1071,7 @@ def format_html(
         <button type="button" class="view-option" data-view="plan" aria-pressed="false" title="Best schedule for films you pick">Plan<span id="plan-count" class="plan-count" hidden></span></button>
       </div>
       {settings_html}
-      <p id="plan-cap" class="plan-cap" hidden>A plan holds 8 films.</p>
+      <p id="plan-cap" class="plan-cap" hidden>A plan holds 12 films.</p>
       <div class="search-field">
         <input type="search" id="search" placeholder="Filter by title, director, genre…" autocomplete="off" aria-describedby="search-count">
         <span id="search-count" class="search-count" role="status" hidden></span>
@@ -1033,13 +1094,17 @@ def format_html(
     <div id="plan-view" hidden>
       <div class="plan-board">
         {status_html}
-        <p class="empty-hint" id="plan-empty">Add films from the list or calendar. A plan holds up to 8.</p>
+        <p class="empty-hint" id="plan-empty">Add films from the list or calendar. A plan holds up to 12.</p>
         <div class="plan-picked" id="plan-picked" hidden>
           <div class="plan-chips" id="plan-chips"></div>
           <button type="button" id="plan-clear" class="plan-clear">Clear all</button>
         </div>
         <div class="plan-options" id="plan-options" role="group" aria-label="Schedule options" hidden></div>
         <p class="plan-summary" id="plan-summary" hidden></p>
+        <p class="plan-actions" id="plan-actions" hidden>
+          <button type="button" id="plan-save" class="plan-save">Add plan to calendar</button>
+          <span id="plan-save-status" class="plan-save-status" role="status"></span>
+        </p>
         <div class="plan-calendar" id="plan-schedule" hidden></div>
         <section class="plan-left-out" id="plan-left-out" hidden>
           <h2>Not scheduled</h2>

@@ -48,7 +48,7 @@
     function visibleCount(selector) {
       const ids = new Set();
       document.querySelectorAll(selector).forEach((el) => {
-        if (!el.hidden) ids.add(el.getAttribute("data-movie-id"));
+        if (!el.hidden) ids.add(el.getAttribute("data-plan-id") || el.getAttribute("data-movie-id"));
       });
       return ids.size;
     }
@@ -74,7 +74,8 @@
       document.querySelectorAll(".day-film").forEach((film) => {
         const blob = film.getAttribute("data-search") || "";
         const langHide = film.getAttribute("data-lang-hide") === "1";
-        const sectionMiss = isCalendar() && sectionFilter && film.getAttribute("data-section") !== sectionFilter;
+        const membership = film.getAttribute("data-sections") || film.getAttribute("data-section") || "";
+        const sectionMiss = isCalendar() && sectionFilter && !membership.split(/\s+/).includes(sectionFilter);
         const hide = langHide || sectionMiss || (searching && !blob.includes(q));
         film.hidden = hide;
         if (!hide) return;
@@ -629,6 +630,65 @@
       });
     }
 
+    function profileSkeletonMarkup() {
+      const row = (
+        '<div class="skeleton-row">' +
+        '<span class="sk sk-rating"></span>' +
+        '<span class="sk sk-year"></span>' +
+        '<span class="sk sk-title"></span>' +
+        '<span class="sk sk-director"></span>' +
+        '<span class="sk sk-genres"></span>' +
+        "</div>"
+      );
+      const section = (rows) => (
+        '<section class="skeleton-section">' +
+        '<div class="skeleton-head">' +
+        '<span class="skeleton-rail"></span>' +
+        '<span class="skeleton-copy">' +
+        '<span class="sk sk-heading"></span>' +
+        '<span class="sk sk-subhead"></span>' +
+        "</span></div>" +
+        `<div class="skeleton-panel">${row.repeat(rows)}</div>` +
+        "</section>"
+      );
+      return section(7) + section(5);
+    }
+
+    function setProfileLoading(active) {
+      const main = document.querySelector("main");
+      if (!main) return;
+      let shell = document.getElementById("profile-loading");
+      if (!shell) {
+        shell = document.createElement("div");
+        shell.id = "profile-loading";
+        shell.className = "profile-loading";
+        shell.hidden = true;
+        shell.setAttribute("aria-hidden", "true");
+        shell.innerHTML = profileSkeletonMarkup();
+        main.prepend(shell);
+      }
+      shell.hidden = !active;
+      document.body.classList.toggle("is-profile-loading", active);
+      main.setAttribute("aria-busy", active ? "true" : "false");
+      const openButton = document.getElementById("settings-open");
+      if (openButton) {
+        if (active) {
+          if (!openButton.dataset.label) openButton.dataset.label = openButton.textContent;
+          openButton.textContent = "Loading…";
+          openButton.disabled = true;
+          openButton.setAttribute("aria-busy", "true");
+        } else {
+          if (openButton.dataset.label) openButton.textContent = openButton.dataset.label;
+          openButton.disabled = false;
+          openButton.removeAttribute("aria-busy");
+        }
+      }
+      if (active) {
+        setSettingsOpen(false);
+        window.scrollTo(0, 0);
+      }
+    }
+
     async function loadProfile(event) {
       event.preventDefault();
       const input = document.getElementById("letterboxd-user");
@@ -645,6 +705,8 @@
       }
       if (status) status.textContent = "Loading profile…";
       if (button) button.disabled = true;
+      setProfileLoading(true);
+      let navigating = false;
       try {
         const response = await fetch(viewerEndpoint(), {
           method: "POST",
@@ -654,17 +716,24 @@
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {
           if (status) status.textContent = payload.error || "Could not load that profile.";
+          setSettingsOpen(true);
           return;
         }
         serverReady = true;
-        if (payload.reload) window.location.reload();
-        else if (status) status.textContent = "";
+        if (payload.reload) {
+          navigating = true;
+          window.location.reload();
+        } else if (status) status.textContent = "";
       } catch (err) {
         if (status) {
           status.textContent = "Run python3 goodmoviefinder.py --serve, then load the profile again.";
         }
+        setSettingsOpen(true);
       } finally {
-        if (button) button.disabled = false;
+        if (!navigating) {
+          setProfileLoading(false);
+          if (button) button.disabled = false;
+        }
       }
     }
 

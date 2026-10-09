@@ -16,7 +16,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from goodmoviefinder.calendar_busy import BusyInterval, CalendarError, VIENNA
 from goodmoviefinder.config import GOOGLE_CLIENT_PATH, GOOGLE_TOKEN_PATH
 
-_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+_SCOPE = f"{_READ_SCOPE} {_WRITE_SCOPE}"
 _AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_URI = "https://oauth2.googleapis.com/token"
 _FIELDS = "items(start,end,transparency,status,attendees(self,responseStatus)),nextPageToken"
@@ -382,3 +384,78 @@ def _error_from_http(exc: urllib.error.HTTPError) -> CalendarError:
         return _LoginExpired("Google Calendar rejected the saved login.")
     detail = f" ({message})" if message else ""
     return CalendarError(f"Google Calendar request failed ({exc.code}){detail}.")
+
+
+class _AlreadySaved(CalendarError):
+    pass
+
+
+def save_google_events(events: list[dict[str, object]]) -> tuple[int, int]:
+    """Create film events on the primary calendar. A repeat click is skipped."""
+    access = _access_token()
+    try:
+        return _insert_events(access, events)
+    except CalendarError as exc:
+        if "403" not in str(exc):
+            raise
+        access = _interactive_login()
+        return _insert_events(access, events)
+
+
+def _insert_events(access: str, events: list[dict[str, object]]) -> tuple[int, int]:
+    added = 0
+    skipped = 0
+    for event in events:
+        start = event["start"]
+        end = event["end"]
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise CalendarError("A film time could not be saved.")
+        body = {
+            "summary": event["title"],
+            "location": event["location"],
+            "description": event["url"],
+            "iCalUID": f"gmf-{event['key']}@local.goodmoviefinder",
+            "start": {
+                "dateTime": start.isoformat(),
+                "timeZone": "Europe/Vienna",
+            },
+            "end": {
+                "dateTime": end.isoformat(),
+                "timeZone": "Europe/Vienna",
+            },
+        }
+        try:
+            _api_post(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                access,
+                body,
+            )
+        except _AlreadySaved:
+            skipped += 1
+            continue
+        added += 1
+    return added, skipped
+
+
+def _api_post(url: str, access: str, body: dict[str, object]) -> dict:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={
+            "Authorization": f"Bearer {access}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            payload = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            raise _AlreadySaved("This film is already on Google Calendar.") from exc
+        raise _error_from_http(exc) from exc
+    except urllib.error.URLError as exc:
+        raise CalendarError(f"Google Calendar request failed: {exc.reason}") from exc
+    if not isinstance(payload, dict):
+        raise CalendarError("Google Calendar returned an unexpected response.")
+    return payload

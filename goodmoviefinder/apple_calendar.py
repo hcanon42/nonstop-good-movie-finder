@@ -52,23 +52,67 @@ _PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 
 def fetch_apple_busy(start: datetime, end: datetime) -> list[BusyInterval]:
     """Timed events that mark you occupied, between start and end."""
+    payload = _run_helper(
+        {
+            "start": start.timestamp(),
+            "end": end.timestamp(),
+            "output": str(_RESULT),
+        }
+    )
+    intervals: list[BusyInterval] = []
+    for item in payload.get("intervals") or []:
+        parsed = _interval(item)
+        if parsed is not None:
+            intervals.append(parsed)
+    return intervals
+
+
+def save_apple_events(events: list[dict[str, object]]) -> tuple[int, int, str]:
+    """Add films to the calendar Apple uses for new events."""
+    if not events:
+        raise CalendarError("There are no films to add.")
+    starts = [event["start"] for event in events if isinstance(event.get("start"), datetime)]
+    ends = [event["end"] for event in events if isinstance(event.get("end"), datetime)]
+    payload = _run_helper(
+        {
+            "start": min(starts).timestamp(),
+            "end": max(ends).timestamp(),
+            "output": str(_RESULT),
+            "events": [
+                {
+                    "title": event["title"],
+                    "start": event["start"].timestamp()
+                    if isinstance(event["start"], datetime)
+                    else 0,
+                    "end": event["end"].timestamp() if isinstance(event["end"], datetime) else 0,
+                    "location": event.get("location") or "",
+                    "url": event.get("url") or "",
+                    "key": event["key"],
+                }
+                for event in events
+            ],
+        }
+    )
+    added = payload.get("added")
+    skipped = payload.get("skipped")
+    name = payload.get("calendar")
+    return (
+        int(added) if isinstance(added, int) else 0,
+        int(skipped) if isinstance(skipped, int) else 0,
+        str(name).strip() or "Apple Calendar",
+    )
+
+
+def _run_helper(request: dict[str, object]) -> dict:
     app = _ensure_helper()
     _REQUEST.parent.mkdir(parents=True, exist_ok=True)
-    _REQUEST.write_text(
-        json.dumps(
-            {
-                "start": start.timestamp(),
-                "end": end.timestamp(),
-                "output": str(_RESULT),
-            }
-        ),
-        encoding="utf-8",
-    )
+    _REQUEST.write_text(json.dumps(request), encoding="utf-8")
     _RESULT.unlink(missing_ok=True)
-    print(
-        "Asking macOS for calendar access. Allow goodmoviefinder if a prompt appears.",
-        file=sys.stderr,
-    )
+    if "events" not in request:
+        print(
+            "Asking macOS for calendar access. Allow goodmoviefinder if a prompt appears.",
+            file=sys.stderr,
+        )
     try:
         subprocess.run(
             ["open", "-W", "-n", str(app)],
@@ -86,15 +130,12 @@ def fetch_apple_busy(start: datetime, end: datetime) -> list[BusyInterval]:
         payload = json.loads(_RESULT.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise CalendarError("Calendar access returned an unreadable result.") from exc
-    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        raise CalendarError("Calendar access returned an unreadable result.")
+    error = payload.get("error")
     if error:
         raise CalendarError(str(error))
-    intervals: list[BusyInterval] = []
-    for item in payload.get("intervals") or []:
-        parsed = _interval(item)
-        if parsed is not None:
-            intervals.append(parsed)
-    return intervals
+    return payload
 
 
 def _interval(item: object) -> BusyInterval | None:

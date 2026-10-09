@@ -16,6 +16,12 @@ def serve(state: Any, port: int) -> int:
         def log_message(self, fmt: str, *args: object) -> None:
             print(f"[serve] {self.address_string()} {fmt % args}", file=sys.stderr)
 
+        def handle(self) -> None:
+            try:
+                super().handle()
+            except (ConnectionResetError, BrokenPipeError, TimeoutError):
+                return
+
         def _send(self, code: int, body: bytes | str, content_type: str) -> None:
             data = body if isinstance(body, bytes) else body.encode("utf-8")
             self.send_response(code)
@@ -50,31 +56,48 @@ def serve(state: Any, port: int) -> int:
 
         def do_POST(self) -> None:
             path = urllib.parse.urlparse(self.path).path
-            if path != "/api/viewer":
-                self._send(404, json.dumps({"error": "Not found"}), "application/json")
+            payload = self._read_json()
+            if payload is None:
                 return
+            if path == "/api/viewer":
+                try:
+                    reload = state.apply_viewer(payload)
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except RuntimeError as exc:
+                    self._send(502, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                self._send(200, json.dumps({"ok": True, "reload": reload}), "application/json")
+                return
+            if path == "/api/plan":
+                try:
+                    message = state.save_plan(payload)
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    self._send(502, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                self._send(200, json.dumps({"ok": True, "message": message}), "application/json")
+                return
+            self._send(404, json.dumps({"error": "Not found"}), "application/json")
+
+        def _read_json(self) -> dict | None:
             length = int(self.headers.get("Content-Length") or 0)
             if length > 100_000:
                 self._send(413, json.dumps({"error": "Request too large"}), "application/json")
-                return
+                return None
             raw = self.rfile.read(length)
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 self._send(400, json.dumps({"error": "Invalid JSON"}), "application/json")
-                return
+                return None
             if not isinstance(payload, dict):
                 self._send(400, json.dumps({"error": "Invalid JSON"}), "application/json")
-                return
-            try:
-                reload = state.apply_viewer(payload)
-            except ValueError as exc:
-                self._send(400, json.dumps({"error": str(exc)}), "application/json")
-                return
-            except RuntimeError as exc:
-                self._send(502, json.dumps({"error": str(exc)}), "application/json")
-                return
-            self._send(200, json.dumps({"ok": True, "reload": reload}), "application/json")
+                return None
+            return payload
 
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)

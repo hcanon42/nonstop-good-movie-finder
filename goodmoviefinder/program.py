@@ -6,7 +6,11 @@ import urllib.parse
 from datetime import date
 
 from goodmoviefinder.config import DEFAULT_KNOWN_LANGUAGE_KEYS
+from goodmoviefinder.matching import director_person_keys
 from goodmoviefinder.models import Movie, ProgramFilm, Screening
+
+# A film at or above this score makes its director a recommendation source.
+LOVED_RATING = 4.0
 
 UNDERSTOOD_AUDIO_VERSIONS = frozenset({"OV", "OmdU", "OmeU"})
 ENGLISH_SUBTITLE_VERSIONS = frozenset({"OmeU"})
@@ -158,28 +162,92 @@ def sort_movies(movies: list[Movie]) -> list[Movie]:
     return sorted(movies, key=sort_key)
 
 
+def _loved_director_index(
+    watched_ratings: dict[str, float | None],
+    loved_credits: dict[str, dict],
+) -> dict[str, list[tuple[float, str, int | None, str]]]:
+    """Director name → films this viewer rated at least LOVED_RATING."""
+    index: dict[str, list[tuple[float, str, int | None, str]]] = {}
+    for slug, rating in watched_ratings.items():
+        if not isinstance(rating, (int, float)) or rating < LOVED_RATING:
+            continue
+        credit = loved_credits.get(slug) or {}
+        title = credit.get("title")
+        directors = credit.get("directors") or []
+        if not isinstance(title, str) or not title.strip() or not directors:
+            continue
+        year = credit.get("year")
+        film_year = year if isinstance(year, int) else None
+        item = (float(rating), title.strip(), film_year, slug)
+        for key in director_person_keys([str(name) for name in directors]):
+            index.setdefault(key, []).append(item)
+    return index
+
+
+def _recommendation_because(
+    movie: Movie,
+    index: dict[str, list[tuple[float, str, int | None, str]]],
+    own_slug: str | None,
+) -> str | None:
+    """The highest-rated loved film that shares a director with this one."""
+    best: tuple[float, str, int | None, str] | None = None
+    seen: set[str] = set()
+    for key in director_person_keys(movie.directors):
+        for rating, title, year, slug in index.get(key, ()):
+            if slug == own_slug or slug in seen:
+                continue
+            seen.add(slug)
+            if best is None or rating > best[0] or (
+                rating == best[0] and title.casefold() < best[1].casefold()
+            ):
+                best = (rating, title, year, slug)
+    if best is None:
+        return None
+    rating, title, year, _slug = best
+    film = f"{title} ({year})" if year is not None else title
+    return f"Same director as {film}, which you rated {rating:.1f}"
+
+
 def partition_program_movies(
     movies: list[Movie],
     watched_ratings: dict[str, float | None],
     watchlist_slugs: set[str],
-) -> tuple[list[Movie], list[Movie], list[Movie]]:
+    loved_credits: dict[str, dict] | None = None,
+) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
+    """Watchlist, recommendations, already watched, and the full program.
+
+    Watchlist and recommendation titles are listed in those sections and again
+    in the full program. Already watched titles stay out of the full program.
+    """
     watchlist: list[Movie] = []
+    recommendations: list[Movie] = []
     watched: list[Movie] = []
     program: list[Movie] = []
+    index = _loved_director_index(watched_ratings, loved_credits or {})
 
     for movie in movies:
+        movie.because = None
         slug = letterboxd_slug_from_url(movie.letterboxd_url)
         if slug and slug in watched_ratings:
             movie.user_rating = watched_ratings[slug]
             watched.append(movie)
             continue
+        because = _recommendation_because(movie, index, slug)
         if slug and slug in watchlist_slugs:
+            movie.because = because
             watchlist.append(movie)
+            program.append(movie)
+            continue
+        if because:
+            movie.because = because
+            recommendations.append(movie)
+            program.append(movie)
             continue
         program.append(movie)
 
     return (
         sort_movies(watchlist),
+        sort_movies(recommendations),
         sort_movies(watched),
         sort_movies(program),
     )

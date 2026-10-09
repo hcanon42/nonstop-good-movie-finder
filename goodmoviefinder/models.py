@@ -59,6 +59,8 @@ class Movie:
     screenings: list[Screening] = field(default_factory=list)
     note: str | None = None
     user_rating: float | None = None
+    # Why this screening is recommended, when it shares a director with a loved film.
+    because: str | None = None
     # False when a cached Letterboxd link was stored by an older matcher.
     match_current: bool = True
 

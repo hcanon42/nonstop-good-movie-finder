@@ -145,6 +145,20 @@ def _surnames(name: str) -> set[str]:
     return {folded.split()[-1]}
 
 
+_PERSON_SPLIT = re.compile(r"\s*(?:/|,|&|\band\b)\s*")
+
+
+def director_person_keys(names: list[str]) -> set[str]:
+    """Folded full names for each person in a director credit."""
+    keys: set[str] = set()
+    for name in names:
+        for chunk in _PERSON_SPLIT.split(name):
+            folded = _name_fold(chunk)
+            if folded:
+                keys.add(folded)
+    return keys
+
+
 def director_overlaps(
     nonstop_director: str | None,
     letterboxd_directors: list[str],

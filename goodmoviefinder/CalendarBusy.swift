@@ -5,6 +5,16 @@ struct Request: Decodable {
     let start: TimeInterval
     let end: TimeInterval
     let output: String
+    let events: [PlanEvent]?
+}
+
+struct PlanEvent: Decodable {
+    let title: String
+    let start: TimeInterval
+    let end: TimeInterval
+    let location: String
+    let url: String
+    let key: String
 }
 
 struct Interval: Encodable {
@@ -15,6 +25,9 @@ struct Interval: Encodable {
 struct Result: Encodable {
     var intervals: [Interval]?
     var error: String?
+    var added: Int?
+    var skipped: Int?
+    var calendar: String?
 }
 
 final class AccessBox: @unchecked Sendable {
@@ -62,6 +75,46 @@ if !box.granted {
         message += " (\(box.message))"
     }
     finish(Result(error: message), to: outputURL, code: 1)
+}
+
+if let plan = request.events {
+    guard let calendar = store.defaultCalendarForNewEvents else {
+        finish(Result(error: "Apple Calendar has no calendar for new events."), to: outputURL, code: 1)
+    }
+    var added = 0
+    var skipped = 0
+    for item in plan {
+        let start = Date(timeIntervalSince1970: item.start)
+        let end = Date(timeIntervalSince1970: item.end)
+        let marker = "goodmoviefinder:\(item.key)"
+        let existing = store.events(matching: store.predicateForEvents(withStart: start, end: end, calendars: [calendar]))
+        if existing.contains(where: { ($0.notes ?? "").contains(marker) }) {
+            skipped += 1
+            continue
+        }
+        let event = EKEvent(eventStore: store)
+        event.calendar = calendar
+        event.title = item.title
+        event.startDate = start
+        event.endDate = end
+        event.location = item.location
+        event.notes = marker
+        event.availability = .busy
+        if item.url.hasPrefix("http"), let link = URL(string: item.url) {
+            event.url = link
+        }
+        do {
+            try store.save(event, span: .thisEvent)
+            added += 1
+        } catch {
+            finish(Result(error: "Could not save a film. \(error.localizedDescription)"), to: outputURL, code: 1)
+        }
+    }
+    finish(
+        Result(added: added, skipped: skipped, calendar: calendar.title),
+        to: outputURL,
+        code: 0
+    )
 }
 
 let windowStart = Date(timeIntervalSince1970: request.start)

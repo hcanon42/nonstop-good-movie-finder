@@ -51,9 +51,30 @@ def load_viewer() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save_viewer(user: str, languages: list[str]) -> None:
-    payload = {"letterboxd_user": user, "languages": languages}
+def save_viewer(
+    user: str,
+    languages: list[str],
+    calendars: list[str] | None = None,
+) -> None:
+    payload: dict[str, object] = {"letterboxd_user": user, "languages": languages}
+    if calendars is None:
+        saved = load_calendars()
+        if saved:
+            payload["calendars"] = saved
+    else:
+        payload["calendars"] = calendars
     VIEWER_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def load_calendars() -> list[str]:
+    raw = load_viewer().get("calendars")
+    if not isinstance(raw, list):
+        return []
+    chosen: list[str] = []
+    for item in raw:
+        if item in ("apple", "google") and item not in chosen:
+            chosen.append(item)
+    return chosen
 
 
 def language_choices(found: list[str], selected: list[str]) -> list[str]:

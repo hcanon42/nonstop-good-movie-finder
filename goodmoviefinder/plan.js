@@ -1,4 +1,4 @@
-    const PLAN_LIMIT = 8;
+    const PLAN_LIMIT = 12;
     const PLAN_STORAGE = "gmf-plan";
     const ASSUMED_RUNTIME = 150;
     const SAME_VENUE_GAP = 20;
@@ -81,6 +81,45 @@
 
     function overlapsBusy(start, end, busy) {
       return busy.some((block) => start < block.end && end > block.start);
+    }
+
+    function formatClock(minutes) {
+      const clamped = Math.max(0, Math.min(24 * 60, minutes));
+      const hour = Math.floor(clamped / 60);
+      const minute = clamped % 60;
+      return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+    }
+
+    function isoFromStamp(stamp) {
+      const day = Math.floor(stamp / 1440);
+      const date = new Date(day * 86400000);
+      const year = date.getUTCFullYear();
+      const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+      const dayNum = String(date.getUTCDate()).padStart(2, "0");
+      return `${year}-${month}-${dayNum}`;
+    }
+
+    function busyOnDay(iso) {
+      const dayStart = minutesOnDate(iso, 0);
+      if (dayStart == null) return [];
+      const dayEnd = dayStart + 1440;
+      const labels = [];
+      planBusy.forEach((block) => {
+        const start = Math.max(block.start, dayStart);
+        const end = Math.min(block.end, dayEnd);
+        if (end <= start) return;
+        labels.push(`${formatClock(start - dayStart)}–${formatClock(end - dayStart)}`);
+      });
+      return labels;
+    }
+
+    function busyHtml(labels) {
+      if (!labels.length) return "";
+      return (
+        `<span class="plan-busy">` +
+        `<span class="plan-busy-time">${escapeHtml(labels.join(", "))}</span>` +
+        `<span class="plan-busy-label">Busy</span></span>`
+      );
     }
 
     function weekdayIndex(iso) {
@@ -418,16 +457,19 @@
       for (let day = 1; day <= daysInMonth; day++) {
         const iso = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
         const films = byDate.get(iso) || [];
+        const busy = busyOnDay(iso);
         const todayClass = iso === todayIso ? " is-today" : "";
-        if (!films.length) {
+        if (!films.length && !busy.length) {
           cells.push(
             `<span class="plan-cell blank${todayClass}"><span class="plan-cell-num">${day}</span></span>`,
           );
           continue;
         }
+        const kind = films.length ? " has" : " is-busy";
         cells.push(
-          `<div class="plan-cell has${todayClass}">` +
+          `<div class="plan-cell${kind}${todayClass}">` +
           `<span class="plan-cell-num">${day}</span>` +
+          `${busyHtml(busy)}` +
           `${films.map(cellFilmHtml).join("")}</div>`,
         );
       }
@@ -448,14 +490,19 @@
     }
 
     function planCalendarHtml(rows, todayIso) {
-      if (!rows.length) return "";
       const byDate = new Map();
       rows.forEach((row) => {
         const list = byDate.get(row.date) || [];
         list.push(row);
         byDate.set(row.date, list);
       });
-      const dates = [...byDate.keys()].sort();
+      const sorted = [...byDate.keys()];
+      planBusy.forEach((block) => {
+        sorted.push(isoFromStamp(block.start));
+        if (block.end > block.start) sorted.push(isoFromStamp(block.end - 1));
+      });
+      const dates = sorted.filter(Boolean).sort();
+      if (!dates.length) return "";
       let year = Number(dates[0].slice(0, 4));
       let month = Number(dates[0].slice(5, 7));
       const endYear = Number(dates[dates.length - 1].slice(0, 4));
@@ -542,6 +589,7 @@
     }
 
     let planMode = "best";
+    let plannedRows = [];
 
     function renderPlan() {
       const empty = document.getElementById("plan-empty");
@@ -552,6 +600,8 @@
       const calendar = document.getElementById("plan-schedule");
       const left = document.getElementById("plan-left-out");
       const leftList = document.getElementById("plan-left-out-list");
+      const actions = document.getElementById("plan-actions");
+      const saveStatus = document.getElementById("plan-save-status");
       if (!empty || !picked || !chips || !options || !summary || !calendar || !left || !leftList) return;
       if (!planSelected.length) {
         empty.hidden = false;
@@ -560,9 +610,11 @@
         options.hidden = true;
         options.replaceChildren();
         summary.hidden = true;
+        if (actions) actions.hidden = true;
         calendar.hidden = true;
         calendar.replaceChildren();
         left.hidden = true;
+        plannedRows = [];
         markPlannedDays([]);
         return;
       }
@@ -587,7 +639,10 @@
       )).join("");
       summary.hidden = false;
       summary.textContent = result.summary;
-      if (result.rows.length) {
+      plannedRows = result.rows;
+      if (actions) actions.hidden = result.rows.length === 0;
+      if (saveStatus && actions && actions.hidden) saveStatus.textContent = "";
+      if (result.rows.length || planBusy.length) {
         calendar.hidden = false;
         calendar.innerHTML = planCalendarHtml(result.rows, todayIso);
       } else {
@@ -635,6 +690,45 @@
       renderPlan();
     }
 
+    async function savePlan() {
+      const button = document.getElementById("plan-save");
+      const status = document.getElementById("plan-save-status");
+      if (!plannedRows.length || !button || !status) return;
+      button.disabled = true;
+      status.hidden = false;
+      status.classList.remove("is-error");
+      status.textContent = "Adding to your calendar…";
+      try {
+        const response = await fetch("/api/plan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            events: plannedRows.map((row) => ({
+              title: row.title,
+              date: row.date,
+              time: row.time,
+              minutes: row.end - row.start,
+              location: row.venue || "",
+              url: row.url || "",
+            })),
+          }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const fallback = response.status === 404
+            ? "Restart python3 goodmoviefinder.py --serve, then add the plan again."
+            : "Could not add the plan.";
+          throw new Error(payload.error || fallback);
+        }
+        status.textContent = payload.message || "Added to your calendar.";
+      } catch (err) {
+        status.textContent = err && err.message ? err.message : "Could not add the plan.";
+        status.classList.add("is-error");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
     document.querySelectorAll(".plan-add").forEach((button) => {
       button.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -651,6 +745,8 @@
     }
     const planClear = document.getElementById("plan-clear");
     if (planClear) planClear.addEventListener("click", clearPlan);
+    const planSave = document.getElementById("plan-save");
+    if (planSave) planSave.addEventListener("click", savePlan);
     const planOptions = document.getElementById("plan-options");
     if (planOptions) {
       planOptions.addEventListener("click", (event) => {

@@ -124,6 +124,75 @@ def fetch_letterboxd_watched_ratings(
     return ratings
 
 
+def _director_names(raw: object) -> list[str]:
+    if isinstance(raw, dict):
+        items: list[object] = [raw]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        return []
+    names: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            name = item
+        elif isinstance(item, dict) and isinstance(item.get("name"), str):
+            name = item["name"]
+        else:
+            continue
+        name = html.unescape(name).strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def parse_letterboxd_film_json(body: str) -> dict[str, object] | None:
+    """Title, year, and directors from Letterboxd's compact film JSON."""
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or not data.get("result"):
+        return None
+    title = data.get("name")
+    year = data.get("releaseYear")
+    return {
+        "title": title.strip() if isinstance(title, str) and title.strip() else None,
+        "year": year if isinstance(year, int) else None,
+        "directors": _director_names(data.get("directors")),
+    }
+
+
+def fetch_letterboxd_film_credit(slug: str) -> dict[str, object]:
+    """Directors for one Letterboxd film. An unknown slug has no directors."""
+    url = (
+        "https://letterboxd.com/film/"
+        + urllib.parse.quote(slug, safe="-_")
+        + "/json/"
+    )
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            parsed = parse_letterboxd_film_json(fetch(url))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return {"title": None, "year": None, "directors": []}
+            if exc.code in {403, 429, 503} and attempt < 3:
+                time.sleep(1.5 * (attempt + 2))
+                last_error = exc
+                continue
+            raise RuntimeError(f"Failed to fetch {url}: HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Failed to fetch {url}: {exc.reason}") from exc
+        if parsed is None:
+            raise RuntimeError(f"Letterboxd returned no film data for {slug}")
+        return parsed
+    raise RuntimeError(f"Failed to fetch {url}: {last_error}")
+
+
 def letterboxd_autocomplete_slugs(
     query: str,
     delay: float,

@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import re
 import sys
 import threading
 import urllib.error
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from goodmoviefinder.apple_calendar import fetch_apple_busy
+from goodmoviefinder.apple_calendar import fetch_apple_busy, save_apple_events
 from goodmoviefinder.cache import (
     backfill_letterboxd_details,
     backfill_nonstop_details,
     backfill_runtime,
     cache_get,
     cache_put,
+    ensure_loved_film_credits,
     load_cache,
     load_profile_cache,
     save_cache,
@@ -27,6 +31,7 @@ from goodmoviefinder.calendar_busy import (
     interval_payload,
     latest_screening_date,
     status_sentence,
+    VIENNA,
 )
 from goodmoviefinder.config import (
     DEFAULT_CACHE,
@@ -36,7 +41,7 @@ from goodmoviefinder.config import (
     DEFAULT_SERVE_PORT,
     GENERATED_HTML,
 )
-from goodmoviefinder.google_calendar import fetch_google_busy
+from goodmoviefinder.google_calendar import fetch_google_busy, save_google_events
 from goodmoviefinder.html import format_html
 from goodmoviefinder.http import fetch
 from goodmoviefinder.letterboxd import (
@@ -59,6 +64,7 @@ from goodmoviefinder.viewer import (
     canonical_languages,
     language_choices,
     language_keys,
+    load_calendars,
     normalize_letterboxd_user,
     resolve_settings,
     save_viewer,
@@ -103,6 +109,52 @@ def _calendar_for_plan(
     return interval_payload(merged), status_sentence(ready, failed, through)
 
 
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_TIME_RE = re.compile(r"\d{2}:\d{2}")
+
+
+def _plan_event(raw: object) -> dict[str, object]:
+    if not isinstance(raw, dict):
+        raise ValueError("A film in the plan is invalid.")
+    title = str(raw.get("title") or "").strip()
+    if not title or len(title) > 180:
+        raise ValueError("Each film needs a title.")
+    date_raw = str(raw.get("date") or "")
+    time_raw = str(raw.get("time") or "")
+    if not _DATE_RE.fullmatch(date_raw) or not _TIME_RE.fullmatch(time_raw):
+        raise ValueError("A screening time is invalid.")
+    minutes = raw.get("minutes")
+    if isinstance(minutes, float) and minutes.is_integer():
+        minutes = int(minutes)
+    if not isinstance(minutes, int) or minutes <= 0 or minutes > 12 * 60:
+        raise ValueError("A screening length is invalid.")
+    start = datetime.fromisoformat(f"{date_raw}T{time_raw}").replace(tzinfo=VIENNA)
+    location = str(raw.get("location") or "").strip()[:180]
+    url = str(raw.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        url = ""
+    key = hashlib.sha256(f"{title}|{start.isoformat()}".encode()).hexdigest()[:16]
+    return {
+        "title": title,
+        "start": start,
+        "end": start + timedelta(minutes=minutes),
+        "location": location,
+        "url": url,
+        "key": key,
+    }
+
+
+def _saved_sentence(added: int, skipped: int, name: str) -> str:
+    if added == 0 and skipped:
+        return f"Those films are already on {name}."
+    films = "film" if added == 1 else "films"
+    sentence = f"Added {added} {films} to {name}."
+    if skipped:
+        already = "1 was" if skipped == 1 else f"{skipped} were"
+        sentence += f" {already} already there."
+    return sentence
+
+
 def _remember_runtime(movie: Movie, page: NonstopFilmPage | None) -> None:
     """Keep a Nonstop runtime when Letterboxd did not already provide one."""
     if page is None or movie.duration_minutes:
@@ -128,6 +180,7 @@ class ProgramPage:
         port: int,
         busy_intervals: list[dict[str, str]],
         calendar_status: str,
+        calendar_sources: list[str],
     ) -> None:
         self.results = results
         self.cache = cache
@@ -139,8 +192,10 @@ class ProgramPage:
         self.port = port
         self.busy_intervals = busy_intervals
         self.calendar_status = calendar_status
+        self.calendar_sources = list(calendar_sources)
         self.watched_ratings: dict[str, float | None] = {}
         self.watchlist_slugs: set[str] = set()
+        self.loved_credits: dict[str, dict] = {}
         self._lock = threading.Lock()
 
     @property
@@ -153,14 +208,18 @@ class ProgramPage:
             "languages": self.languages,
         }
 
-    def write(self) -> tuple[list[Movie], list[Movie], list[Movie]]:
+    def write(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
         if self.no_profile:
             watchlist: list[Movie] = []
+            recommendations: list[Movie] = []
             watched: list[Movie] = []
             program = sort_movies(self.results)
         else:
-            watchlist, watched, program = partition_program_movies(
-                self.results, self.watched_ratings, self.watchlist_slugs
+            watchlist, recommendations, watched, program = partition_program_movies(
+                self.results,
+                self.watched_ratings,
+                self.watchlist_slugs,
+                self.loved_credits,
             )
         found = [
             movie.primary_language for movie in self.results if movie.primary_language
@@ -169,6 +228,7 @@ class ProgramPage:
         self.languages = canonical_languages(self.languages, choices)
         output = format_html(
             watchlist,
+            recommendations,
             watched,
             program,
             letterboxd_user=self.letterboxd_user,
@@ -179,7 +239,7 @@ class ProgramPage:
         )
         GENERATED_HTML.parent.mkdir(parents=True, exist_ok=True)
         GENERATED_HTML.write_text(output, encoding="utf-8")
-        return watchlist, watched, program
+        return watchlist, recommendations, watched, program
 
     def apply_viewer(self, payload: dict) -> bool:
         with self._lock:
@@ -210,6 +270,13 @@ class ProgramPage:
                     )
                     self.watched_ratings = watched
                     self.watchlist_slugs = watchlist
+                    self.loved_credits = ensure_loved_film_credits(
+                        self.cache,
+                        self.cache_path,
+                        watched,
+                        self.delay,
+                        self.results,
+                    )
                     self.letterboxd_user = user
                     self.no_profile = False
                     reload = True
@@ -217,6 +284,39 @@ class ProgramPage:
                 self.write()
             save_viewer(self.letterboxd_user, self.languages)
             return reload
+
+    def save_plan(self, payload: dict) -> str:
+        with self._lock:
+            raw = payload.get("events")
+            if not isinstance(raw, list) or not raw:
+                raise ValueError("Choose a plan before adding it to your calendar.")
+            if len(raw) > 12:
+                raise ValueError("A plan holds up to 12 films.")
+            events = [_plan_event(item) for item in raw]
+            sources = self.calendar_sources or load_calendars()
+            if not sources:
+                raise ValueError(
+                    "No calendar is connected. Run with --calendar apple or --calendar google."
+                )
+            sentences: list[str] = []
+            problems: list[str] = []
+            for source in sources:
+                label = "Apple Calendar" if source == "apple" else "Google Calendar"
+                try:
+                    if source == "apple":
+                        added, skipped, name = save_apple_events(events)
+                        sentences.append(_saved_sentence(added, skipped, name))
+                    else:
+                        added, skipped = save_google_events(events)
+                        sentences.append(_saved_sentence(added, skipped, "Google Calendar"))
+                except CalendarError as exc:
+                    problems.append(f"{label}: {exc}")
+            if not sentences:
+                raise CalendarError(" ".join(problems) or "Could not add the plan.")
+            message = " ".join(sentences)
+            if problems:
+                message = f"{message} {' '.join(problems)}"
+            return message
 
 
 def load_profile(
@@ -345,6 +445,11 @@ def main() -> int:
         metavar="{apple,google}",
         help="Skip plan showtimes that overlap this calendar (repeat to use both)",
     )
+    parser.add_argument(
+        "--no-calendar",
+        action="store_true",
+        help="Stop using a saved calendar when planning",
+    )
     args = parser.parse_args()
     try:
         letterboxd_user, known_languages, persist_settings = resolve_settings(
@@ -353,6 +458,21 @@ def main() -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    if args.no_calendar:
+        calendar_sources: list[str] = []
+        persist_calendars = True
+    elif args.calendar:
+        calendar_sources = list(dict.fromkeys(args.calendar))
+        persist_calendars = True
+    else:
+        calendar_sources = load_calendars()
+        persist_calendars = False
+        if calendar_sources:
+            print(
+                "Using saved calendar: " + ", ".join(calendar_sources),
+                file=sys.stderr,
+            )
 
     print(f"Fetching program: {args.program_url}", file=sys.stderr)
     try:
@@ -502,17 +622,36 @@ def main() -> int:
         save_cache(args.cache, cache)
         results.append(movie)
 
+    loved_credits: dict[str, dict] = {}
     if args.no_letterboxd_profile:
         grouped_watchlist: list[Movie] = []
+        grouped_recommendations: list[Movie] = []
         grouped_watched: list[Movie] = []
         grouped_program = sort_movies(results)
     else:
-        grouped_watchlist, grouped_watched, grouped_program = partition_program_movies(
-            results, watched_ratings, watchlist_slugs
+        loved_credits = ensure_loved_film_credits(
+            cache,
+            args.cache,
+            watched_ratings,
+            args.delay,
+            results,
+        )
+        (
+            grouped_watchlist,
+            grouped_recommendations,
+            grouped_watched,
+            grouped_program,
+        ) = partition_program_movies(
+            results, watched_ratings, watchlist_slugs, loved_credits
         )
     busy_intervals, calendar_status = _calendar_for_plan(
-        args.calendar or [],
-        [*grouped_watchlist, *grouped_watched, *grouped_program],
+        calendar_sources,
+        [
+            *grouped_watchlist,
+            *grouped_recommendations,
+            *grouped_watched,
+            *grouped_program,
+        ],
     )
     page = ProgramPage(
         results,
@@ -525,17 +664,26 @@ def main() -> int:
         port=args.port,
         busy_intervals=busy_intervals,
         calendar_status=calendar_status,
+        calendar_sources=calendar_sources,
     )
     page.watched_ratings = watched_ratings
     page.watchlist_slugs = watchlist_slugs
-    watchlist_movies, watched_movies, program_movies = page.write()
-    if persist_settings:
-        save_viewer(page.letterboxd_user, page.languages)
+    page.loved_credits = loved_credits
+    watchlist_movies, recommendation_movies, watched_movies, program_movies = page.write()
+    if persist_settings or persist_calendars:
+        save_viewer(
+            page.letterboxd_user,
+            page.languages,
+            calendar_sources if persist_calendars else None,
+        )
     print(f"Wrote {GENERATED_HTML}", file=sys.stderr)
 
     known = language_keys(page.languages)
     visible_program = [
         movie for movie in program_movies if movie_is_watchable(movie, known)
+    ]
+    visible_recommendations = [
+        movie for movie in recommendation_movies if movie_is_watchable(movie, known)
     ]
     hidden_for_language = len(program_movies) - len(visible_program)
     language_label = ", ".join(page.languages) if page.languages else "English subtitles only"
@@ -545,8 +693,9 @@ def main() -> int:
         file=sys.stderr,
     )
     print(
-        f"Done: {len(visible_program)} in main program, "
+        f"Done: {len(visible_program)} in the full program (watchlist and recommendations included), "
         f"{len(watchlist_movies)} watchlist, "
+        f"{len(visible_recommendations)} recommended, "
         f"{len(watched_movies)} already watched, "
         f"{rated}/{len(results)} with Letterboxd ratings.",
         file=sys.stderr,

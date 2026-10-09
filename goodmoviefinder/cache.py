@@ -11,12 +11,14 @@ from typing import Any
 
 from goodmoviefinder.http import fetch
 from goodmoviefinder.letterboxd import (
+    fetch_letterboxd_film_credit,
     parse_letterboxd_runtime,
     parse_original_title,
     parse_primary_language,
 )
 from goodmoviefinder.models import Movie
 from goodmoviefinder.nonstop import parse_nonstop_movie_page
+from goodmoviefinder.program import LOVED_RATING, letterboxd_slug_from_url
 
 CACHE_VERSION = 4
 PROFILE_CACHE_MAX_AGE = 6 * 60 * 60  # seconds
@@ -211,6 +213,145 @@ def backfill_nonstop_details(movie: Movie, delay: float) -> None:
         movie.duration_minutes = page.duration_minutes
         movie.duration_known = True
     time.sleep(delay)
+
+
+def _film_credit_get(cache: dict[str, Any], slug: str) -> dict[str, Any] | None:
+    raw = cache.get("film_credits", {}).get(slug)
+    if not isinstance(raw, dict) or not isinstance(raw.get("directors"), list):
+        return None
+    title = raw.get("title")
+    year = raw.get("year")
+    return {
+        "title": title.strip() if isinstance(title, str) and title.strip() else None,
+        "year": year if isinstance(year, int) else None,
+        "directors": [
+            name.strip()
+            for name in raw["directors"]
+            if isinstance(name, str) and name.strip()
+        ],
+    }
+
+
+def _film_credit_put(cache: dict[str, Any], slug: str, credit: dict[str, Any]) -> None:
+    cache.setdefault("film_credits", {})[slug] = {
+        "title": credit.get("title"),
+        "year": credit.get("year"),
+        "directors": list(credit.get("directors") or []),
+    }
+
+
+def _remember_film_credit(
+    cache: dict[str, Any],
+    slug: str | None,
+    title: str | None,
+    year: object,
+    directors: object,
+) -> bool:
+    if not slug or _film_credit_get(cache, slug) is not None:
+        return False
+    if not isinstance(directors, list) or not directors:
+        return False
+    names = [name.strip() for name in directors if isinstance(name, str) and name.strip()]
+    if not names:
+        return False
+    _film_credit_put(
+        cache,
+        slug,
+        {
+            "title": title.strip() if isinstance(title, str) and title.strip() else None,
+            "year": year if isinstance(year, int) else None,
+            "directors": names,
+        },
+    )
+    return True
+
+
+def ensure_loved_film_credits(
+    cache: dict[str, Any],
+    cache_path: Path,
+    watched_ratings: dict[str, float | None],
+    delay: float,
+    movies: list[Movie] | None = None,
+) -> dict[str, dict]:
+    """Directors for films rated at least 4.0. Missing ones are fetched and saved."""
+    loved = sorted(
+        slug
+        for slug, rating in watched_ratings.items()
+        if isinstance(rating, (int, float)) and rating >= LOVED_RATING
+    )
+    if not loved:
+        return {}
+
+    changed = False
+    for movie in movies or []:
+        changed = (
+            _remember_film_credit(
+                cache,
+                letterboxd_slug_from_url(movie.letterboxd_url),
+                movie.letterboxd_title or movie.title,
+                movie.year,
+                movie.directors,
+            )
+            or changed
+        )
+    for entry in cache.get("entries", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        changed = (
+            _remember_film_credit(
+                cache,
+                letterboxd_slug_from_url(entry.get("letterboxd_url")),
+                entry.get("letterboxd_title") or entry.get("title"),
+                entry.get("year"),
+                entry.get("directors"),
+            )
+            or changed
+        )
+
+    credits: dict[str, dict] = {}
+    missing: list[str] = []
+    for slug in loved:
+        credit = _film_credit_get(cache, slug)
+        if credit is None:
+            missing.append(slug)
+        else:
+            credits[slug] = credit
+
+    if missing:
+        print(
+            f"Looking up directors for {len(missing)} films rated {LOVED_RATING:.1f} or higher…",
+            file=sys.stderr,
+        )
+    for index, slug in enumerate(missing, start=1):
+        try:
+            fetched = fetch_letterboxd_film_credit(slug)
+        except RuntimeError as exc:
+            print(f"  [{index}/{len(missing)}] {slug}: {exc}", file=sys.stderr)
+            time.sleep(delay)
+            continue
+        credit = {
+            "title": fetched.get("title"),
+            "year": fetched.get("year"),
+            "directors": list(fetched.get("directors") or []),
+        }
+        _film_credit_put(cache, slug, credit)
+        credits[slug] = credit
+        changed = True
+        label = credit["title"] or slug
+        names = ", ".join(credit["directors"]) or "no director"
+        print(f"  [{index}/{len(missing)}] {label} — {names}", file=sys.stderr)
+        if index % 10 == 0:
+            save_cache(cache_path, cache)
+        time.sleep(delay)
+
+    if changed:
+        save_cache(cache_path, cache)
+    ready = sum(1 for slug in loved if credits.get(slug, {}).get("directors"))
+    print(
+        f"Directors ready for {ready} of {len(loved)} films rated {LOVED_RATING:.1f} or higher.",
+        file=sys.stderr,
+    )
+    return {slug: credits[slug] for slug in loved if slug in credits}
 
 
 def backfill_runtime(movie: Movie, delay: float) -> bool:
