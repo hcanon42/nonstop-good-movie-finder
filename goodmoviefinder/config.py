@@ -4,7 +4,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GENERATED_HTML = REPO_ROOT / "generated" / "program-ranked.html"
+GENERATED_ACCOUNT = REPO_ROOT / "generated" / "account.html"
 DEFAULT_CACHE = REPO_ROOT / "cache" / "ratings.json"
+STREAMING_CACHE = REPO_ROOT / "cache" / "streaming.json"
 GOOGLE_CLIENT_PATH = REPO_ROOT / "cache" / "google-client.json"
 GOOGLE_TOKEN_PATH = REPO_ROOT / "cache" / "google-token.json"
 DEFAULT_PROGRAM_URL = (

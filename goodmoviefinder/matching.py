@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
+import urllib.parse
 
 # Runtimes within this many minutes count as the same cut.
 DURATION_CLOSE_MINUTES = 5
@@ -85,6 +86,27 @@ def parenthetical_search_queries(
 _TITLE_PIECE_RE = re.compile(r"\s+(?:[–—]|-)\s+|\s*:\s*")
 _YEAR_OR_RANGE_RE = re.compile(r"^\d{4}(?:\s*[–—-]\s*\d{4})?$")
 
+_ARTICLE_PREFIX_RE = re.compile(
+    r"^(?:the|a|an|der|die|das|le|la|les|el|los|las|un|une|ein|eine)\s+",
+    re.IGNORECASE,
+)
+
+_SLUG_QUERY_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "der",
+        "die",
+        "das",
+        "und",
+        "and",
+        "of",
+        "en",
+        "de",
+    }
+)
+
 
 def _usable_search_query(text: str) -> bool:
     text = text.strip()
@@ -93,14 +115,30 @@ def _usable_search_query(text: str) -> bool:
     return _YEAR_OR_RANGE_RE.match(text) is None
 
 
+def _slug_token_search_queries(nonstop_url: str) -> list[str]:
+    """Distinctive words from a Nonstop URL slug (e.g. the-grinch-2 → Grinch)."""
+    path = urllib.parse.urlparse(nonstop_url).path.rstrip("/")
+    slug = re.sub(r"-\d+$", "", path.split("/")[-1])
+    queries: list[str] = []
+    for token in slug.split("-"):
+        if token.isdigit() or len(token) < 3:
+            continue
+        if token.casefold() in _SLUG_QUERY_STOPWORDS:
+            continue
+        queries.append(token)
+    return queries
+
+
 def flexible_search_queries(
     display_title: str,
     nonstop_page_title: str | None,
+    nonstop_url: str | None = None,
 ) -> list[str]:
     """Titles to try with Letterboxd autocomplete after slug guesses miss.
 
     Order: full titles, parenthetical alternates, then pieces split on
-    spaced dashes and colons. Year ranges and tiny fragments are skipped.
+    spaced dashes and colons, titles without a leading article, then
+    Nonstop URL slug tokens. Year ranges and tiny fragments are skipped.
     """
     seen: set[str] = set()
     queries: list[str] = []
@@ -122,12 +160,19 @@ def flexible_search_queries(
         titles.append(nonstop_page_title)
     for title in titles:
         add(title)
+    for title in titles:
+        stripped = _ARTICLE_PREFIX_RE.sub("", title.strip(), count=1)
+        if stripped and stripped.casefold() != title.casefold():
+            add(stripped)
     for inner in parenthetical_search_queries(display_title, nonstop_page_title):
         add(inner)
     for title in titles:
         normalized = normalize_title_chars(title)
         for piece in _TITLE_PIECE_RE.split(normalized):
             add(piece)
+    if nonstop_url:
+        for token in _slug_token_search_queries(nonstop_url):
+            add(token)
     return queries
 
 
@@ -277,6 +322,13 @@ def film_identity_confirms(
         return True
     if (
         director is True
+        and cast_count >= 2
+        and year_delta is not None
+        and year_delta <= 1
+    ):
+        return True
+    if (
+        director is True
         and duration != "conflict"
         and year_delta is not None
         and year_delta <= 1
@@ -335,6 +387,12 @@ def film_identity_conflicts(
         else None
     )
     if director is False:
+        return True
+    if (
+        duration == "conflict"
+        and year_delta is not None
+        and year_delta > 1
+    ):
         return True
     if duration == "conflict" and cast_count == 0:
         return True

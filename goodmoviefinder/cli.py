@@ -8,7 +8,7 @@ import re
 import sys
 import threading
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from goodmoviefinder.apple_calendar import fetch_apple_busy, save_apple_events
@@ -23,6 +23,7 @@ from goodmoviefinder.cache import (
     load_profile_cache,
     save_cache,
     save_profile_cache,
+    save_watchlist_films,
 )
 from goodmoviefinder.calendar_busy import (
     CalendarError,
@@ -39,32 +40,39 @@ from goodmoviefinder.config import (
     DEFAULT_LETTERBOXD_USER,
     DEFAULT_PROGRAM_URL,
     DEFAULT_SERVE_PORT,
+    GENERATED_ACCOUNT,
     GENERATED_HTML,
 )
 from goodmoviefinder.google_calendar import fetch_google_busy, save_google_events
+from goodmoviefinder.account import format_account_html
 from goodmoviefinder.html import format_html
 from goodmoviefinder.http import fetch
 from goodmoviefinder.letterboxd import (
     apply_nonstop_metadata,
-    fetch_letterboxd_profile_slugs,
     fetch_letterboxd_watched_ratings,
+    fetch_letterboxd_watchlist,
     resolve_letterboxd,
     stored_letterboxd_still_matches,
 )
 from goodmoviefinder.models import Movie, NonstopFilmPage
 from goodmoviefinder.nonstop import parse_nonstop_movie_page, parse_program
+from goodmoviefinder.neighbors import ensure_neighbors
 from goodmoviefinder.program import (
     attach_program,
+    letterboxd_slug_from_url,
     movie_is_watchable,
     partition_program_movies,
     sort_movies,
 )
 from goodmoviefinder.serve import serve
+from goodmoviefinder.streaming import resolve_watchlist_streaming
+from goodmoviefinder.taste import build_for_you
 from goodmoviefinder.viewer import (
     canonical_languages,
     language_choices,
     language_keys,
     load_calendars,
+    load_signed_out,
     normalize_letterboxd_user,
     resolve_settings,
     save_viewer,
@@ -181,6 +189,7 @@ class ProgramPage:
         busy_intervals: list[dict[str, str]],
         calendar_status: str,
         calendar_sources: list[str],
+        signed_out: bool = False,
     ) -> None:
         self.results = results
         self.cache = cache
@@ -189,13 +198,23 @@ class ProgramPage:
         self.letterboxd_user = user
         self.languages = list(languages)
         self.no_profile = no_profile
+        self.signed_out = signed_out
         self.port = port
         self.busy_intervals = busy_intervals
         self.calendar_status = calendar_status
         self.calendar_sources = list(calendar_sources)
         self.watched_ratings: dict[str, float | None] = {}
         self.watchlist_slugs: set[str] = set()
+        self.watchlist_films: list[dict[str, object]] = []
+        self.stream_films: list[dict[str, object]] | None = None
+        self.refresh_streaming = False
         self.loved_credits: dict[str, dict] = {}
+        self.refresh_neighbors = False
+        self.see_first: list[Movie] = []
+        self.like_you: list[Movie] = []
+        self.step_outside: list[Movie] = []
+        self.taste_paragraph = ""
+        self.taste_note: str | None = None
         self._lock = threading.Lock()
 
     @property
@@ -208,12 +227,48 @@ class ProgramPage:
             "languages": self.languages,
         }
 
+    def friend_ratings(self, slug: str) -> dict[str, object]:
+        from goodmoviefinder.friends import ensure_friend_ratings, present_friend_ratings
+
+        if self.no_profile:
+            raise ValueError("Sign in to see friend ratings.")
+
+        friends = ensure_friend_ratings(
+            self.cache_path.parent / "friends.json",
+            self.letterboxd_user,
+            slug,
+            self.delay,
+        )
+        return present_friend_ratings(friends)
+
+    def _nonstop_next(self) -> dict[str, str]:
+        """Letterboxd slug -> date of the next Nonstop screening."""
+        today = date.today().isoformat()
+        upcoming: dict[str, str] = {}
+        for movie in self.results:
+            slug = letterboxd_slug_from_url(movie.letterboxd_url) if movie.letterboxd_url else None
+            if not slug:
+                continue
+            days = [
+                screening.weekday
+                for screening in movie.screenings
+                if _DATE_RE.fullmatch(screening.weekday or "") and screening.weekday >= today
+            ]
+            if days:
+                upcoming[slug] = min(days)
+        return upcoming
+
     def write(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
         if self.no_profile:
             watchlist: list[Movie] = []
             recommendations: list[Movie] = []
             watched: list[Movie] = []
             program = sort_movies(self.results)
+            self.see_first = []
+            self.like_you = []
+            self.step_outside = []
+            self.taste_paragraph = ""
+            self.taste_note = None
         else:
             watchlist, recommendations, watched, program = partition_program_movies(
                 self.results,
@@ -221,11 +276,49 @@ class ProgramPage:
                 self.watchlist_slugs,
                 self.loved_credits,
             )
+            neighbors, _aborted = ensure_neighbors(
+                self.cache_path,
+                self.letterboxd_user,
+                self.watched_ratings,
+                self.delay,
+                refresh=self.refresh_neighbors,
+            )
+            self.refresh_neighbors = False
+            taste = build_for_you(
+                self.cache,
+                self.cache_path,
+                self.watched_ratings,
+                neighbors,
+                self.watchlist_slugs,
+                known_languages=language_keys(self.languages),
+                user=self.letterboxd_user,
+                delay=self.delay,
+            )
+            self.see_first = taste.see_first
+            self.like_you = taste.like_you
+            self.step_outside = taste.step_outside
+            self.taste_paragraph = taste.paragraph
+            self.taste_note = taste.note
         found = [
             movie.primary_language for movie in self.results if movie.primary_language
         ]
         choices = language_choices(found, self.languages)
         self.languages = canonical_languages(self.languages, choices)
+        account = format_account_html(
+            letterboxd_user=self.letterboxd_user,
+            signed_in=not self.no_profile,
+            stream_films=self.stream_films,
+            nonstop_next=self._nonstop_next(),
+            see_first=self.see_first,
+            like_you=self.like_you,
+            step_outside=self.step_outside,
+            paragraph=self.taste_paragraph,
+            note=self.taste_note or "",
+            known_languages=self.languages,
+            language_options=choices,
+        )
+        GENERATED_ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
+        GENERATED_ACCOUNT.write_text(account, encoding="utf-8")
         output = format_html(
             watchlist,
             recommendations,
@@ -236,6 +329,7 @@ class ProgramPage:
             serve_port=self.port,
             busy_intervals=self.busy_intervals,
             calendar_status=self.calendar_status,
+            signed_in=not self.no_profile,
         )
         GENERATED_HTML.parent.mkdir(parents=True, exist_ok=True)
         GENERATED_HTML.write_text(output, encoding="utf-8")
@@ -257,19 +351,35 @@ class ProgramPage:
                         raise ValueError("That language list is too long.")
                     languages.append(name)
                 self.languages = languages
+            if payload.get("signOut") is True and not self.no_profile:
+                self.no_profile = True
+                self.signed_out = True
+                self.watched_ratings = {}
+                self.watchlist_slugs = set()
+                self.watchlist_films = []
+                self.stream_films = None
+                self.loved_credits = {}
+                reload = True
             if payload.get("letterboxdUser") is not None:
                 user = normalize_letterboxd_user(str(payload["letterboxdUser"]))
-                if user.casefold() != self.letterboxd_user.casefold():
-                    watched, watchlist = load_profile(
+                changed = user.casefold() != self.letterboxd_user.casefold()
+                if changed or self.no_profile:
+                    watched, watchlist, films = load_profile(
                         self.cache,
                         self.cache_path,
                         user,
                         self.delay,
-                        refresh=True,
+                        refresh=changed,
                         no_cache=False,
                     )
                     self.watched_ratings = watched
                     self.watchlist_slugs = watchlist
+                    self.watchlist_films = films
+                    self.stream_films = resolve_watchlist_streaming(
+                        films,
+                        self.delay,
+                        refresh=self.refresh_streaming,
+                    )
                     self.loved_credits = ensure_loved_film_credits(
                         self.cache,
                         self.cache_path,
@@ -278,14 +388,16 @@ class ProgramPage:
                         self.results,
                     )
                     self.letterboxd_user = user
+                    self.refresh_neighbors = True
                     self.no_profile = False
+                    self.signed_out = False
                     reload = True
             if reload:
                 self.write()
-            save_viewer(self.letterboxd_user, self.languages)
+            save_viewer(self.letterboxd_user, self.languages, signed_out=self.signed_out)
             return reload
 
-    def save_plan(self, payload: dict) -> str:
+    def save_plan(self, payload: dict) -> dict[str, object]:
         with self._lock:
             raw = payload.get("events")
             if not isinstance(raw, list) or not raw:
@@ -316,7 +428,41 @@ class ProgramPage:
             message = " ".join(sentences)
             if problems:
                 message = f"{message} {' '.join(problems)}"
-            return message
+            try:
+                calendar = self._reload_calendar_locked()
+            except Exception as exc:
+                calendar = {
+                    "intervals": self.busy_intervals,
+                    "status": self.calendar_status,
+                }
+                message = f"{message} The calendar could not be refreshed: {exc}"
+            return {"message": message, **calendar}
+
+    def refresh_calendar(self) -> dict[str, object]:
+        with self._lock:
+            sources = self.calendar_sources or load_calendars()
+            if not sources:
+                raise ValueError(
+                    "No calendar is connected. Run with --calendar apple or --calendar google."
+                )
+            return self._reload_calendar_locked()
+
+    def _reload_calendar_locked(self) -> dict[str, object]:
+        sources = self.calendar_sources or load_calendars()
+        intervals, status = _calendar_for_plan(sources, self.results)
+        self.busy_intervals = intervals
+        self.calendar_status = status
+        self.write()
+        return {"intervals": intervals, "status": status}
+
+
+def _watchlist_titles_current(
+    slugs: set[str],
+    films: list[dict[str, object]] | None,
+) -> bool:
+    if films is None:
+        return not slugs
+    return {str(film["slug"]) for film in films} == slugs
 
 
 def load_profile(
@@ -327,37 +473,50 @@ def load_profile(
     *,
     refresh: bool,
     no_cache: bool,
-) -> tuple[dict[str, float | None], set[str]]:
+) -> tuple[dict[str, float | None], set[str], list[dict[str, object]]]:
     profile = None
     if not refresh and not no_cache:
         profile = load_profile_cache(cache, user)
     if profile is not None:
-        watched_ratings, watchlist_slugs = profile
-        print(
-            f"Using cached profile: {len(watched_ratings)} watched, "
-            f"{len(watchlist_slugs)} on watchlist.",
-            file=sys.stderr,
-        )
-        return watched_ratings, watchlist_slugs
+        watched_ratings, watchlist_slugs, watchlist_films = profile
+        if _watchlist_titles_current(watchlist_slugs, watchlist_films):
+            print(
+                f"Using cached profile: {len(watched_ratings)} watched, "
+                f"{len(watchlist_slugs)} on watchlist.",
+                file=sys.stderr,
+            )
+            return watched_ratings, watchlist_slugs, watchlist_films or []
+        print(f"Fetching Letterboxd watchlist titles for @{user}…", file=sys.stderr)
+        try:
+            watchlist_films = fetch_letterboxd_watchlist(user, delay=delay)
+        except RuntimeError as exc:
+            print(f"{exc}; watchlist titles were not updated.", file=sys.stderr)
+            return watched_ratings, watchlist_slugs, []
+        save_watchlist_films(cache, user, watchlist_films)
+        save_cache(cache_path, cache)
+        watchlist_slugs = {str(film["slug"]) for film in watchlist_films}
+        print(f"Watchlist: {len(watchlist_films)} films.", file=sys.stderr)
+        return watched_ratings, watchlist_slugs, watchlist_films
 
     print(f"Fetching Letterboxd watched films for @{user}…", file=sys.stderr)
     try:
         watched_ratings = fetch_letterboxd_watched_ratings(user, delay=delay)
         print(f"Fetching Letterboxd watchlist for @{user}…", file=sys.stderr)
-        watchlist_slugs = fetch_letterboxd_profile_slugs(user, "watchlist", delay=delay)
+        watchlist_films = fetch_letterboxd_watchlist(user, delay=delay)
     except RuntimeError as exc:
         stale = load_profile_cache(cache, user, allow_stale=True)
         if stale is None:
             raise
-        watched_ratings, watchlist_slugs = stale
+        watched_ratings, watchlist_slugs, watchlist_films = stale
         print(
             f"{exc}; using the saved profile "
             f"({len(watched_ratings)} watched, {len(watchlist_slugs)} on watchlist).",
             file=sys.stderr,
         )
-        return watched_ratings, watchlist_slugs
+        return watched_ratings, watchlist_slugs, watchlist_films or []
 
-    save_profile_cache(cache, user, watched_ratings, watchlist_slugs)
+    watchlist_slugs = {str(film["slug"]) for film in watchlist_films}
+    save_profile_cache(cache, user, watched_ratings, watchlist_slugs, watchlist_films)
     save_cache(cache_path, cache)
     rated = sum(1 for value in watched_ratings.values() if value is not None)
     print(
@@ -365,7 +524,7 @@ def load_profile(
         f"{len(watchlist_slugs)} on watchlist.",
         file=sys.stderr,
     )
-    return watched_ratings, watchlist_slugs
+    return watched_ratings, watchlist_slugs, watchlist_films
 
 
 def main() -> int:
@@ -427,6 +586,11 @@ def main() -> int:
         help="Re-fetch Letterboxd watched/watchlist (ignore profile cache)",
     )
     parser.add_argument(
+        "--refresh-streaming",
+        action="store_true",
+        help="Re-check where watchlist films are streaming in Austria",
+    )
+    parser.add_argument(
         "--serve",
         action="store_true",
         help="Keep serving the page so Settings can load another Letterboxd profile",
@@ -458,6 +622,9 @@ def main() -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    signed_out = load_signed_out() and args.letterboxd_user is None
+    no_profile = args.no_letterboxd_profile or signed_out
 
     if args.no_calendar:
         calendar_sources: list[str] = []
@@ -493,10 +660,11 @@ def main() -> int:
 
     watched_ratings: dict[str, float | None] = {}
     watchlist_slugs: set[str] = set()
+    watchlist_films: list[dict[str, object]] = []
 
-    if not args.no_letterboxd_profile:
+    if not no_profile:
         try:
-            watched_ratings, watchlist_slugs = load_profile(
+            watched_ratings, watchlist_slugs, watchlist_films = load_profile(
                 cache,
                 args.cache,
                 letterboxd_user,
@@ -623,7 +791,7 @@ def main() -> int:
         results.append(movie)
 
     loved_credits: dict[str, dict] = {}
-    if args.no_letterboxd_profile:
+    if no_profile:
         grouped_watchlist: list[Movie] = []
         grouped_recommendations: list[Movie] = []
         grouped_watched: list[Movie] = []
@@ -660,7 +828,8 @@ def main() -> int:
         args.delay,
         letterboxd_user,
         known_languages,
-        no_profile=args.no_letterboxd_profile,
+        no_profile=no_profile,
+        signed_out=signed_out,
         port=args.port,
         busy_intervals=busy_intervals,
         calendar_status=calendar_status,
@@ -668,15 +837,28 @@ def main() -> int:
     )
     page.watched_ratings = watched_ratings
     page.watchlist_slugs = watchlist_slugs
+    page.watchlist_films = watchlist_films
+    page.refresh_streaming = args.refresh_streaming
+    page.refresh_neighbors = args.refresh_profile
     page.loved_credits = loved_credits
+    if no_profile:
+        page.stream_films = None
+    else:
+        page.stream_films = resolve_watchlist_streaming(
+            watchlist_films,
+            args.delay,
+            refresh=args.refresh_streaming,
+        )
     watchlist_movies, recommendation_movies, watched_movies, program_movies = page.write()
     if persist_settings or persist_calendars:
         save_viewer(
             page.letterboxd_user,
             page.languages,
             calendar_sources if persist_calendars else None,
+            signed_out=signed_out,
         )
     print(f"Wrote {GENERATED_HTML}", file=sys.stderr)
+    print(f"Wrote {GENERATED_ACCOUNT}", file=sys.stderr)
 
     known = language_keys(page.languages)
     visible_program = [
@@ -696,6 +878,7 @@ def main() -> int:
         f"Done: {len(visible_program)} in the full program (watchlist and recommendations included), "
         f"{len(watchlist_movies)} watchlist, "
         f"{len(visible_recommendations)} recommended, "
+        f"{len(page.see_first) + len(page.like_you) + len(page.step_outside)} on For you, "
         f"{len(watched_movies)} already watched, "
         f"{rated}/{len(results)} with Letterboxd ratings.",
         file=sys.stderr,

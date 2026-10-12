@@ -41,16 +41,59 @@ def serve(state: Any, port: int) -> int:
 
         def do_GET(self) -> None:
             path = urllib.parse.urlparse(self.path).path
-            if path in {"/", "/index.html"}:
+            if path == "/for-you":
+                self.send_response(302)
+                self.send_header("Location", "/account.html#recommendations")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            pages = {
+                "/": html_path,
+                "/index.html": html_path,
+                "/program-ranked.html": html_path,
+                "/account": html_path.parent / "account.html",
+                "/account.html": html_path.parent / "account.html",
+            }
+            page_path = pages.get(path)
+            if page_path is not None:
                 try:
-                    body = html_path.read_text(encoding="utf-8")
+                    body = page_path.read_text(encoding="utf-8")
                 except OSError:
-                    self._send(500, "Missing page", "text/plain; charset=utf-8")
+                    self._send(404, "This page is not ready yet", "text/plain; charset=utf-8")
                     return
                 self._send(200, body, "text/html; charset=utf-8")
                 return
             if path == "/api/viewer":
                 self._send(200, json.dumps(state.viewer_payload()), "application/json")
+                return
+            if path == "/api/friends":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                slug = (query.get("slug") or [""])[0]
+                try:
+                    payload = state.friend_ratings(slug)
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] friend ratings: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": "Letterboxd could not be reached."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps(payload), "application/json")
+                return
+            if path == "/api/calendar":
+                try:
+                    payload = state.refresh_calendar()
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    self._send(502, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                self._send(200, json.dumps({"ok": True, **payload}), "application/json")
                 return
             self._send(404, "Not found", "text/plain; charset=utf-8")
 
@@ -72,14 +115,14 @@ def serve(state: Any, port: int) -> int:
                 return
             if path == "/api/plan":
                 try:
-                    message = state.save_plan(payload)
+                    saved = state.save_plan(payload)
                 except ValueError as exc:
                     self._send(400, json.dumps({"error": str(exc)}), "application/json")
                     return
                 except Exception as exc:
                     self._send(502, json.dumps({"error": str(exc)}), "application/json")
                     return
-                self._send(200, json.dumps({"ok": True, "message": message}), "application/json")
+                self._send(200, json.dumps({"ok": True, **saved}), "application/json")
                 return
             self._send(404, json.dumps({"error": "Not found"}), "application/json")
 

@@ -11,8 +11,16 @@ from typing import Any
 
 from goodmoviefinder.http import fetch
 from goodmoviefinder.letterboxd import (
+    LetterboxdRefused,
     fetch_letterboxd_film_credit,
+    fetch_letterboxd_html,
+    letterboxd_film_nanogenres_url,
+    letterboxd_film_page_url,
+    parse_letterboxd_film_features,
+    parse_letterboxd_nanogenres,
+    parse_letterboxd_poster,
     parse_letterboxd_runtime,
+    parse_letterboxd_synopsis,
     parse_original_title,
     parse_primary_language,
 )
@@ -30,14 +38,41 @@ MATCHER_VERSION = 4
 TITLE_PARSER = 1
 
 
+def _stored_watchlist_films(profile: dict[str, Any]) -> list[dict[str, object]] | None:
+    """None when this profile was saved before watchlist titles were stored."""
+    if "watchlist_films" not in profile:
+        return None
+    raw = profile.get("watchlist_films")
+    if not isinstance(raw, list):
+        return None
+    films: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        slug = item.get("slug")
+        if not isinstance(slug, str) or not slug or slug in seen:
+            continue
+        title = item.get("title")
+        display = title.strip() if isinstance(title, str) and title.strip() else slug
+        year = item.get("year")
+        if isinstance(year, float) and year.is_integer():
+            year = int(year)
+        if not isinstance(year, int):
+            year = None
+        seen.add(slug)
+        films.append({"slug": slug, "title": display, "year": year})
+    return films
+
+
 def load_profile_cache(
     cache: dict[str, Any],
     user: str,
     *,
     allow_stale: bool = False,
-) -> tuple[dict[str, float | None], set[str]] | None:
+) -> tuple[dict[str, float | None], set[str], list[dict[str, object]] | None] | None:
     profile = cache.get("profile", {}).get(user)
-    if not profile:
+    if not isinstance(profile, dict):
         return None
     fetched_at = profile.get("fetched_at", 0)
     if not allow_stale and time.time() - fetched_at > PROFILE_CACHE_MAX_AGE:
@@ -50,7 +85,7 @@ def load_profile_cache(
         for slug, value in raw_ratings.items()
     }
     watchlist = set(profile.get("watchlist", []))
-    return watched, watchlist
+    return watched, watchlist, _stored_watchlist_films(profile)
 
 
 def save_profile_cache(
@@ -58,13 +93,28 @@ def save_profile_cache(
     user: str,
     watched_ratings: dict[str, float | None],
     watchlist: set[str],
+    watchlist_films: list[dict[str, object]],
 ) -> None:
     cache.setdefault("profile", {})[user] = {
         "watched": sorted(watched_ratings),
         "watched_ratings": watched_ratings,
         "watchlist": sorted(watchlist),
+        "watchlist_films": watchlist_films,
         "fetched_at": int(time.time()),
     }
+
+
+def save_watchlist_films(
+    cache: dict[str, Any],
+    user: str,
+    watchlist_films: list[dict[str, object]],
+) -> None:
+    """Fill in watchlist titles without marking the rest of the profile stale."""
+    profile = cache.get("profile", {}).get(user)
+    if not isinstance(profile, dict):
+        return
+    profile["watchlist"] = sorted({str(film["slug"]) for film in watchlist_films})
+    profile["watchlist_films"] = watchlist_films
 
 
 def load_cache(path: Path) -> dict[str, Any]:
@@ -388,3 +438,258 @@ def backfill_runtime(movie: Movie, delay: float) -> bool:
     movie.duration_known = True
     time.sleep(delay)
     return True
+
+
+def _slug_map(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        name: slug
+        for name, slug in value.items()
+        if isinstance(name, str) and name.strip() and isinstance(slug, str) and slug.strip()
+    }
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def film_feature_get(cache: dict[str, Any], slug: str) -> dict[str, Any] | None:
+    raw = cache.get("film_features", {}).get(slug)
+    if not isinstance(raw, dict) or not raw.get("fetched"):
+        return None
+    year = raw.get("year")
+    runtime = raw.get("runtime")
+    community = raw.get("community_rating")
+    members = raw.get("member_count")
+    return {
+        "title": raw.get("title") if isinstance(raw.get("title"), str) else None,
+        "year": year if isinstance(year, int) else None,
+        "directors": _string_list(raw.get("directors")),
+        "actors": _string_list(raw.get("actors")),
+        "genres": _string_list(raw.get("genres")),
+        "themes": _string_list(raw.get("themes")),
+        "mini_themes": _string_list(raw.get("mini_themes")),
+        "nanogenres": _string_list(raw.get("nanogenres")),
+        "nanogenre_slugs": _slug_map(raw.get("nanogenre_slugs")),
+        "nanogenres_known": bool(raw.get("nanogenres_known")),
+        "countries": _string_list(raw.get("countries")),
+        "language": raw.get("language") if isinstance(raw.get("language"), str) else None,
+        "runtime": runtime if isinstance(runtime, int) else None,
+        "community_rating": float(community) if isinstance(community, (int, float)) else None,
+        "member_count": members if isinstance(members, int) else None,
+        "themes_known": bool(raw.get("themes_known")),
+        "synopsis": raw.get("synopsis") if isinstance(raw.get("synopsis"), str) else "",
+        "poster": raw.get("poster") if isinstance(raw.get("poster"), str) else None,
+        "card_known": bool(raw.get("card_known")),
+        "fetched": True,
+    }
+
+
+def _film_feature_put(cache: dict[str, Any], slug: str, feature: dict[str, Any]) -> None:
+    previous = cache.get("film_features", {}).get(slug)
+    nanogenres = list(feature.get("nanogenres") or [])
+    nanogenre_slugs = _slug_map(feature.get("nanogenre_slugs"))
+    known = bool(feature.get("nanogenres_known"))
+    if (
+        isinstance(previous, dict)
+        and previous.get("nanogenres_known")
+        and not known
+    ):
+        nanogenres = _string_list(previous.get("nanogenres"))
+        nanogenre_slugs = _slug_map(previous.get("nanogenre_slugs"))
+        known = True
+    cache.setdefault("film_features", {})[slug] = {
+        "title": feature.get("title"),
+        "year": feature.get("year"),
+        "directors": list(feature.get("directors") or []),
+        "actors": list(feature.get("actors") or []),
+        "genres": list(feature.get("genres") or []),
+        "themes": list(feature.get("themes") or []),
+        "mini_themes": list(feature.get("mini_themes") or []),
+        "nanogenres": nanogenres,
+        "nanogenre_slugs": nanogenre_slugs,
+        "nanogenres_known": known,
+        "countries": list(feature.get("countries") or []),
+        "language": feature.get("language"),
+        "runtime": feature.get("runtime"),
+        "community_rating": feature.get("community_rating"),
+        "member_count": feature.get("member_count"),
+        "themes_known": bool(feature.get("themes_known")),
+        "synopsis": feature.get("synopsis") or "",
+        "poster": feature.get("poster"),
+        "card_known": bool(feature.get("card_known")),
+        "fetched": True,
+    }
+
+
+def ensure_film_features(
+    cache: dict[str, Any],
+    cache_path: Path,
+    slugs: list[str],
+    delay: float,
+) -> dict[str, dict[str, Any]]:
+    """Letterboxd themes, country, cast, and ratings for each slug. Cached after the first fetch."""
+    features: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    for slug in dict.fromkeys(slugs):
+        stored = film_feature_get(cache, slug)
+        if stored is None:
+            missing.append(slug)
+        else:
+            features[slug] = stored
+    if not missing:
+        return features
+
+    print(
+        f"Looking up themes and countries for {len(missing)} films…",
+        file=sys.stderr,
+    )
+    refused = 0
+    for index, slug in enumerate(missing, start=1):
+        try:
+            body = fetch_letterboxd_html(letterboxd_film_page_url(slug), delay)
+        except LetterboxdRefused as exc:
+            refused += 1
+            print(f"  [{index}/{len(missing)}] {slug}: {exc}", file=sys.stderr)
+            if refused >= 3:
+                print(
+                    "Letterboxd refused three times. Stopping the feature lookup.",
+                    file=sys.stderr,
+                )
+                break
+            time.sleep(max(delay, 1.0))
+            continue
+        except RuntimeError as exc:
+            refused = 0
+            print(f"  [{index}/{len(missing)}] {slug}: {exc}", file=sys.stderr)
+            time.sleep(delay)
+            continue
+        refused = 0
+        parsed = parse_letterboxd_film_features(body)
+        _film_feature_put(cache, slug, parsed)
+        stored = film_feature_get(cache, slug)
+        if stored is not None:
+            features[slug] = stored
+        label = parsed.get("title") or slug
+        themes = list(parsed.get("themes") or [])
+        countries = list(parsed.get("countries") or [])
+        detail = ", ".join([*countries, *themes[:2]]) or "no themes"
+        print(f"  [{index}/{len(missing)}] {label} — {detail}", file=sys.stderr)
+        if index % 10 == 0:
+            save_cache(cache_path, cache)
+        time.sleep(delay)
+    save_cache(cache_path, cache)
+    print(
+        f"Features ready for {len(features)} of {len(set(slugs))} films.",
+        file=sys.stderr,
+    )
+    return features
+
+
+def ensure_nanogenres(
+    cache: dict[str, Any],
+    cache_path: Path,
+    slugs: list[str],
+    delay: float,
+) -> None:
+    """Fill nanogenres from each film's nanogenres page. The film page itself does not list them."""
+    stored = cache.setdefault("film_features", {})
+    missing = [
+        slug
+        for slug in dict.fromkeys(slugs)
+        if isinstance(stored.get(slug), dict)
+        and stored[slug].get("fetched")
+        and not stored[slug].get("nanogenres_known")
+    ]
+    if not missing:
+        return
+    print(
+        f"Looking up nanogenres for {len(missing)} films…",
+        file=sys.stderr,
+    )
+    refused = 0
+    found = 0
+    for index, slug in enumerate(missing, start=1):
+        try:
+            body = fetch_letterboxd_html(letterboxd_film_nanogenres_url(slug), delay)
+        except LetterboxdRefused as exc:
+            refused += 1
+            print(f"  [{index}/{len(missing)}] {slug}: {exc}", file=sys.stderr)
+            if refused >= 3:
+                print(
+                    "Letterboxd refused three times. Stopping the nanogenre lookup.",
+                    file=sys.stderr,
+                )
+                break
+            time.sleep(max(delay, 1.0))
+            continue
+        except RuntimeError as exc:
+            refused = 0
+            print(f"  [{index}/{len(missing)}] {slug}: {exc}", file=sys.stderr)
+            time.sleep(delay)
+            continue
+        refused = 0
+        pairs = parse_letterboxd_nanogenres(body)
+        raw = stored.get(slug)
+        if isinstance(raw, dict):
+            raw["nanogenres"] = [name for name, _nano in pairs]
+            raw["nanogenre_slugs"] = {name: nano for name, nano in pairs}
+            raw["nanogenres_known"] = True
+            found += 1
+        if index % 25 == 0 or index == len(missing):
+            print(
+                f"  [{index}/{len(missing)}] nanogenres saved",
+                file=sys.stderr,
+            )
+            save_cache(cache_path, cache)
+        time.sleep(delay)
+    save_cache(cache_path, cache)
+    print(f"Nanogenres ready for {found} films.", file=sys.stderr)
+
+
+def ensure_film_cards(
+    cache: dict[str, Any],
+    cache_path: Path,
+    slugs: list[str],
+    delay: float,
+) -> None:
+    """Synopsis and poster for films whose features were saved before those fields existed."""
+    missing = []
+    for slug in dict.fromkeys(slugs):
+        raw = cache.get("film_features", {}).get(slug)
+        if isinstance(raw, dict) and raw.get("fetched") and not raw.get("card_known"):
+            missing.append(slug)
+    if not missing:
+        return
+    print(f"Looking up posters and synopses for {len(missing)} films…", file=sys.stderr)
+    refused = 0
+    for index, slug in enumerate(missing, start=1):
+        raw = cache.get("film_features", {}).get(slug)
+        if not isinstance(raw, dict):
+            continue
+        try:
+            body = fetch_letterboxd_html(letterboxd_film_page_url(slug), delay)
+        except LetterboxdRefused as exc:
+            refused += 1
+            print(f"  [{index}/{len(missing)}] {slug}: {exc}", file=sys.stderr)
+            if refused >= 3:
+                print("Letterboxd refused three times. Stopping poster lookup.", file=sys.stderr)
+                break
+            time.sleep(max(delay, 1.0))
+            continue
+        except RuntimeError as exc:
+            refused = 0
+            print(f"  [{index}/{len(missing)}] {slug}: {exc}", file=sys.stderr)
+            time.sleep(delay)
+            continue
+        refused = 0
+        raw["synopsis"] = parse_letterboxd_synopsis(body) or ""
+        raw["poster"] = parse_letterboxd_poster(body)
+        raw["card_known"] = True
+        label = raw.get("title") or slug
+        print(f"  [{index}/{len(missing)}] {label}", file=sys.stderr)
+        time.sleep(delay)
+    save_cache(cache_path, cache)

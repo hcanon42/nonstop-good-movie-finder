@@ -536,7 +536,30 @@
     }
 
     const planCatalog = readCatalog();
-    const planBusy = readBusy();
+    let planBusy = readBusy();
+
+    function applyCalendar(payload) {
+      const intervals = payload && Array.isArray(payload.intervals) ? payload.intervals : [];
+      const node = document.getElementById("plan-busy");
+      if (node) node.textContent = JSON.stringify({ intervals });
+      planBusy = readBusy();
+      const status = document.getElementById("plan-calendar-status");
+      const bar = document.getElementById("plan-calendar-bar");
+      if (status && payload && typeof payload.status === "string") {
+        status.textContent = payload.status;
+      }
+      if (bar && payload && payload.status) bar.hidden = false;
+      renderPlan();
+    }
+
+    function todayIsoNow() {
+      const now = new Date();
+      return [
+        now.getFullYear(),
+        String(now.getMonth() + 1).padStart(2, "0"),
+        String(now.getDate()).padStart(2, "0"),
+      ].join("-");
+    }
     let planSelected = [];
     try {
       const raw = JSON.parse(localStorage.getItem(PLAN_STORAGE) || "[]");
@@ -611,20 +634,22 @@
         options.replaceChildren();
         summary.hidden = true;
         if (actions) actions.hidden = true;
-        calendar.hidden = true;
-        calendar.replaceChildren();
         left.hidden = true;
+        leftList.replaceChildren();
         plannedRows = [];
         markPlannedDays([]);
+        if (planBusy.length) {
+          calendar.hidden = false;
+          calendar.innerHTML = planCalendarHtml([], todayIsoNow());
+        } else {
+          calendar.hidden = true;
+          calendar.replaceChildren();
+        }
         return;
       }
       const films = planSelected.map((id) => planCatalog.get(id)).filter(Boolean);
       const now = new Date();
-      const todayIso = [
-        now.getFullYear(),
-        String(now.getMonth() + 1).padStart(2, "0"),
-        String(now.getDate()).padStart(2, "0"),
-      ].join("-");
+      const todayIso = todayIsoNow();
       const choices = planChoices(films, todayIso, now.getHours() * 60 + now.getMinutes());
       if (!choices.some((choice) => choice.mode === planMode)) planMode = choices[0].mode;
       const active = choices.find((choice) => choice.mode === planMode) || choices[0];
@@ -641,7 +666,7 @@
       summary.textContent = result.summary;
       plannedRows = result.rows;
       if (actions) actions.hidden = result.rows.length === 0;
-      if (saveStatus && actions && actions.hidden) saveStatus.textContent = "";
+      if (saveStatus && !saveStatus.textContent) saveStatus.hidden = true;
       if (result.rows.length || planBusy.length) {
         calendar.hidden = false;
         calendar.innerHTML = planCalendarHtml(result.rows, todayIso);
@@ -721,9 +746,51 @@
           throw new Error(payload.error || fallback);
         }
         status.textContent = payload.message || "Added to your calendar.";
+        planSelected = [];
+        const cap = document.getElementById("plan-cap");
+        if (cap) cap.hidden = true;
+        writePlan();
+        syncPlanControls();
+        if (Array.isArray(payload.intervals)) applyCalendar(payload);
+        else renderPlan();
       } catch (err) {
         status.textContent = err && err.message ? err.message : "Could not add the plan.";
         status.classList.add("is-error");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function refreshCalendar() {
+      const button = document.getElementById("plan-refresh");
+      const status = document.getElementById("plan-save-status");
+      if (!button) return;
+      button.disabled = true;
+      if (status) {
+        status.hidden = false;
+        status.classList.remove("is-error");
+        status.textContent = "Reading your calendar…";
+      }
+      try {
+        const response = await fetch("/api/calendar");
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const fallback = response.status === 404
+            ? "Restart python3 goodmoviefinder.py --serve, then refresh the calendar."
+            : "Could not read your calendar.";
+          throw new Error(payload.error || fallback);
+        }
+        applyCalendar(payload);
+        if (status) {
+          status.textContent = "";
+          status.hidden = true;
+        }
+      } catch (err) {
+        if (status) {
+          status.hidden = false;
+          status.textContent = err && err.message ? err.message : "Could not read your calendar.";
+          status.classList.add("is-error");
+        }
       } finally {
         button.disabled = false;
       }
@@ -747,6 +814,8 @@
     if (planClear) planClear.addEventListener("click", clearPlan);
     const planSave = document.getElementById("plan-save");
     if (planSave) planSave.addEventListener("click", savePlan);
+    const planRefresh = document.getElementById("plan-refresh");
+    if (planRefresh) planRefresh.addEventListener("click", refreshCalendar);
     const planOptions = document.getElementById("plan-options");
     if (planOptions) {
       planOptions.addEventListener("click", (event) => {

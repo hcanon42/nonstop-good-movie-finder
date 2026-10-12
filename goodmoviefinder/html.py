@@ -5,7 +5,7 @@ from __future__ import annotations
 import calendar
 import html
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from goodmoviefinder.config import (
@@ -13,6 +13,8 @@ from goodmoviefinder.config import (
     DEFAULT_LETTERBOXD_USER,
     DEFAULT_SERVE_PORT,
 )
+from goodmoviefinder.letterboxd import letterboxd_poster_url
+from goodmoviefinder.layout import render_page
 from goodmoviefinder.models import Movie, Screening
 from goodmoviefinder.program import (
     _MONTHS,
@@ -26,7 +28,9 @@ from goodmoviefinder.program import (
     format_language,
     format_screening_date,
     language_filter_blurb,
+    letterboxd_slug_from_url,
     movie_is_watchable,
+    sort_movies,
     split_program_groups,
     venue_label,
 )
@@ -180,6 +184,22 @@ def _screenings_by_day(screenings: list[Screening]) -> dict[date, list[Screening
     return grouped
 
 
+def _friend_ratings_html(slug: str | None) -> str:
+    """Placeholder filled when the film is opened, if the page is being served."""
+    if not slug or len(slug) > 160:
+        return ""
+    if any(not (character.isalnum() or character == "-") for character in slug):
+        return ""
+    safe = html.escape(slug, quote=True)
+    return (
+        f'<section class="friend-ratings" data-friend-slug="{safe}">'
+        f'<h3 class="schedule-label">Letterboxd friends</h3>'
+        f'<p class="friend-status muted">Loading friend ratings…</p>'
+        f'<ul class="friend-list" hidden></ul>'
+        f"</section>"
+    )
+
+
 def _external_link(url: str, label: str, css_class: str = "") -> str:
     class_attr = f' class="{css_class}"' if css_class else ""
     return (
@@ -268,6 +288,8 @@ def _showtimes_list_html(
 
 
 def _schedule_html(movie: Movie, known: frozenset[str]) -> str:
+    if not movie.screenings:
+        return ""
     by_day = _screenings_by_day(movie.screenings)
     if not by_day:
         return '<p class="muted">No screenings in a version you can follow.</p>'
@@ -316,12 +338,14 @@ def _detail_panel_html(movie: Movie, detail_id: str, known: frozenset[str]) -> s
         letterboxd = (
             f'<p class="detail-links">{_external_link(movie.letterboxd_url, label, "link-lb")}</p>'
         )
+        friends = _friend_ratings_html(letterboxd_slug_from_url(movie.letterboxd_url))
     else:
         letterboxd = ""
+        friends = ""
     return (
         f'<div class="detail panel panel-inset" id="{html.escape(detail_id, quote=True)}">'
         f"{poster}"
-        f'<div class="detail-body">{synopsis}{letterboxd}{_schedule_html(movie, known)}</div>'
+        f'<div class="detail-body">{synopsis}{letterboxd}{friends}{_schedule_html(movie, known)}</div>'
         f"</div>"
     )
 
@@ -332,6 +356,19 @@ def _because_html(movie: Movie, css_class: str = "because") -> str:
     return (
         f'<span class="{css_class}">{html.escape(movie.because)}</span>'
     )
+
+
+def _leaving_soon(movie: Movie) -> bool:
+    today = date.today()
+    last: date | None = None
+    for screening in movie.screenings:
+        try:
+            day = date.fromisoformat(screening.weekday)
+        except ValueError:
+            continue
+        if last is None or day > last:
+            last = day
+    return last is not None and today <= last <= today + timedelta(days=7)
 
 
 def _movie_search_blob(movie: Movie) -> str:
@@ -353,12 +390,23 @@ def _calendar_groups(
     recommendations: list[Movie],
     watched: list[Movie],
     program: list[Movie],
+    see_first: list[Movie] | None = None,
+    like_you: list[Movie] | None = None,
+    step_outside: list[Movie] | None = None,
 ) -> list[tuple[str, str, list[tuple[str, Movie]]]]:
     """Same section order and row ids as the list tables."""
     rated, unrated, unfound = split_program_groups(program)
+    if see_first is not None or like_you is not None or step_outside is not None:
+        taste_labeled = (
+            ("see-first", "See this first", see_first or []),
+            ("like-you", "More like what you love", like_you or []),
+            ("step-outside", "A step outside", step_outside or []),
+        )
+    else:
+        taste_labeled = (("recommendations", "Recommended", recommendations),)
     labeled = (
+        *taste_labeled,
         ("watchlist", "Watchlist", watchlist),
-        ("recommendations", "Recommended", recommendations),
         ("watched", "Watched", watched),
         ("program", "Program", rated),
         ("unrated", "Unrated", unrated),
@@ -633,10 +681,21 @@ def _program_calendar_html(
     program: list[Movie],
     known: frozenset[str],
     today: date | None = None,
+    see_first: list[Movie] | None = None,
+    like_you: list[Movie] | None = None,
+    step_outside: list[Movie] | None = None,
 ) -> str:
     today = today or date.today()
     by_day = _calendar_by_day(
-        _calendar_groups(watchlist, recommendations, watched, program)
+        _calendar_groups(
+            watchlist,
+            recommendations,
+            watched,
+            program,
+            see_first,
+            like_you,
+            step_outside,
+        )
     )
     current = (today.year, today.month)
     following = _shift_month(*current)
@@ -659,8 +718,11 @@ def _format_html_movie_row(
     row_class: str = "",
     row_id: str = "",
     show_user_rating: bool = False,
+    show_predicted: bool = False,
     language_filter: bool = False,
+    unavailable: bool = False,
     show_because: bool = True,
+    show_follow_badge: bool = True,
 ) -> str:
     rating_text = f"{m.rating:.2f}" if m.rating is not None else "—"
     title = html.escape(film_title(m))
@@ -678,21 +740,31 @@ def _format_html_movie_row(
         genre_html = '<span class="muted">—</span>'
     year = html.escape(_format_year(m))
     follow = movie_is_watchable(m, known)
-    show_badge = not follow and not language_filter
-    hide_row = language_filter and not follow
+    if unavailable:
+        show_badge = False
+        hide_row = follow
+        filter_mode = "unavailable"
+    else:
+        show_badge = show_follow_badge and not follow and not language_filter
+        hide_row = language_filter and not follow
+        filter_mode = "hide" if language_filter else ("catalog" if not show_follow_badge else "keep")
     follow_badge = (
         '<span class="chip chip-warn follow-badge" '
         'title="No screenings in a version you can follow."'
         f'{" hidden" if not show_badge else ""}>no followable version</span>'
     )
     because_html = _because_html(m) if show_because else ""
+    soon_html = (
+        '<span class="chip chip-soon" title="Last screening is within 7 days">Leaving soon</span> '
+        if (show_predicted or m.predicted_rating is not None) and _leaving_soon(m)
+        else ""
+    )
     classes = " ".join(
         part for part in (row_class, "row-no-follow" if show_badge else "") if part
     )
     extra = f' class="{classes}"' if classes else ""
     row_hidden = " hidden" if hide_row else ""
     lang_hide = "1" if hide_row else "0"
-    filter_mode = "hide" if language_filter else "keep"
     primary = html.escape(m.primary_language or "", quote=True)
     versions = html.escape(" ".join(m.versions), quote=True)
     detail_classes = " ".join(part for part in ("detail-row", row_class) if part)
@@ -716,6 +788,23 @@ def _format_html_movie_row(
         you_value = f"{m.user_rating:.4f}" if m.user_rating is not None else ""
         sort_you = f' data-sort-you="{you_value}"'
         columns = 7
+    predicted_cell = ""
+    sort_predicted = ""
+    if show_predicted:
+        predicted_text = f"{m.predicted_rating:.1f}" if m.predicted_rating is not None else "—"
+        predicted_cell = (
+            '<td class="col-rating">'
+            + _rating_badge(
+                m.predicted_rating,
+                predicted_text,
+                "rating-you",
+                "Predicted rating for you",
+            )
+            + "</td>"
+        )
+        predicted_value = f"{m.predicted_rating:.4f}" if m.predicted_rating is not None else ""
+        sort_predicted = f' data-sort-predicted="{predicted_value}"'
+        columns += 1
     sort_rating = f"{m.rating:.4f}" if m.rating is not None else ""
     sort_year = str(m.year) if m.year is not None else ""
     sort_title = html.escape(film_title(m), quote=True)
@@ -727,19 +816,21 @@ def _format_html_movie_row(
         f'data-search="{search_blob}"'
         f' data-filter="{filter_mode}" data-lang-hide="{lang_hide}"'
         f' data-primary-language="{primary}" data-versions="{versions}"'
-        f' data-sort-rating="{sort_rating}"{sort_you}'
+        f' data-sort-rating="{sort_rating}"{sort_you}{sort_predicted}'
         f' data-sort-year="{sort_year}"'
         f' data-sort-title="{sort_title}"'
         f' data-sort-director="{sort_director}"'
         f' data-sort-genres="{sort_genres}"'
         f' data-sort-language="{sort_language}">'
         f'<td class="col-rating">{_rating_badge(m.rating, rating_text)}</td>'
+        f"{predicted_cell}"
         f"{user_cell}"
         f"<td class=\"col-year\">{year}</td>"
         f'<td class="col-title"><span class="title-line">{_plan_add_button(m)}'
         f'<button type="button" class="expand" '
         f'aria-expanded="false" aria-controls="{html.escape(detail_id, quote=True)}">'
-        f"<strong>{title}</strong> {follow_badge}{because_html}</button></span></td>"
+        f"<strong>{title}</strong> {follow_badge}{soon_html}{because_html}</button>"
+        f'<span class="row-chevron" aria-hidden="true"></span></span></td>'
         f"<td class=\"col-director\">{directors}</td>"
         f"<td class=\"col-genres\">{genre_html}</td>"
         f"<td class=\"col-language\">{language}</td>"
@@ -774,8 +865,12 @@ def _html_table_section(
     known: frozenset[str],
     row_class: str = "",
     show_user_rating: bool = False,
+    show_predicted: bool = False,
     language_filter: bool = False,
+    unavailable: bool = False,
     show_because: bool = True,
+    start_folded: bool = False,
+    show_follow_badge: bool = True,
 ) -> str:
     if not movies:
         return ""
@@ -786,25 +881,46 @@ def _html_table_section(
             row_class=row_class,
             row_id=f"{section_id}-{index}",
             show_user_rating=show_user_rating,
+            show_predicted=show_predicted,
             language_filter=language_filter,
+            unavailable=unavailable,
             show_because=show_because,
+            show_follow_badge=show_follow_badge,
         )
         for index, movie in enumerate(movies)
     )
-    visible = [
-        movie
-        for movie in movies
-        if not language_filter or movie_is_watchable(movie, known)
-    ]
+    if unavailable:
+        visible = [movie for movie in movies if not movie_is_watchable(movie, known)]
+    else:
+        visible = [
+            movie
+            for movie in movies
+            if not language_filter or movie_is_watchable(movie, known)
+        ]
     count = len(visible)
     section_hidden = " hidden" if count == 0 else ""
+    folded_class = " is-folded" if start_folded else ""
+    folded_attr = " data-start-folded" if start_folded else ""
+    expanded = "false" if start_folded else "true"
     you_header = _sortable_header("You", "you", "number", extra_class="col-rating") if show_user_rating else ""
+    rating_sort = None if show_predicted else "descending"
+    predicted_header = (
+        _sortable_header(
+            "For you",
+            "predicted",
+            "number",
+            sorted_dir="descending",
+            extra_class="col-rating",
+        )
+        if show_predicted
+        else ""
+    )
     film_word = "film" if count == 1 else "films"
     note_id = ' id="program-language-note"' if section_id == "program" else ""
     return f"""
-<section class="program-section" id="{section_id}"{section_hidden}>
+<section class="program-section{folded_class}" id="{section_id}"{folded_attr}{section_hidden}>
   <h2 class="section-head">
-    <button type="button" class="section-toggle" aria-expanded="true" aria-controls="{section_id}-table">
+    <button type="button" class="section-toggle" aria-expanded="{expanded}" aria-controls="{section_id}-table">
       <span class="section-rail" aria-hidden="true"></span>
       <span class="section-copy">
         <span class="section-title-row">
@@ -822,7 +938,8 @@ def _html_table_section(
         <table>
           <thead>
             <tr>
-              {_sortable_header("Rating", "rating", "number", sorted_dir="descending", extra_class="col-rating")}
+              {_sortable_header("Rating", "rating", "number", sorted_dir=rating_sort, extra_class="col-rating")}
+              {predicted_header}
               {you_header}
               {_sortable_header("Year", "year", "number", extra_class="col-year")}
               {_sortable_header("Film", "title", "text", extra_class="col-title")}
@@ -841,44 +958,18 @@ def _html_table_section(
 </section>"""
 
 
-def _settings_html(user: str, choices: list[str], selected: list[str]) -> str:
-    selected_keys = {name.casefold() for name in selected}
-    boxes = []
-    for name in choices:
-        checked = " checked" if name.casefold() in selected_keys else ""
-        boxes.append(
-            '<label class="lang-option">'
-            f'<input type="checkbox" name="language" value="{html.escape(name, quote=True)}"{checked}>'
-            f"<span>{html.escape(name)}</span></label>"
-        )
-    safe_user = html.escape(user)
-    safe_value = html.escape(user, quote=True)
-    return (
-        '<div class="settings">'
-        '<button type="button" class="settings-open" id="settings-open" '
-        'aria-expanded="false" aria-controls="settings-panel" '
-        'title="Letterboxd profile and languages">'
-        f"@{safe_user}</button>"
-        '<div id="settings-panel" class="settings-panel" role="dialog" '
-        'aria-label="Viewer settings" hidden>'
-        '<form id="settings-form">'
-        '<label class="settings-user" for="letterboxd-user">Letterboxd profile</label>'
-        '<div class="settings-user-row">'
-        '<span class="settings-at" aria-hidden="true">@</span>'
-        f'<input id="letterboxd-user" name="letterboxd" value="{safe_value}" '
-        'autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">'
-        '<button type="submit" class="settings-load">Load</button>'
-        "</div>"
-        '<p id="settings-status" class="settings-status" role="status"></p>'
-        '<fieldset class="settings-languages">'
-        "<legend>Languages you know</legend>"
-        f'<div class="lang-options">{"".join(boxes)}</div>'
-        '<p class="settings-hint">Original versions count for these languages. '
-        "Every other film needs English subtitles.</p>"
-        "</fieldset>"
-        '<button type="button" id="settings-reset" class="settings-reset">Reset languages</button>'
-        "</form></div></div>"
-    )
+def _language_candidates(*groups: list[Movie]) -> list[Movie]:
+    """Films whose primary language can leave them without a followable version."""
+    seen: set[str] = set()
+    chosen: list[Movie] = []
+    for group in groups:
+        for movie in group:
+            key = movie.nonstop_url or film_title(movie).casefold()
+            if key in seen or not movie.primary_language:
+                continue
+            seen.add(key)
+            chosen.append(movie)
+    return sort_movies(chosen)
 
 
 def _nav_link(section_id: str, label: str, present: bool, visible: bool) -> str:
@@ -899,7 +990,9 @@ def format_html(
     serve_port: int = DEFAULT_SERVE_PORT,
     busy_intervals: list[dict[str, str]] | None = None,
     calendar_status: str = "",
+    signed_in: bool = True,
 ) -> str:
+    """The Nonstop Kino page: List, Calendar and Plan tabs."""
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
     found = [
         movie.primary_language
@@ -910,10 +1003,16 @@ def format_html(
     selected = canonical_languages(selected, choices)
     known = language_keys(selected)
     user_label = f"@{letterboxd_user}"
-    sections = []
+    rated, unrated, unfound = split_program_groups(program)
+    unavailable_movies = _language_candidates(watchlist, recommendations, watched, program)
+
+    def section(*args: object, **kwargs: object) -> str:
+        return _html_table_section(*args, **kwargs)  # type: ignore[arg-type]
+
+    personal: list[str] = []
     if watchlist:
-        sections.append(
-            _html_table_section(
+        personal.append(
+            section(
                 "watchlist",
                 "Watchlist",
                 f"On {user_label}'s Letterboxd watchlist and playing at Nonstop Wien",
@@ -923,8 +1022,8 @@ def format_html(
             )
         )
     if recommendations:
-        sections.append(
-            _html_table_section(
+        personal.append(
+            section(
                 "recommendations",
                 "Recommendations",
                 (
@@ -938,8 +1037,8 @@ def format_html(
             )
         )
     if watched:
-        sections.append(
-            _html_table_section(
+        personal.append(
+            section(
                 "watched",
                 "Already watched",
                 f"{user_label} has seen these — they're back on the program",
@@ -949,10 +1048,10 @@ def format_html(
                 show_user_rating=True,
             )
         )
-    rated, unrated, unfound = split_program_groups(program)
+    main_sections: list[str] = []
     if rated:
-        sections.append(
-            _html_table_section(
+        main_sections.append(
+            section(
                 "program",
                 "Full program",
                 language_filter_blurb(selected),
@@ -962,9 +1061,10 @@ def format_html(
                 show_because=False,
             )
         )
+    other: list[str] = []
     if unrated:
-        sections.append(
-            _html_table_section(
+        other.append(
+            section(
                 "unrated",
                 "Unrated",
                 "Matched on Letterboxd, but the film has no community rating yet",
@@ -975,8 +1075,8 @@ def format_html(
             )
         )
     if unfound:
-        sections.append(
-            _html_table_section(
+        other.append(
+            section(
                 "unfound",
                 "Unfound",
                 "No Letterboxd page could be matched to these titles",
@@ -986,33 +1086,58 @@ def format_html(
                 show_because=False,
             )
         )
-    sections_html = "\n".join(sections)
-    calendar_html = _program_calendar_html(
-        watchlist, recommendations, watched, program, known
-    )
-    catalog_json = _plan_catalog_json(
-        [*watchlist, *recommendations, *watched, *program]
-    )
+    if unavailable_movies:
+        other.append(
+            section(
+                "unavailable",
+                "Unavailable movies for you",
+                "No screening in a version you can follow",
+                unavailable_movies,
+                known,
+                unavailable=True,
+                show_because=False,
+            )
+        )
+    groups: list[str] = []
+    if personal:
+        groups.append(
+            '<section class="section-group" id="group-personal">'
+            f'<h2 class="group-title">Picked for {html.escape(user_label)}</h2>'
+            + "\n".join(personal)
+            + "</section>"
+        )
+    if main_sections:
+        groups.append(
+            '<section class="section-group" id="group-program">'
+            '<h2 class="group-title">Program</h2>'
+            + "\n".join(main_sections)
+            + "</section>"
+        )
+    if other:
+        groups.append(
+            '<details class="section-group group-other" id="group-other">'
+            '<summary><h2 class="group-title">More: unrated, unfound and unavailable</h2></summary>'
+            + "\n".join(other)
+            + "</details>"
+        )
+    list_html = "\n".join(groups)
+
+    calendar_html = _program_calendar_html(watchlist, recommendations, watched, program, known)
+    catalog_json = _plan_catalog_json([*watchlist, *recommendations, *watched, *program])
     busy_json = json.dumps(
         {"intervals": busy_intervals or []},
         ensure_ascii=False,
     ).replace("<", "\\u003c")
-    status_html = ""
-    if calendar_status:
-        status_html = (
-            f'<p class="plan-calendar-status">{html.escape(calendar_status)}</p>'
-        )
-    settings_html = _settings_html(letterboxd_user, choices, selected)
-    viewer_json = _json_for_html(
-        {
-            "letterboxdUser": letterboxd_user,
-            "languages": selected,
-            "defaults": list(DEFAULT_KNOWN_LANGUAGES),
-            "stamp": settings_stamp(letterboxd_user, selected),
-            "port": serve_port,
-        }
+    bar_hidden = "" if calendar_status else " hidden"
+    status_html = (
+        f'<div class="plan-calendar-bar" id="plan-calendar-bar"{bar_hidden}>'
+        f'<p class="plan-calendar-status" id="plan-calendar-status">'
+        f"{html.escape(calendar_status)}</p>"
+        f'<button type="button" id="plan-refresh" class="plan-refresh">'
+        f"Refresh calendar</button></div>"
     )
-    nav_html = "".join(
+
+    nav_links = "".join(
         (
             _nav_link("watchlist", "Watchlist", bool(watchlist), bool(watchlist)),
             _nav_link(
@@ -1040,61 +1165,43 @@ def format_html(
                 bool(unfound),
                 any(movie_is_watchable(movie, known) for movie in unfound),
             ),
+            _nav_link(
+                "unavailable",
+                "Unavailable",
+                bool(unavailable_movies),
+                any(not movie_is_watchable(movie, known) for movie in unavailable_movies),
+            ),
         )
     )
-
-    return (
-        f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Nonstop Kino — Letterboxd rankings</title>
-  <style>
-'''
-        + (_ASSET_DIR / "page.css").read_text(encoding="utf-8")
-        + f'''  </style>
-
-</head>
-<body>
-  <header class="hero">
-    <div class="hero-inner">
-      <h1>Nonstop Kino × Letterboxd</h1>
-      <p class="tagline">Wien program ranked by community ratings — find what to see next.</p>
-    </div>
-  </header>
-  <div class="toolbar">
-    <div class="toolbar-row">
-      <div class="view-toggle" role="group" aria-label="How to browse the program">
-        <button type="button" class="view-option" data-view="list" aria-pressed="true" title="Ranked by rating">List</button>
-        <button type="button" class="view-option" data-view="calendar" aria-pressed="false" title="Films by day">Calendar</button>
-        <button type="button" class="view-option" data-view="plan" aria-pressed="false" title="Best schedule for films you pick">Plan<span id="plan-count" class="plan-count" hidden></span></button>
-      </div>
-      {settings_html}
-      <p id="plan-cap" class="plan-cap" hidden>A plan holds 12 films.</p>
-      <div class="search-field">
-        <input type="search" id="search" placeholder="Filter by title, director, genre…" autocomplete="off" aria-describedby="search-count">
-        <span id="search-count" class="search-count" role="status" hidden></span>
-        <button type="button" id="search-clear" class="search-clear" hidden aria-label="Clear search">&times;</button>
-      </div>
-      <nav class="nav-pills" aria-label="Program sections">
-        {nav_html}
-      </nav>
-    </div>
-  </div>
-  <main>
-    <div id="list-view">
-{sections_html}
+    tools_html = (
+        '      <div class="search-field" data-tools="list calendar">\n'
+        '        <input type="search" id="search" placeholder="Filter by title, director, genre…" '
+        'autocomplete="off" aria-describedby="search-count">\n'
+        '        <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>\n'
+        '        <button type="button" id="search-clear" class="search-clear" hidden '
+        'aria-label="Clear search">&times;</button>\n'
+        "      </div>\n"
+        '      <button type="button" class="btn lang-chip" data-open-account data-tools="list calendar" '
+        'title="Change the languages you follow">Languages: <strong id="lang-summary">'
+        f"{html.escape(', '.join(selected) or 'English subtitles only')}</strong></button>\n"
+        '      <div data-tools="list calendar plan"><p id="plan-cap" class="plan-cap" hidden>'
+        "A plan holds 12 films.</p></div>\n"
+        '      <nav class="nav-pills" aria-label="Program sections" data-tools="list calendar">'
+        '<span class="nav-pills-label" id="nav-pills-label">Jump to</span>'
+        f"{nav_links}</nav>"
+    )
+    panels_html = f"""    <div id="list-view" role="tabpanel" aria-labelledby="tab-list">
+{list_html}
       <p class="empty-hint" id="list-empty" hidden>No films match this search.</p>
     </div>
-    <div id="calendar-view" hidden>
+    <div id="calendar-view" role="tabpanel" aria-labelledby="tab-calendar" hidden>
 {calendar_html}
       <p class="empty-hint" id="calendar-empty" hidden>No films match.</p>
     </div>
-    <div id="plan-view" hidden>
+    <div id="plan-view" role="tabpanel" aria-labelledby="tab-plan" hidden>
       <div class="plan-board">
         {status_html}
-        <p class="empty-hint" id="plan-empty">Add films from the list or calendar. A plan holds up to 12.</p>
+        <p class="empty-hint" id="plan-empty">Add films from the list or calendar with the + button. A plan holds up to 12.</p>
         <div class="plan-picked" id="plan-picked" hidden>
           <div class="plan-chips" id="plan-chips"></div>
           <button type="button" id="plan-clear" class="plan-clear">Clear all</button>
@@ -1103,30 +1210,51 @@ def format_html(
         <p class="plan-summary" id="plan-summary" hidden></p>
         <p class="plan-actions" id="plan-actions" hidden>
           <button type="button" id="plan-save" class="plan-save">Add plan to calendar</button>
-          <span id="plan-save-status" class="plan-save-status" role="status"></span>
         </p>
+        <p id="plan-save-status" class="plan-save-status" role="status" hidden></p>
         <div class="plan-calendar" id="plan-schedule" hidden></div>
         <section class="plan-left-out" id="plan-left-out" hidden>
           <h2>Not scheduled</h2>
           <ul id="plan-left-out-list"></ul>
         </section>
       </div>
-    </div>
-  </main>
-  <footer>
-    Generated by goodmoviefinder. Ratings from Letterboxd; showtimes from Nonstop Kino Wien.
-  </footer>
-  <script type="application/json" id="viewer-config">{viewer_json}</script>
-  <script type="application/json" id="plan-busy">{busy_json}</script>
-  <script type="application/json" id="plan-catalog">{catalog_json}</script>
-  <script>
-'''
-        + (_ASSET_DIR / "page.js").read_text(encoding="utf-8")
-        + '''  </script>
-  <script>
-'''
-        + (_ASSET_DIR / "plan.js").read_text(encoding="utf-8")
-        + '''  </script>
-</body>
-</html>'''
+    </div>"""
+    total = len({movie.nonstop_url or film_title(movie) for movie in (*program, *watchlist, *recommendations, *watched)})
+    stats = [f"<strong>{total}</strong> films playing"]
+    hint = ""
+    if signed_in:
+        stats.append(f"<strong>{len(watchlist)}</strong> on your watchlist")
+        stats.append(f"<strong>{len(recommendations)}</strong> recommended")
+        stats.append(f"<strong>{len(watched)}</strong> already seen")
+    else:
+        hint = (
+            '<p class="page-hint"><a href="#" data-open-account>Sign in</a> with your Letterboxd '
+            "username to highlight your watchlist, recommendations and films you have seen.</p>"
+        )
+    extra = (
+        f'  <script type="application/json" id="plan-busy">{busy_json}</script>\n'
+        f'  <script type="application/json" id="plan-catalog">{catalog_json}</script>\n'
+    )
+    return render_page(
+        page="nonstop",
+        title="Nonstop Kino — Letterboxd rankings",
+        heading="Nonstop Kino Wien",
+        tagline="The Wien program ranked by Letterboxd community ratings. Find what to see next.",
+        stats=stats,
+        hint_html=hint,
+        tabs=[("list", "List"), ("calendar", "Calendar"), ("plan", 'Plan<span id="plan-count" class="plan-count" hidden></span>')],
+        tools_html=tools_html,
+        panels_html=panels_html,
+        user=letterboxd_user,
+        signed_in=signed_in,
+        choices=choices,
+        selected=selected,
+        viewer={"port": serve_port, "stamp": settings_stamp(letterboxd_user, selected)},
+        scripts=("page.js", "shell.js", "plan.js"),
+        styles=("base.css", "nonstop.css"),
+        extra_json=extra,
+        footer=(
+            "Generated by goodmoviefinder. Ratings from Letterboxd; "
+            "showtimes from Nonstop Kino Wien."
+        ),
     )

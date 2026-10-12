@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +33,9 @@ LETTERBOXD_NEXT_PAGE_RE = re.compile(
     r'<a class="next" href="([^"]+)"[^>]*>\s*Older\s*</a>',
     re.IGNORECASE,
 )
+LETTERBOXD_ITEM_NAME_RE = re.compile(r'data-item-name="([^"]*)"')
+# Letterboxd display names end with the release year: "Title (2006)".
+_DISPLAY_YEAR_RE = re.compile(r"\s+\(((?:19|20)\d{2})\)$")
 
 PRIMARY_LANGUAGE_RE = re.compile(
     r"Primary Language</span></h3>\s*"
@@ -59,6 +63,65 @@ def parse_letterboxd_profile_slugs(html_text: str) -> set[str]:
     return set(LETTERBOXD_SLUG_RE.findall(html_text))
 
 
+def letterboxd_catalog_url(kind: str, slug: str, page: int = 1) -> str:
+    base = f"https://letterboxd.com/csi/films/films-browser-list/{kind}/{slug}/by/rating/"
+    if page > 1:
+        base += f"page/{page}/"
+    return base + "?esi"
+
+
+def fetch_catalog_film_slugs(kind: str, slug: str, delay: float, pages: int = 1) -> list[str]:
+    """Film slugs from a Letterboxd country or theme list, highest rated first."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for page in range(1, pages + 1):
+        try:
+            body = fetch_letterboxd_html(letterboxd_catalog_url(kind, slug, page), delay)
+        except (LetterboxdRefused, RuntimeError):
+            break
+        time.sleep(max(delay, 1.0))
+        for film_slug in LETTERBOXD_SLUG_RE.findall(body):
+            if film_slug in seen:
+                continue
+            seen.add(film_slug)
+            found.append(film_slug)
+        if not body or "data-item-slug" not in body:
+            break
+    return found
+
+
+def watchlist_film_record(slug: str, display_name: str) -> dict[str, object]:
+    """Title and release year from a Letterboxd poster name such as 'Title (2006)'."""
+    name = html.unescape(display_name).strip()
+    year: int | None = None
+    match = _DISPLAY_YEAR_RE.search(name)
+    title = name
+    if match:
+        year = int(match.group(1))
+        title = name[: match.start()].strip()
+    return {"slug": slug, "title": title or slug, "year": year}
+
+
+def parse_letterboxd_watchlist_films(html_text: str) -> list[dict[str, object]]:
+    """Films on one watchlist page, in the order Letterboxd shows them."""
+    films: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for chunk in html_text.split('<li class="griditem">')[1:]:
+        end = chunk.find("</li>")
+        item = chunk if end < 0 else chunk[:end]
+        slug_match = LETTERBOXD_SLUG_RE.search(item)
+        if not slug_match:
+            continue
+        slug = slug_match.group(1)
+        if slug in seen:
+            continue
+        seen.add(slug)
+        name_match = LETTERBOXD_ITEM_NAME_RE.search(item)
+        display_name = name_match.group(1) if name_match else slug
+        films.append(watchlist_film_record(slug, display_name))
+    return films
+
+
 def parse_letterboxd_watched_ratings(html_text: str) -> dict[str, float | None]:
     """Map each film slug on a watched page to that viewer's rating."""
     ratings: dict[str, float | None] = {}
@@ -73,12 +136,17 @@ def parse_letterboxd_watched_ratings(html_text: str) -> dict[str, float | None]:
     return ratings
 
 
-def _iter_letterboxd_profile_pages(user: str, section: str, delay: float):
+def _iter_letterboxd_profile_pages(
+    user: str,
+    section: str,
+    delay: float,
+    max_pages: int = 50,
+):
     page = 1
     opener = make_cookie_opener()
     profile_delay = max(delay, 1.0)
 
-    while page <= 50:
+    while page <= max_pages:
         url = letterboxd_profile_url(user, section, page)
         html_text = None
         for attempt in range(4):
@@ -107,19 +175,35 @@ def fetch_letterboxd_profile_slugs(
     user: str,
     section: str,
     delay: float,
+    max_pages: int = 50,
 ) -> set[str]:
     slugs: set[str] = set()
-    for html_text in _iter_letterboxd_profile_pages(user, section, delay):
+    for html_text in _iter_letterboxd_profile_pages(user, section, delay, max_pages):
         slugs |= parse_letterboxd_profile_slugs(html_text)
     return slugs
+
+
+def fetch_letterboxd_watchlist(user: str, delay: float) -> list[dict[str, object]]:
+    """Watchlist films in page order, with the title and year shown on each poster."""
+    films: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for html_text in _iter_letterboxd_profile_pages(user, "watchlist", delay):
+        for film in parse_letterboxd_watchlist_films(html_text):
+            slug = str(film["slug"])
+            if slug in seen:
+                continue
+            seen.add(slug)
+            films.append(film)
+    return films
 
 
 def fetch_letterboxd_watched_ratings(
     user: str,
     delay: float,
+    max_pages: int = 50,
 ) -> dict[str, float | None]:
     ratings: dict[str, float | None] = {}
-    for html_text in _iter_letterboxd_profile_pages(user, "films", delay):
+    for html_text in _iter_letterboxd_profile_pages(user, "films", delay, max_pages):
         ratings.update(parse_letterboxd_watched_ratings(html_text))
     return ratings
 
@@ -160,6 +244,230 @@ def parse_letterboxd_film_json(body: str) -> dict[str, object] | None:
         "year": year if isinstance(year, int) else None,
         "directors": _director_names(data.get("directors")),
     }
+
+
+class LetterboxdRefused(RuntimeError):
+    """Letterboxd answered 403, 429, or 503 after retries."""
+
+
+_LETTERBOXD_GAP_LOCK = threading.Lock()
+_LAST_LETTERBOXD_FETCH = 0.0
+
+
+def _wait_letterboxd_gap(pause: float) -> None:
+    global _LAST_LETTERBOXD_FETCH
+    with _LETTERBOXD_GAP_LOCK:
+        gap = pause - (time.monotonic() - _LAST_LETTERBOXD_FETCH)
+        if gap > 0:
+            time.sleep(gap)
+
+
+def _mark_letterboxd_fetch() -> None:
+    global _LAST_LETTERBOXD_FETCH
+    with _LETTERBOXD_GAP_LOCK:
+        _LAST_LETTERBOXD_FETCH = time.monotonic()
+
+
+def fetch_letterboxd_html(
+    url: str,
+    delay: float,
+    extra_headers: dict[str, str] | None = None,
+) -> str:
+    """Fetch one Letterboxd page. Repeated refusals raise LetterboxdRefused."""
+    pause = max(delay, 1.0)
+    last: urllib.error.HTTPError | None = None
+    for attempt in range(4):
+        _wait_letterboxd_gap(pause)
+        try:
+            body = fetch(url, extra_headers=extra_headers)
+            _mark_letterboxd_fetch()
+            return body
+        except urllib.error.HTTPError as exc:
+            _mark_letterboxd_fetch()
+            last = exc
+            if exc.code == 404:
+                raise RuntimeError(f"Failed to fetch {url}: HTTP 404") from exc
+            if exc.code not in {403, 429, 503}:
+                raise RuntimeError(f"Failed to fetch {url}: HTTP {exc.code}") from exc
+            time.sleep(pause * (attempt + 2))
+        except urllib.error.URLError as exc:
+            _mark_letterboxd_fetch()
+            raise RuntimeError(f"Failed to fetch {url}: {exc.reason}") from exc
+    code = last.code if last is not None else 0
+    raise LetterboxdRefused(f"Failed to fetch {url}: HTTP {code}")
+
+
+_TAXONOMY_LINK_RE = re.compile(
+    r'href="(/films/(theme|mini-theme|nanogenre|country)/[^"]*)"[^>]*>\s*([^<]+?)\s*</a>',
+    re.IGNORECASE,
+)
+_HEADING_BLOCK_RE = re.compile(
+    r"<h3><span>(Themes|Nanogenres|Country)</span></h3>\s*"
+    r'<div class="text-sluglist[^"]*">(.*?)</div>',
+    re.IGNORECASE | re.DOTALL,
+)
+_RATING_COUNT_RE = re.compile(r'"ratingCount"\s*:\s*(\d+)')
+_PROFILE_FILM_COUNT_RE = re.compile(
+    r'href="/[^"]+/films/"><span class="value">([\d,]+)</span>'
+    r'<span class="definition[^"]*">Films</span>',
+    re.IGNORECASE,
+)
+
+
+def _taxonomy_from_block(block: str) -> dict[str, list[str]]:
+    found: dict[str, list[str]] = {
+        "themes": [],
+        "mini_themes": [],
+        "nanogenres": [],
+        "countries": [],
+    }
+    buckets = {
+        "theme": "themes",
+        "mini-theme": "mini_themes",
+        "nanogenre": "nanogenres",
+        "country": "countries",
+    }
+    seen: set[tuple[str, str]] = set()
+    for _href, kind, label in _TAXONOMY_LINK_RE.findall(block):
+        name = re.sub(r"\s+", " ", html.unescape(label)).strip()
+        if not name or name.casefold().startswith("show all"):
+            continue
+        bucket = buckets.get(kind.casefold())
+        if bucket is None:
+            continue
+        key = (bucket, name.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        found[bucket].append(name)
+    return found
+
+
+_NANOGENRE_LINK_RE = re.compile(
+    r'href="/films/nanogenre/([^"/]+)/[^"]*"[^>]*>\s*([^<]+?)\s*</a>',
+    re.IGNORECASE,
+)
+
+
+def parse_letterboxd_nanogenres(html_text: str) -> list[tuple[str, str]]:
+    """Nanogenre name and catalog slug from a film's nanogenres page."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for slug, label in _NANOGENRE_LINK_RE.findall(html_text):
+        name = re.sub(r"\s+", " ", html.unescape(label)).strip()
+        if not name or name.casefold().startswith("show all"):
+            continue
+        if slug in seen:
+            continue
+        seen.add(slug)
+        found.append((name, slug))
+    return found
+
+
+def parse_letterboxd_taxonomy(html_text: str) -> dict[str, list[str]]:
+    """Themes, mini-themes, nanogenres, and countries from a film page."""
+    combined: dict[str, list[str]] = {
+        "themes": [],
+        "mini_themes": [],
+        "nanogenres": [],
+        "countries": [],
+    }
+    seen: set[tuple[str, str]] = set()
+    for _heading, block in _HEADING_BLOCK_RE.findall(html_text):
+        for bucket, names in _taxonomy_from_block(block).items():
+            for name in names:
+                key = (bucket, name.casefold())
+                if key in seen:
+                    continue
+                seen.add(key)
+                combined[bucket].append(name)
+    return combined
+
+
+def parse_letterboxd_rating_count(html_text: str) -> int | None:
+    match = _RATING_COUNT_RE.search(html_text)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def parse_letterboxd_film_features(html_text: str) -> dict[str, object]:
+    """Metadata used to describe taste and to score a film."""
+    (
+        name,
+        year,
+        rating,
+        genres,
+        directors,
+        language,
+        _original_title,
+        _original_language,
+        actors,
+        runtime,
+    ) = parse_letterboxd_film(html_text)
+    taxonomy = parse_letterboxd_taxonomy(html_text)
+    return {
+        "title": name,
+        "year": year,
+        "directors": directors,
+        "actors": actors,
+        "genres": genres,
+        "themes": taxonomy["themes"],
+        "mini_themes": taxonomy["mini_themes"],
+        "nanogenres": taxonomy["nanogenres"],
+        "countries": taxonomy["countries"],
+        "language": language,
+        "runtime": runtime,
+        "community_rating": rating,
+        "member_count": parse_letterboxd_rating_count(html_text),
+        "themes_known": bool(taxonomy["themes"] or taxonomy["mini_themes"] or taxonomy["nanogenres"]),
+        "synopsis": parse_letterboxd_synopsis(html_text) or "",
+        "poster": parse_letterboxd_poster(html_text),
+        "card_known": True,
+    }
+
+
+def parse_profile_film_count(html_text: str) -> int | None:
+    match = _PROFILE_FILM_COUNT_RE.search(html_text)
+    if not match:
+        return None
+    return int(match.group(1).replace(",", ""))
+
+
+def parse_film_rating_members(html_text: str, film_slug: str) -> list[str]:
+    """Usernames on a film's ratings page, highest ratings first."""
+    pattern = re.compile(
+        rf'href="/([A-Za-z0-9_]+)/film/{re.escape(film_slug)}/activity/"',
+        re.IGNORECASE,
+    )
+    seen: set[str] = set()
+    names: list[str] = []
+    for name in pattern.findall(html_text):
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def letterboxd_film_page_url(slug: str) -> str:
+    return "https://letterboxd.com/film/" + urllib.parse.quote(slug, safe="-_") + "/"
+
+
+def letterboxd_film_nanogenres_url(slug: str) -> str:
+    return letterboxd_film_page_url(slug) + "nanogenres/"
+
+
+def letterboxd_film_ratings_url(slug: str, page: int = 1) -> str:
+    base = letterboxd_film_page_url(slug) + "ratings/"
+    if page <= 1:
+        return base
+    return f"{base}page/{page}/"
+
+
+def letterboxd_member_url(user: str) -> str:
+    return "https://letterboxd.com/" + urllib.parse.quote(user, safe="-_") + "/"
 
 
 def fetch_letterboxd_film_credit(slug: str) -> dict[str, object]:
@@ -349,6 +657,56 @@ def parse_letterboxd_film(
         actors,
         duration_minutes,
     )
+
+
+_SYNOPSIS_RE = re.compile(
+    r'<div class="truncate"[^>]*\bdata-truncate="\d+"[^>]*>\s*<p>(.*?)</p>',
+    re.IGNORECASE | re.DOTALL,
+)
+_POSTER_RE = re.compile(
+    r'"image"\s*:\s*"(https://a\.ltrbxd\.com/resized/(?:film-poster|sm/upload)/[^"]+)"'
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def parse_letterboxd_synopsis(html_text: str) -> str | None:
+    """The synopsis Letterboxd shows under the film title."""
+    match = _SYNOPSIS_RE.search(html_text)
+    if not match:
+        return None
+    text = re.sub(r"<br\s*/?>", "\n", match.group(1), flags=re.IGNORECASE)
+    text = _TAG_RE.sub("", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text or None
+
+
+def letterboxd_poster_url(value: object) -> str | None:
+    """A Letterboxd poster, not the square social image or an empty frame."""
+    if not isinstance(value, str) or not value.startswith("https://a.ltrbxd.com/resized/"):
+        return None
+    if "/film-poster/" in value or "-0-600-0-900-crop" in value:
+        return value
+    return None
+
+
+def parse_letterboxd_poster(html_text: str) -> str | None:
+    """Poster URL when Letterboxd has one. A placeholder is left out."""
+    match = _POSTER_RE.search(html_text)
+    if not match:
+        return None
+    return letterboxd_poster_url(match.group(1))
+
+
+def parse_letterboxd_film_card(html_text: str) -> dict[str, object]:
+    """Community score, synopsis, and poster from a Letterboxd film page."""
+    rating = parse_letterboxd_film(html_text)[2]
+    return {
+        "rating": rating,
+        "synopsis": parse_letterboxd_synopsis(html_text) or "",
+        "poster": parse_letterboxd_poster(html_text),
+    }
 
 
 def parse_letterboxd_runtime(html_text: str) -> int | None:
@@ -613,6 +971,13 @@ def resolve_letterboxd(
             return True
         if (
             director is True
+            and cast_count >= 2
+            and year_delta is not None
+            and year_delta <= 1
+        ):
+            return True
+        if (
+            director is True
             and duration_gap != "conflict"
             and year_delta is not None
             and year_delta <= 1
@@ -718,7 +1083,9 @@ def resolve_letterboxd(
         return False
 
     def _search_queries() -> None:
-        for query in flexible_search_queries(display_title, nonstop_page_title):
+        for query in flexible_search_queries(
+            display_title, nonstop_page_title, nonstop_url
+        ):
             for slug in letterboxd_autocomplete_slugs(query, delay, limit=8):
                 if consider_slug(slug, from_search=True):
                     return

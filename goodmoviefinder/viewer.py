@@ -55,8 +55,11 @@ def save_viewer(
     user: str,
     languages: list[str],
     calendars: list[str] | None = None,
+    signed_out: bool = False,
 ) -> None:
     payload: dict[str, object] = {"letterboxd_user": user, "languages": languages}
+    if signed_out:
+        payload["signed_out"] = True
     if calendars is None:
         saved = load_calendars()
         if saved:
@@ -64,6 +67,10 @@ def save_viewer(
     else:
         payload["calendars"] = calendars
     VIEWER_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def load_signed_out() -> bool:
+    return load_viewer().get("signed_out") is True
 
 
 def load_calendars() -> list[str]:

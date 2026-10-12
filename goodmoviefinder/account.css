@@ -1,0 +1,63 @@
+    #account-view { padding-top: 1.25rem; }
+    .stream-intro {
+      margin: 0 0 0.9rem;
+      color: var(--muted);
+    }
+    .stream-note {
+      margin: 0;
+      color: var(--faint);
+    }
+    .col-stream { min-width: 8rem; }
+    .stream-offers {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      align-items: center;
+    }
+    .stream-offer {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 2.25rem;
+      height: 2.25rem;
+      border-radius: 8px;
+      background: #fff;
+      overflow: hidden;
+    }
+    .stream-offer img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .stream-offer-text {
+      width: auto;
+      height: auto;
+      padding: 0.28rem 0.55rem;
+      background: var(--surface-raised);
+      color: var(--text);
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-decoration: none;
+    }
+    .stream-missing {
+      margin: 0;
+      color: var(--faint);
+      font-size: 0.88rem;
+    }
+    .col-nonstop { white-space: nowrap; font-size: 0.8rem; }
+    .nonstop-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.15rem 0.55rem;
+      border-radius: 999px;
+      background: var(--lb-soft);
+      color: var(--lb);
+      font-weight: 600;
+      text-decoration: none;
+    }
+    .nonstop-badge:hover { text-decoration: underline; }
+    .stream-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; margin: 0 0 0.9rem; }
+    .stream-summary .stream-intro { margin: 0; flex: 1 1 18rem; }
+    tr.row-watchlist td:first-child { box-shadow: inset 3px 0 0 var(--lb); }

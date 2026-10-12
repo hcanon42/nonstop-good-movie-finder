@@ -31,8 +31,12 @@ def fetch(
     url: str,
     timeout: float = 45.0,
     opener: urllib.request.OpenerDirector | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> str:
-    req = urllib.request.Request(url, headers=_request_headers())
+    headers = _request_headers()
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
     last_error: Exception | None = None
     for attempt in range(3):
         try:
