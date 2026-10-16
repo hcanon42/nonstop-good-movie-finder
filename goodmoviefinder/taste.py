@@ -26,6 +26,7 @@ MIN_SIMILARITY = 0.25
 MIN_NEIGHBORS = 4
 MIN_CALLS = 10
 MIN_PRECISION = 0.70
+MIN_RATINGS = 500
 OUTSIDE_CAP = 5
 OUTSIDE_PREDICT_MIN = 3.2
 OUTSIDE_TAG_MAX = 2
@@ -116,13 +117,73 @@ class TasteView:
     step_outside: list[Movie] = field(default_factory=list)
 
 
-def _fine_keys(feature: dict) -> list[tuple[str, str]]:
+def _enough_ratings(feature: dict) -> bool:
+    """Letterboxd recommendations need a stable community score."""
+    members = feature.get("member_count")
+    return isinstance(members, int) and members >= MIN_RATINGS
+
+
+# Narrative musicals keep Drama/Comedy/etc. Filmed concerts are often Music alone.
+_MUSIC_ONLY_GENRES = frozenset({"music", "tv movie"})
+_LIVE_PERFORMANCE_MARKERS = (
+    "concert",
+    "live at ",
+    "in concert",
+    "in-concert",
+    "live performance",
+    "music festival",
+    "live album",
+)
+
+
+def _folded_names(values: object) -> list[str]:
+    names: list[str] = []
+    if not isinstance(values, list):
+        return names
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            names.append(value.strip())
+    return names
+
+
+def excluded_from_recommendations(
+    movie: Movie | None = None,
+    feature: dict | None = None,
+) -> bool:
+    """Skip documentaries and filmed concerts on Letterboxd For you lists."""
+    genres = {
+        name.casefold()
+        for name in [
+            *_folded_names(movie.genres if movie else None),
+            *_folded_names((feature or {}).get("genres")),
+        ]
+    }
+    if "documentary" in genres:
+        return True
+    titles: list[str] = []
+    if movie is not None:
+        titles.extend([movie.title, movie.letterboxd_title or ""])
+    feature_title = (feature or {}).get("title")
+    if isinstance(feature_title, str):
+        titles.append(feature_title)
+    themes = [
+        *_folded_names((feature or {}).get("themes")),
+        *_folded_names((feature or {}).get("mini_themes")),
+        *_folded_names((feature or {}).get("nanogenres")),
+    ]
+    blob = " ".join(part for part in (*titles, *themes) if part).casefold()
+    live = any(marker in blob for marker in _LIVE_PERFORMANCE_MARKERS)
+    if "music" in genres and (live or not (genres - _MUSIC_ONLY_GENRES)):
+        return True
+    return False
+
+
+def _theme_keys(feature: dict) -> list[tuple[str, str]]:
     keys: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for name in [
         *(feature.get("themes") or []),
         *(feature.get("mini_themes") or []),
-        *(feature.get("nanogenres") or []),
     ]:
         if not isinstance(name, str) or not name.strip():
             continue
@@ -131,6 +192,21 @@ def _fine_keys(feature: dict) -> list[tuple[str, str]]:
             continue
         seen.add(key)
         keys.append(key)
+    return keys
+
+
+def _theme_overlap(left: dict, right: dict) -> float:
+    """Jaccard on themes. Missing tags are not similarity — two untagged films can be unrelated."""
+    mine = {(kind, name.casefold()) for kind, name in _theme_keys(left)}
+    theirs = {(kind, name.casefold()) for kind, name in _theme_keys(right)}
+    if not mine or not theirs:
+        return 0.0
+    return len(mine & theirs) / len(mine | theirs)
+
+
+def _fine_keys(feature: dict) -> list[tuple[str, str]]:
+    keys = list(_theme_keys(feature))
+    seen = set(keys)
     for name in feature.get("countries") or []:
         if not isinstance(name, str) or not name.strip():
             continue
@@ -341,7 +417,6 @@ class _Space:
         return (sum(values) + 3 * self.user_mean) / (len(values) + 3)
 
     def _nearness(self, slug: str, feature: dict) -> tuple[float, float]:
-        mine = {(kind, name.casefold()) for kind, name in _fine_keys(feature)}
         my_directors = set(director_person_keys([str(name) for name in feature.get("directors") or []]))
         my_actors = {
             name.strip().casefold()
@@ -352,9 +427,7 @@ class _Space:
         for other_slug, rating, other in self.rows:
             if other_slug == slug:
                 continue
-            theirs = {(kind, name.casefold()) for kind, name in _fine_keys(other)}
-            union = mine | theirs
-            overlap = (len(mine & theirs) / len(union)) if union else 0.0
+            overlap = _theme_overlap(feature, other)
             their_directors = set(
                 director_person_keys([str(name) for name in other.get("directors") or []])
             )
@@ -427,15 +500,12 @@ class _Space:
         return values
 
     def nearest_titles(self, slug: str, feature: dict, limit: int = 2) -> list[str]:
-        mine = {(kind, name.casefold()) for kind, name in _fine_keys(feature)}
         my_directors = set(director_person_keys([str(name) for name in feature.get("directors") or []]))
         scored: list[tuple[float, float, str]] = []
         for other_slug, rating, other in self.rows:
             if other_slug == slug or rating < LOVED_RATING:
                 continue
-            theirs = {(kind, name.casefold()) for kind, name in _fine_keys(other)}
-            union = mine | theirs
-            overlap = (len(mine & theirs) / len(union)) if union else 0.0
+            overlap = _theme_overlap(feature, other)
             their_directors = set(
                 director_person_keys([str(name) for name in other.get("directors") or []])
             )
@@ -661,11 +731,16 @@ def _hash(
     known_languages: frozenset[str],
 ) -> str:
     digest = hashlib.sha256()
+    digest.update(b"near-themes-v2")
     digest.update(",".join(sorted(known_languages)).encode())
     for slug in sorted(ratings):
         digest.update(slug.encode())
         digest.update(str(ratings[slug]).encode())
-        feature = features.get(slug) or {}
+        feature = {
+            key: value
+            for key, value in (features.get(slug) or {}).items()
+            if key not in {"nanogenres", "nanogenre_slugs", "nanogenres_known"}
+        }
         digest.update(json.dumps(feature, sort_keys=True, default=str).encode())
     for name in sorted(neighbors):
         diary = neighbors[name]
@@ -846,6 +921,10 @@ def recommend(
         feature = features.get(slug)
         if not feature:
             continue
+        if excluded_from_recommendations(movie, feature):
+            continue
+        if not _enough_ratings(feature):
+            continue
         predicted = lower = None
         if content_ok and mean_model is not None and low_model is not None:
             predicted, lower = _predict_pair(space, mean_model, low_model, slug, feature)
@@ -1000,7 +1079,7 @@ def cached_category_slugs(
         if not isinstance(slug, str) or slug in watched or not isinstance(raw, dict):
             continue
         keys = set()
-        for name in (raw.get("themes") or []) + (raw.get("mini_themes") or []) + (raw.get("nanogenres") or []):
+        for name in (raw.get("themes") or []) + (raw.get("mini_themes") or []):
             if isinstance(name, str) and name.strip():
                 keys.add(("theme", name.strip()))
         for name in raw.get("countries") or []:
@@ -1365,6 +1444,8 @@ def build_for_you(
         movie_from_letterboxd(slug, features[slug])
         for slug in chosen
         if slug in features
+        and not excluded_from_recommendations(feature=features[slug])
+        and _enough_ratings(features[slug])
     ]
     view = recommend(
         movies,

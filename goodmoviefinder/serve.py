@@ -84,6 +84,22 @@ def serve(state: Any, port: int) -> int:
                     return
                 self._send(200, json.dumps(payload), "application/json")
                 return
+            if path == "/api/following":
+                try:
+                    payload = state.following_list()
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] following list: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": "Letterboxd could not be reached."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps(payload), "application/json")
+                return
             if path == "/api/calendar":
                 try:
                     payload = state.refresh_calendar()
@@ -94,6 +110,9 @@ def serve(state: Any, port: int) -> int:
                     self._send(502, json.dumps({"error": str(exc)}), "application/json")
                     return
                 self._send(200, json.dumps({"ok": True, **payload}), "application/json")
+                return
+            if path == "/api/recommendations":
+                self._send(200, json.dumps(state.recommendations_status()), "application/json")
                 return
             self._send(404, "Not found", "text/plain; charset=utf-8")
 
@@ -124,6 +143,22 @@ def serve(state: Any, port: int) -> int:
                     return
                 self._send(200, json.dumps({"ok": True, **saved}), "application/json")
                 return
+            if path == "/api/recommendations":
+                try:
+                    payload = state.start_recommendations_refresh()
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] recommendations refresh: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": "Recommendations could not be refreshed."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps({"ok": True, **payload}), "application/json")
+                return
             self._send(404, json.dumps({"error": "Not found"}), "application/json")
 
         def _read_json(self) -> dict | None:
@@ -131,6 +166,8 @@ def serve(state: Any, port: int) -> int:
             if length > 100_000:
                 self._send(413, json.dumps({"error": "Request too large"}), "application/json")
                 return None
+            if length == 0:
+                return {}
             raw = self.rfile.read(length)
             try:
                 payload = json.loads(raw.decode("utf-8"))

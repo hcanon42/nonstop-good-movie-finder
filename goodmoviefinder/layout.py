@@ -82,19 +82,37 @@ def account_menu_html(
             "</div>"
         )
         signed_class = ""
+        account_open = (
+            '<div class="account-chip">'
+            '<button type="button" class="account-open account-settings-open" id="settings-open" '
+            'aria-expanded="false" aria-controls="settings-panel" aria-haspopup="dialog" '
+            'aria-label="Account and languages">'
+            f'<span class="account-avatar" aria-hidden="true">{initial}</span>'
+            '<span class="account-caret" aria-hidden="true"></span></button>'
+            '<button type="button" class="account-name" id="account-switch-open" '
+            'aria-expanded="false" aria-controls="account-switch-panel" aria-haspopup="listbox">'
+            f"{name}</button></div>"
+            '<div id="account-switch-panel" class="account-switch-panel" role="listbox" '
+            'aria-label="Switch Letterboxd profile" hidden>'
+            '<p class="account-switch-status muted" role="status">Loading…</p>'
+            '<ul class="account-switch-list"></ul></div>'
+        )
     else:
         initial = "?"
         name = "Sign in"
         who = '<p class="menu-who">You are not signed in.</p>'
         signout = ""
         signed_class = " is-signed-out"
+        account_open = (
+            '<button type="button" class="account-open" id="settings-open" '
+            'aria-expanded="false" aria-controls="settings-panel" aria-haspopup="dialog">'
+            f'<span class="account-avatar" aria-hidden="true">{initial}</span>'
+            f'<span class="account-name">{name}</span>'
+            '<span class="account-caret" aria-hidden="true"></span></button>'
+        )
     return (
         f'<div class="account{signed_class}">'
-        '<button type="button" class="account-open" id="settings-open" '
-        'aria-expanded="false" aria-controls="settings-panel" aria-haspopup="dialog">'
-        f'<span class="account-avatar" aria-hidden="true">{initial}</span>'
-        f'<span class="account-name">{name}</span>'
-        '<span class="account-caret" aria-hidden="true"></span></button>'
+        f"{account_open}"
         '<div id="settings-panel" class="settings-panel" role="dialog" '
         'aria-label="Account and languages" hidden>'
         f'<div class="menu-section">{who}{_profile_form(user, signed_in)}</div>'

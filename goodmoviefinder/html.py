@@ -24,6 +24,8 @@ from goodmoviefinder.program import (
     _format_user_rating,
     _format_year,
     acceptable_versions,
+    counts_as_viewer_language,
+    primary_language_constrains_versions,
     film_title,
     format_language,
     format_screening_date,
@@ -119,7 +121,7 @@ def _json_for_html(payload: object) -> str:
 
 
 def _screening_followable(movie: Movie, screening: Screening, known: frozenset[str]) -> bool:
-    if movie.primary_language is None:
+    if not primary_language_constrains_versions(movie):
         return True
     return screening.language in set(acceptable_versions(movie, known))
 
@@ -194,8 +196,17 @@ def _friend_ratings_html(slug: str | None) -> str:
     return (
         f'<section class="friend-ratings" data-friend-slug="{safe}">'
         f'<h3 class="schedule-label">Letterboxd friends</h3>'
-        f'<p class="friend-status muted">Loading friend ratings…</p>'
+        f'<p class="friend-status muted">Loading friend ratings and watchlists…</p>'
+        f'<div class="friend-group" data-friend-section="rated">'
+        f'<h4 class="friend-group-label">Rated</h4>'
         f'<ul class="friend-list" hidden></ul>'
+        f'<p class="friend-empty muted" hidden>None of your Letterboxd friends have rated this.</p>'
+        f"</div>"
+        f'<div class="friend-group" data-friend-section="watchlist">'
+        f'<h4 class="friend-group-label">On watchlist</h4>'
+        f'<ul class="friend-list" hidden></ul>'
+        f'<p class="friend-empty muted" hidden>None of your Letterboxd friends have this on their watchlist.</p>'
+        f"</div>"
         f"</section>"
     )
 
@@ -540,6 +551,7 @@ def _day_film_html(
         f"{_rating_badge(movie.rating, rating_text)}"
         f"{_plan_add_button(movie)}"
         f'<button type="button" class="day-film-title" aria-expanded="false">{title}</button>'
+        f"{_new_program_chip_html(movie)}"
         f'<span class="chip section-chip chip-{html.escape(section_id, quote=True)}">'
         f"{html.escape(label)}</span>"
         f"</div>"
@@ -711,6 +723,15 @@ def _program_calendar_html(
     )
 
 
+def _new_program_chip_html(movie: Movie) -> str:
+    if not movie.new_in_program:
+        return ""
+    return (
+        '<span class="chip chip-new" title="New in the program since your last run">'
+        "New</span> "
+    )
+
+
 def _format_html_movie_row(
     m: Movie,
     known: frozenset[str],
@@ -759,6 +780,7 @@ def _format_html_movie_row(
         if (show_predicted or m.predicted_rating is not None) and _leaving_soon(m)
         else ""
     )
+    new_html = _new_program_chip_html(m)
     classes = " ".join(
         part for part in (row_class, "row-no-follow" if show_badge else "") if part
     )
@@ -829,7 +851,7 @@ def _format_html_movie_row(
         f'<td class="col-title"><span class="title-line">{_plan_add_button(m)}'
         f'<button type="button" class="expand" '
         f'aria-expanded="false" aria-controls="{html.escape(detail_id, quote=True)}">'
-        f"<strong>{title}</strong> {follow_badge}{soon_html}{because_html}</button>"
+        f"<strong>{title}</strong> {follow_badge}{new_html}{soon_html}{because_html}</button>"
         f'<span class="row-chevron" aria-hidden="true"></span></span></td>'
         f"<td class=\"col-director\">{directors}</td>"
         f"<td class=\"col-genres\">{genre_html}</td>"
@@ -965,7 +987,7 @@ def _language_candidates(*groups: list[Movie]) -> list[Movie]:
     for group in groups:
         for movie in group:
             key = movie.nonstop_url or film_title(movie).casefold()
-            if key in seen or not movie.primary_language:
+            if key in seen or not primary_language_constrains_versions(movie):
                 continue
             seen.add(key)
             chosen.append(movie)
@@ -991,13 +1013,14 @@ def format_html(
     busy_intervals: list[dict[str, str]] | None = None,
     calendar_status: str = "",
     signed_in: bool = True,
+    following_user: str | None = None,
 ) -> str:
     """The Nonstop Kino page: List, Calendar and Plan tabs."""
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
     found = [
         movie.primary_language
         for movie in (*watchlist, *recommendations, *watched, *program)
-        if movie.primary_language
+        if counts_as_viewer_language(movie.primary_language)
     ]
     choices = language_choices(found, selected)
     selected = canonical_languages(selected, choices)
@@ -1249,7 +1272,11 @@ def format_html(
         signed_in=signed_in,
         choices=choices,
         selected=selected,
-        viewer={"port": serve_port, "stamp": settings_stamp(letterboxd_user, selected)},
+        viewer={
+            "port": serve_port,
+            "stamp": settings_stamp(letterboxd_user, selected),
+            "followingUser": following_user or letterboxd_user,
+        },
         scripts=("page.js", "shell.js", "plan.js"),
         styles=("base.css", "nonstop.css"),
         extra_json=extra,

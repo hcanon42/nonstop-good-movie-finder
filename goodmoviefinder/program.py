@@ -15,6 +15,8 @@ LOVED_RATING = 4.0
 UNDERSTOOD_AUDIO_VERSIONS = frozenset({"OV", "OmdU", "OmeU"})
 ENGLISH_SUBTITLE_VERSIONS = frozenset({"OmeU"})
 VERSION_ORDER = ("OV", "OmdU", "OmeU", "DF")
+# Letterboxd label for dialogue-free films; any Nonstop version is fine.
+NO_SPOKEN_LANGUAGE_KEY = "no spoken language"
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MONTHS = (
     "",
@@ -78,6 +80,20 @@ def attach_program(movie: Movie, film: ProgramFilm) -> None:
     movie.poster_url = film.poster_url
 
 
+def primary_language_constrains_versions(movie: Movie) -> bool:
+    """False when the film has no dialogue language to match (unknown or none spoken)."""
+    if movie.primary_language is None:
+        return False
+    return movie.primary_language.casefold() != NO_SPOKEN_LANGUAGE_KEY
+
+
+def counts_as_viewer_language(name: str | None) -> bool:
+    """Languages offered in settings; excludes Letterboxd's non-spoken label."""
+    if not name or not name.strip():
+        return False
+    return name.casefold() != NO_SPOKEN_LANGUAGE_KEY
+
+
 def acceptable_versions(
     movie: Movie,
     known_languages: frozenset[str] | None = None,
@@ -85,7 +101,7 @@ def acceptable_versions(
     """Nonstop versions that count for this film's primary language."""
     known = DEFAULT_KNOWN_LANGUAGE_KEYS if known_languages is None else known_languages
     listed = set(movie.versions)
-    if movie.primary_language is None:
+    if not primary_language_constrains_versions(movie):
         return ordered_versions(listed)
     if movie.primary_language.casefold() in known:
         return ordered_versions(listed & UNDERSTOOD_AUDIO_VERSIONS)
@@ -96,8 +112,8 @@ def movie_is_watchable(
     movie: Movie,
     known_languages: frozenset[str] | None = None,
 ) -> bool:
-    """Unknown primary language is not filtered. Other languages need a matching version."""
-    if movie.primary_language is None:
+    """Unknown or non-spoken primary language is not filtered. Others need a matching version."""
+    if not primary_language_constrains_versions(movie):
         return True
     return bool(acceptable_versions(movie, known_languages))
 
@@ -107,7 +123,7 @@ def watchable_screenings(
     known_languages: frozenset[str] | None = None,
 ) -> list[Screening]:
     """Screenings whose version matches the same language rules as the film list."""
-    if movie.primary_language is None:
+    if not primary_language_constrains_versions(movie):
         return list(movie.screenings)
     allowed = set(acceptable_versions(movie, known_languages))
     return [screening for screening in movie.screenings if screening.language in allowed]

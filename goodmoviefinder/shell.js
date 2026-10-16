@@ -82,6 +82,7 @@
     });
 
     const AUDIO_VERSIONS = new Set(["OV", "OmdU", "OmeU"]);
+    const NO_SPOKEN_LANGUAGE = "no spoken language";
     const VIEWER_STORAGE = "gmf-viewer";
     const viewerConfig = readViewerConfig();
     let serverReady = null;
@@ -111,6 +112,16 @@
       return "/api/viewer";
     }
 
+    function followingEndpoint() {
+      if (location.protocol === "file:") {
+        return "http://127.0.0.1:" + (viewerConfig.port || 8765) + "/api/following";
+      }
+      return "/api/following";
+    }
+
+    let followingPayload = null;
+    let followingLoad = null;
+
     function selectedLanguageNames() {
       return [...document.querySelectorAll('#settings-panel input[name="language"]:checked')].map(
         (box) => box.value
@@ -123,14 +134,14 @@
 
     function versionFollowable(primary, version) {
       const language = (primary || "").trim().toLowerCase();
-      if (!language) return true;
+      if (!language || language === NO_SPOKEN_LANGUAGE) return true;
       if (knownLanguageSet().has(language)) return AUDIO_VERSIONS.has(version);
       return version === "OmeU";
     }
 
     function filmFollowable(primary, versions) {
       const language = (primary || "").trim().toLowerCase();
-      if (!language) return true;
+      if (!language || language === NO_SPOKEN_LANGUAGE) return true;
       return versions.some((version) => versionFollowable(primary, version));
     }
 
@@ -322,9 +333,143 @@
       panel.hidden = !open;
       button.setAttribute("aria-expanded", open ? "true" : "false");
       if (open) {
+        setAccountSwitchOpen(false);
         const input = panel.querySelector('input[name="letterboxd"]');
         if (input && !viewerConfig.letterboxdUser) input.focus();
       }
+    }
+
+    function setAccountSwitchOpen(open) {
+      const panel = document.getElementById("account-switch-panel");
+      const button = document.getElementById("account-switch-open");
+      if (!panel || !button) return;
+      panel.hidden = !open;
+      button.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) {
+        setSettingsOpen(false);
+        ensureFollowingList();
+      }
+    }
+
+    function switchAvatarUrl(value) {
+      if (typeof value !== "string" || !value) return null;
+      const prefixes = [
+        "https://a.ltrbxd.com/",
+        "https://s.ltrbxd.com/",
+        "https://secure.gravatar.com/",
+      ];
+      return prefixes.some((prefix) => value.startsWith(prefix)) ? value : null;
+    }
+
+    function renderFollowingList(payload) {
+      const panel = document.getElementById("account-switch-panel");
+      const list = panel && panel.querySelector(".account-switch-list");
+      const status = panel && panel.querySelector(".account-switch-status");
+      if (!panel || !list || !status) return;
+      const members = Array.isArray(payload.members) ? payload.members : [];
+      list.replaceChildren();
+      if (!members.length) {
+        status.textContent = "No Letterboxd friends found.";
+        status.hidden = false;
+        return;
+      }
+      status.hidden = true;
+      const active = String(payload.activeUser || viewerConfig.letterboxdUser || "").toLowerCase();
+      members.forEach((member) => {
+        if (!member || typeof member.username !== "string") return;
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "account-switch-item";
+        item.setAttribute("role", "option");
+        const selected = member.username.toLowerCase() === active;
+        item.setAttribute("aria-selected", selected ? "true" : "false");
+        item.dataset.username = member.username;
+        const avatarUrl = switchAvatarUrl(member.avatar);
+        if (avatarUrl) {
+          const image = document.createElement("img");
+          image.className = "account-switch-avatar";
+          image.src = avatarUrl;
+          image.alt = "";
+          item.appendChild(image);
+        } else {
+          const initial = document.createElement("span");
+          initial.className = "account-switch-initial";
+          initial.setAttribute("aria-hidden", "true");
+          initial.textContent = (member.name || member.username).slice(0, 1);
+          item.appendChild(initial);
+        }
+        const label = document.createElement("span");
+        label.className = "account-switch-label";
+        const title = document.createElement("span");
+        title.textContent = member.name || member.username;
+        label.appendChild(title);
+        const handle = document.createElement("span");
+        handle.className = "account-switch-handle";
+        handle.textContent = "@" + member.username;
+        label.appendChild(handle);
+        item.appendChild(label);
+        if (member.isRoot) {
+          const tag = document.createElement("span");
+          tag.className = "account-switch-handle";
+          tag.textContent = "You";
+          item.appendChild(tag);
+        }
+        item.addEventListener("click", () => {
+          if (selected) {
+            setAccountSwitchOpen(false);
+            return;
+          }
+          switchToProfile(member.username);
+        });
+        list.appendChild(item);
+      });
+    }
+
+    function ensureFollowingList() {
+      const panel = document.getElementById("account-switch-panel");
+      const status = panel && panel.querySelector(".account-switch-status");
+      if (!panel || !status) return;
+      if (followingPayload) {
+        renderFollowingList(followingPayload);
+        return;
+      }
+      status.hidden = false;
+      status.textContent = "Loading friends…";
+      if (!followingLoad) {
+        followingLoad = fetch(followingEndpoint())
+          .then(async (response) => {
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(payload.error || "Could not load friends.");
+            return payload;
+          })
+          .then((payload) => {
+            followingPayload = payload;
+            renderFollowingList(payload);
+          })
+          .catch((err) => {
+            status.textContent = err.message || "Could not load friends.";
+          })
+          .finally(() => {
+            followingLoad = null;
+          });
+      }
+      return followingLoad;
+    }
+
+    function bindAccountSwitch() {
+      const openButton = document.getElementById("account-switch-open");
+      if (!openButton) return;
+      openButton.addEventListener("click", () => {
+        const panel = document.getElementById("account-switch-panel");
+        setAccountSwitchOpen(!panel || panel.hidden);
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.key !== "Escape") return;
+        const panel = document.getElementById("account-switch-panel");
+        if (!panel || panel.hidden) return;
+        setAccountSwitchOpen(false);
+        openButton.focus();
+      });
     }
 
     function bindSettings() {
@@ -359,10 +504,18 @@
       const signOut = document.getElementById("account-signout");
       if (signOut) signOut.addEventListener("click", signOutUser);
       document.addEventListener("click", (event) => {
-        const panel = document.getElementById("settings-panel");
-        if (!panel || panel.hidden) return;
-        if (event.target.closest(".account") || event.target.closest("[data-open-account]")) return;
-        setSettingsOpen(false);
+        const settingsPanel = document.getElementById("settings-panel");
+        const switchPanel = document.getElementById("account-switch-panel");
+        if (settingsPanel && !settingsPanel.hidden) {
+          if (!event.target.closest(".account") && !event.target.closest("[data-open-account]")) {
+            setSettingsOpen(false);
+          }
+        }
+        if (switchPanel && !switchPanel.hidden) {
+          if (!event.target.closest(".account") && !event.target.closest("[data-open-account]")) {
+            setAccountSwitchOpen(false);
+          }
+        }
       });
       document.addEventListener("keydown", (event) => {
         if (event.key !== "Escape") return;
@@ -414,57 +567,72 @@
       document.body.classList.toggle("is-profile-loading", active);
       main.setAttribute("aria-busy", active ? "true" : "false");
       const openButton = document.getElementById("settings-open");
-      const nameEl = openButton && openButton.querySelector(".account-name");
-      if (openButton && nameEl) {
+      const nameEl = document.getElementById("account-switch-open")
+        || (openButton && openButton.querySelector(".account-name"));
+      if (openButton) {
+        openButton.disabled = active;
+        if (active) openButton.setAttribute("aria-busy", "true");
+        else openButton.removeAttribute("aria-busy");
+      }
+      if (nameEl) {
         if (active) {
           if (!nameEl.dataset.label) nameEl.dataset.label = nameEl.textContent;
           nameEl.textContent = "Loading…";
-          openButton.disabled = true;
-          openButton.setAttribute("aria-busy", "true");
+          nameEl.disabled = true;
+          nameEl.setAttribute("aria-busy", "true");
         } else {
           if (nameEl.dataset.label) nameEl.textContent = nameEl.dataset.label;
-          openButton.disabled = false;
-          openButton.removeAttribute("aria-busy");
+          nameEl.disabled = false;
+          nameEl.removeAttribute("aria-busy");
         }
       }
       if (active) {
         setSettingsOpen(false);
+        setAccountSwitchOpen(false);
         window.scrollTo(0, 0);
       }
     }
 
-    async function loadProfile(event) {
-      event.preventDefault();
-      const form = event.currentTarget;
-      const input = form.querySelector('input[name="letterboxd"]');
-      const status = form.querySelector(".settings-status");
-      const button = form.querySelector(".settings-load");
-      const user = (input && input.value ? input.value : "").trim().replace(/^@/, "");
-      if (!user) {
+    async function submitProfile(user, options) {
+      const form = options && options.form;
+      const input = form && form.querySelector('input[name="letterboxd"]');
+      const status = form && form.querySelector(".settings-status");
+      const button = form && form.querySelector(".settings-load");
+      const trimmed = (user || "").trim().replace(/^@/, "");
+      if (!trimmed) {
         if (status) status.textContent = "Enter a Letterboxd username.";
         return;
       }
-      if (
-        viewerConfig.signedIn
-        && user.toLowerCase() === String(viewerConfig.letterboxdUser || "").toLowerCase()
-      ) {
+      const active = trimmed.toLowerCase();
+      const letterboxd = String(viewerConfig.letterboxdUser || "").toLowerCase();
+      const following = String(
+        viewerConfig.followingUser || viewerConfig.letterboxdUser || ""
+      ).toLowerCase();
+      if (viewerConfig.signedIn && active === letterboxd && active === following) {
         if (status) status.textContent = "This page already uses that profile.";
+        setAccountSwitchOpen(false);
         return;
       }
       if (status) status.textContent = "Loading profile…";
       if (button) button.disabled = true;
+      followingPayload = null;
+      followingLoad = null;
       setProfileLoading(true);
       let navigating = false;
       try {
         const response = await fetch(viewerEndpoint(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ letterboxdUser: user, languages: selectedLanguageNames() }),
+          body: JSON.stringify({
+            letterboxdUser: trimmed,
+            languages: selectedLanguageNames(),
+          }),
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {
           if (status) status.textContent = payload.error || "Could not load that profile.";
-          setSettingsOpen(true);
+          if (form) setSettingsOpen(true);
+          else setAccountSwitchOpen(true);
           return;
         }
         serverReady = true;
@@ -476,13 +644,26 @@
         if (status) {
           status.textContent = "Run python3 goodmoviefinder.py --serve, then load the profile again.";
         }
-        setSettingsOpen(true);
+        if (form) setSettingsOpen(true);
+        else setAccountSwitchOpen(true);
       } finally {
         if (!navigating) {
           setProfileLoading(false);
           if (button) button.disabled = false;
         }
       }
+    }
+
+    function switchToProfile(user) {
+      submitProfile(user);
+    }
+
+    async function loadProfile(event) {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const input = form.querySelector('input[name="letterboxd"]');
+      const user = input && input.value ? input.value : "";
+      await submitProfile(user, { form });
     }
 
 
@@ -514,6 +695,7 @@
       if (saved) applyCheckboxSelection(saved);
       applyLanguageFilter();
       bindSettings();
+      bindAccountSwitch();
     }
 
     bootViewer();

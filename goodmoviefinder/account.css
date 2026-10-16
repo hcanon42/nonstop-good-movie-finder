@@ -58,6 +58,33 @@
       text-decoration: none;
     }
     .nonstop-badge:hover { text-decoration: underline; }
+    .taste-refresh-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.55rem 1rem;
+      margin: 0 0 0.75rem;
+    }
+    .taste-refresh {
+      flex: 0 0 auto;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.82rem;
+      font-weight: 600;
+      border-radius: 999px;
+      padding: 0.32rem 0.75rem;
+      cursor: pointer;
+    }
+    .taste-refresh:hover { border-color: var(--gold); color: var(--text); }
+    .taste-refresh:disabled { opacity: 0.6; cursor: progress; }
+    .taste-refresh-status {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+    .taste-refresh-status.is-error { color: var(--danger, #c44); }
     .stream-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; margin: 0 0 0.9rem; }
     .stream-summary .stream-intro { margin: 0; flex: 1 1 18rem; }
     tr.row-watchlist td:first-child { box-shadow: inset 3px 0 0 var(--lb); }

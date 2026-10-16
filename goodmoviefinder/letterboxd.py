@@ -141,24 +141,32 @@ def _iter_letterboxd_profile_pages(
     section: str,
     delay: float,
     max_pages: int = 50,
+    *,
+    page_attempts: int = 4,
+    profile_delay: float | None = None,
 ):
     page = 1
     opener = make_cookie_opener()
-    profile_delay = max(delay, 1.0)
+    pause = max(profile_delay if profile_delay is not None else delay, 1.0)
+    attempts = max(1, page_attempts)
 
     while page <= max_pages:
         url = letterboxd_profile_url(user, section, page)
         html_text = None
-        for attempt in range(4):
+        for attempt in range(attempts):
+            _wait_letterboxd_gap(pause)
             try:
                 html_text = fetch(url, opener=opener)
+                _mark_letterboxd_fetch()
                 break
             except urllib.error.HTTPError as exc:
-                if exc.code in {403, 429, 503} and attempt < 3:
-                    time.sleep(profile_delay * (attempt + 2))
+                _mark_letterboxd_fetch()
+                if exc.code in {403, 429, 503} and attempt < attempts - 1:
+                    time.sleep(pause * (attempt + 2) * 1.5)
                     continue
                 raise RuntimeError(f"Failed to fetch {url}: HTTP {exc.code}") from exc
             except urllib.error.URLError as exc:
+                _mark_letterboxd_fetch()
                 raise RuntimeError(f"Failed to fetch {url}: {exc.reason}") from exc
 
         if html_text is None:
@@ -168,7 +176,7 @@ def _iter_letterboxd_profile_pages(
         if not LETTERBOXD_NEXT_PAGE_RE.search(html_text):
             break
         page += 1
-        time.sleep(profile_delay)
+        time.sleep(pause)
 
 
 def fetch_letterboxd_profile_slugs(
@@ -201,9 +209,19 @@ def fetch_letterboxd_watched_ratings(
     user: str,
     delay: float,
     max_pages: int = 50,
+    *,
+    page_attempts: int = 4,
+    profile_delay: float | None = None,
 ) -> dict[str, float | None]:
     ratings: dict[str, float | None] = {}
-    for html_text in _iter_letterboxd_profile_pages(user, "films", delay, max_pages):
+    for html_text in _iter_letterboxd_profile_pages(
+        user,
+        "films",
+        delay,
+        max_pages,
+        page_attempts=page_attempts,
+        profile_delay=profile_delay,
+    ):
         ratings.update(parse_letterboxd_watched_ratings(html_text))
     return ratings
 
@@ -272,11 +290,14 @@ def fetch_letterboxd_html(
     url: str,
     delay: float,
     extra_headers: dict[str, str] | None = None,
+    *,
+    attempts: int = 4,
+    min_pause: float | None = None,
 ) -> str:
     """Fetch one Letterboxd page. Repeated refusals raise LetterboxdRefused."""
-    pause = max(delay, 1.0)
+    pause = max(min_pause if min_pause is not None else delay, 1.0)
     last: urllib.error.HTTPError | None = None
-    for attempt in range(4):
+    for attempt in range(max(1, attempts)):
         _wait_letterboxd_gap(pause)
         try:
             body = fetch(url, extra_headers=extra_headers)

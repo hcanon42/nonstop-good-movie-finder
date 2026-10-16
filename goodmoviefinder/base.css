@@ -118,6 +118,16 @@
     .page-switch a[aria-current="page"] { background: var(--gold); color: var(--gold-ink); }
 
     .account { position: relative; margin-left: auto; flex: 0 0 auto; }
+    .account-chip {
+      display: inline-flex;
+      align-items: stretch;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .account-chip:focus-within,
+    .account-chip:hover { border-color: var(--gold); }
     .account-open {
       display: inline-flex;
       align-items: center;
@@ -133,8 +143,31 @@
       font-weight: 600;
       cursor: pointer;
     }
+    .account-chip .account-open {
+      border: 0;
+      border-radius: 0;
+      padding-right: 0.45rem;
+    }
+    .account-name {
+      display: inline-flex;
+      align-items: center;
+      min-height: 2.2rem;
+      padding: 0.2rem 0.75rem 0.2rem 0.55rem;
+      border: 0;
+      border-left: 1px solid var(--line);
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.84rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .account-name:hover,
+    .account-name[aria-expanded="true"] { background: var(--surface-raised); color: var(--lb); }
     .account-open:hover,
     .account-open[aria-expanded="true"] { border-color: var(--gold); }
+    .account-chip .account-open:hover,
+    .account-chip .account-open[aria-expanded="true"] { border-color: transparent; }
     .account-open:disabled { cursor: default; opacity: 1; }
     .account-avatar {
       display: inline-flex;
@@ -168,6 +201,80 @@
       border-radius: var(--radius-md);
       background: var(--surface);
       box-shadow: var(--shadow);
+    }
+    .account-switch-panel {
+      position: absolute;
+      z-index: 51;
+      top: calc(100% + 0.5rem);
+      right: 0;
+      width: min(18rem, calc(100vw - 2rem));
+      max-height: min(24rem, calc(100vh - 6rem));
+      padding: 0.45rem 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      overflow: auto;
+    }
+    .account-switch-status {
+      margin: 0;
+      padding: 0.55rem 0.9rem;
+      font-size: 0.82rem;
+    }
+    .account-switch-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+    .account-switch-item {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      width: 100%;
+      padding: 0.45rem 0.9rem;
+      border: 0;
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.86rem;
+      text-align: left;
+      cursor: pointer;
+    }
+    .account-switch-item:hover,
+    .account-switch-item:focus-visible { background: var(--surface-raised); outline: none; }
+    .account-switch-item[aria-selected="true"] {
+      background: var(--lb-soft);
+      color: var(--lb);
+      font-weight: 600;
+    }
+    .account-switch-avatar {
+      flex: 0 0 auto;
+      width: 1.65rem;
+      height: 1.65rem;
+      border-radius: 50%;
+      object-fit: cover;
+      background: var(--surface-raised);
+    }
+    .account-switch-initial {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.65rem;
+      height: 1.65rem;
+      border-radius: 50%;
+      background: var(--lb-soft);
+      color: var(--lb);
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .account-switch-label { min-width: 0; }
+    .account-switch-handle {
+      display: block;
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-weight: 500;
     }
     .menu-who { margin: 0 0 0.75rem; font-size: 0.88rem; color: var(--muted); }
     .menu-who a { color: var(--lb); text-decoration: none; font-weight: 600; }
@@ -672,6 +779,7 @@
     .chip-count { margin: 0; font-variant-numeric: tabular-nums; }
     .chip-warn { background: var(--warn-soft); color: var(--warn-ink); }
     .chip-soon { background: var(--warn-soft); color: var(--warn-ink); }
+    .chip-new { background: var(--ok-soft); color: var(--ok); }
     .taste-intro {
       margin: 0 0 1.35rem;
       padding: 1.15rem 1.3rem 1.15rem 1.2rem;
@@ -763,7 +871,28 @@
     }
     .detail-links { margin: 0 0 0.9rem; }
     .friend-ratings { margin: 0 0 1rem; }
-    .friend-status { margin: 0; }
+    .friend-status { margin: 0 0 0.5rem; }
+    .friend-group { margin-top: 0.65rem; }
+    .friend-group:first-of-type { margin-top: 0.35rem; }
+    .friend-group-label {
+      margin: 0 0 0.25rem;
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .friend-empty { margin: 0; font-size: 0.88rem; }
+    .friend-watchlist-badge {
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: var(--lb);
+      background: var(--lb-soft);
+      padding: 0.12rem 0.45rem;
+      border-radius: 999px;
+    }
     .friend-list {
       list-style: none;
       margin: 0.35rem 0 0;

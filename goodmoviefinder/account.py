@@ -175,6 +175,71 @@ def _watchlist_panel(
     return body, len(films), streamable, at_nonstop
 
 
+def format_taste_panel_html(
+    *,
+    see_first: list[Movie],
+    like_you: list[Movie],
+    step_outside: list[Movie],
+    paragraph: str,
+    note: str,
+) -> tuple[str, str]:
+    """Recommendations tab body and nav-pill links (without the Jump to label)."""
+    known: frozenset[str] = frozenset()
+    sections: list[str] = [
+        '<section class="taste-intro" id="taste">'
+        '<p class="taste-kicker">Your taste</p>'
+        f'<p class="taste-lead">{html.escape(paragraph)}</p>'
+        f'<p class="taste-note">{html.escape(note)} '
+        "Films from across Letterboxd, not only what is playing now.</p>"
+        "</section>"
+    ]
+    for section_id, title, sub, movies, row_class in (
+        ("see-first", "See this first", "The strongest prediction that clears the bar", see_first, "row-recommend"),
+        (
+            "like-you",
+            "More like what you love",
+            "Close to directors, themes, and countries you rate highly",
+            like_you,
+            "row-recommend",
+        ),
+        (
+            "step-outside",
+            "A step outside",
+            "A nanogenre you have liked only once or twice",
+            step_outside,
+            "row-outside",
+        ),
+    ):
+        if movies:
+            sections.append(
+                _html_table_section(
+                    section_id,
+                    title,
+                    sub,
+                    movies,
+                    known,
+                    row_class=row_class,
+                    show_predicted=True,
+                    show_follow_badge=False,
+                )
+            )
+    if len(sections) == 1:
+        sections.append('<p class="empty-hint">No film cleared the bar.</p>')
+    panel = "\n".join(sections) + (
+        '\n<p class="empty-hint" id="list-empty" hidden>No films match this search.</p>'
+    )
+    pills = "".join(
+        f'<a href="#{sid}" data-nav="{sid}">{label}</a>'
+        for sid, label, movies in (
+            ("see-first", "See this first", see_first),
+            ("like-you", "More like what you love", like_you),
+            ("step-outside", "A step outside", step_outside),
+        )
+        if movies
+    )
+    return panel, pills
+
+
 def format_account_html(
     *,
     letterboxd_user: str,
@@ -188,12 +253,12 @@ def format_account_html(
     note: str,
     known_languages: list[str] | None = None,
     language_options: list[str] | None = None,
+    following_user: str | None = None,
 ) -> str:
     """The account page. Signed out, both tabs ask for a Letterboxd username."""
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
     choices = list(language_options or selected)
     selected = canonical_languages(selected, choices)
-    known: frozenset[str] = frozenset()
     stats: list[str] = []
     if not signed_in:
         watchlist_panel = sign_in_card()
@@ -208,48 +273,12 @@ def format_account_html(
         watchlist_panel = body
         watch_label = f"Watchlist ({count})" if count else "Watchlist"
         taste_label = "Recommendations"
-        sections: list[str] = [
-            '<section class="taste-intro" id="taste">'
-            '<p class="taste-kicker">Your taste</p>'
-            f'<p class="taste-lead">{html.escape(paragraph)}</p>'
-            f'<p class="taste-note">{html.escape(note)} '
-            "Films from across Letterboxd, not only what is playing now.</p>"
-            "</section>"
-        ]
-        for section_id, title, sub, movies, row_class in (
-            ("see-first", "See this first", "The strongest prediction that clears the bar", see_first, "row-recommend"),
-            (
-                "like-you",
-                "More like what you love",
-                "Close to directors, themes, and countries you rate highly",
-                like_you,
-                "row-recommend",
-            ),
-            (
-                "step-outside",
-                "A step outside",
-                "A nanogenre you have liked only once or twice",
-                step_outside,
-                "row-outside",
-            ),
-        ):
-            if movies:
-                sections.append(
-                    _html_table_section(
-                        section_id,
-                        title,
-                        sub,
-                        movies,
-                        known,
-                        row_class=row_class,
-                        show_predicted=True,
-                        show_follow_badge=False,
-                    )
-                )
-        if len(sections) == 1:
-            sections.append('<p class="empty-hint">No film cleared the bar.</p>')
-        taste_panel = "\n".join(sections) + (
-            '\n<p class="empty-hint" id="list-empty" hidden>No films match this search.</p>'
+        taste_panel, pills = format_taste_panel_html(
+            see_first=see_first,
+            like_you=like_you,
+            step_outside=step_outside,
+            paragraph=paragraph,
+            note=note,
         )
         tagline = f"@{letterboxd_user}'s Letterboxd watchlist, and films picked for you."
         stats = [
@@ -257,15 +286,6 @@ def format_account_html(
             f"<strong>{streamable}</strong> streaming in Austria",
             f"<strong>{at_nonstop}</strong> playing at Nonstop",
         ]
-        pills = "".join(
-            f'<a href="#{sid}" data-nav="{sid}">{label}</a>'
-            for sid, label, movies in (
-                ("see-first", "See this first", see_first),
-                ("like-you", "More like what you love", like_you),
-                ("step-outside", "A step outside", step_outside),
-            )
-            if movies
-        )
         tools_html = (
             '      <div class="search-field" data-tools="watchlist recommendations">\n'
             '        <input type="search" id="search" placeholder="Filter your watchlist by title…" '
@@ -274,7 +294,13 @@ def format_account_html(
             '        <button type="button" id="search-clear" class="search-clear" hidden '
             'aria-label="Clear search">&times;</button>\n'
             "      </div>\n"
-            '      <nav class="nav-pills" aria-label="Recommendation sections" data-tools="recommendations">'
+            '      <div class="taste-refresh-bar" data-tools="recommendations">\n'
+            '        <button type="button" id="taste-refresh" class="taste-refresh">'
+            "Refresh recommendations</button>\n"
+            '        <p class="taste-refresh-status" id="taste-refresh-status" role="status" hidden></p>\n'
+            "      </div>\n"
+            '      <nav class="nav-pills" aria-label="Recommendation sections" data-tools="recommendations" '
+            'id="recommendations-nav">'
             f'<span class="nav-pills-label">Jump to</span>{pills}</nav>'
         )
     panels_html = (
@@ -297,7 +323,10 @@ def format_account_html(
         signed_in=signed_in,
         choices=choices,
         selected=selected,
-        viewer={"stamp": settings_stamp(letterboxd_user, selected)},
+        viewer={
+            "stamp": settings_stamp(letterboxd_user, selected),
+            "followingUser": following_user or letterboxd_user,
+        },
         scripts=("page.js", "shell.js"),
         styles=("base.css", "account.css"),
         footer=(

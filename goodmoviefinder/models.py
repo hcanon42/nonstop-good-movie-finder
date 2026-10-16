@@ -67,6 +67,8 @@ class Movie:
     member_support: int = 0
     # False when a cached Letterboxd link was stored by an older matcher.
     match_current: bool = True
+    # True when this program title was looked up fresh (not from cache) this run.
+    new_in_program: bool = False
 
 
 LetterboxdCandidate = tuple[

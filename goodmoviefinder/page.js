@@ -280,7 +280,9 @@
       syncSection(section);
     }
 
-    document.querySelectorAll(".program-section").forEach((section) => {
+    function bindProgramSection(section) {
+      if (section.dataset.gmfBound) return;
+      section.dataset.gmfBound = "1";
       const startsFolded = section.hasAttribute("data-start-folded");
       const folded = foldedIds.has(section.id) || (startsFolded && !unfoldedIds.has(section.id));
       section.classList.toggle("is-folded", folded);
@@ -290,7 +292,9 @@
       button.addEventListener("click", () => {
         setFolded(section, !section.classList.contains("is-folded"));
       });
-    });
+    }
+
+    document.querySelectorAll(".program-section").forEach(bindProgramSection);
 
     document.querySelectorAll(".nav-pills a[href^='#']").forEach((link) => {
       link.addEventListener("click", (event) => {
@@ -312,7 +316,9 @@
       });
     });
 
-    document.querySelectorAll("[data-movie-row]").forEach((row) => {
+    function bindMovieRow(row) {
+      if (row.dataset.gmfBound) return;
+      row.dataset.gmfBound = "1";
       row.addEventListener("click", (event) => {
         if (event.target.closest(".plan-add")) return;
         const button = row.querySelector(".expand");
@@ -324,7 +330,9 @@
         detail.hidden = !open;
         if (open) loadFriends(detail);
       });
-    });
+    }
+
+    document.querySelectorAll("[data-movie-row]").forEach(bindMovieRow);
 
     document.querySelectorAll("[data-stream-row]").forEach((row) => {
       row.addEventListener("click", (event) => {
@@ -343,8 +351,18 @@
     const friendLoads = new Map();
     let friendFetchChain = Promise.resolve();
 
+    function friendFetchErrorMessage(err) {
+      if (err && typeof err.message === "string" && err.message.trim()) {
+        return err.message.trim();
+      }
+      if (err && err.name === "TypeError") {
+        return "Letterboxd could not be reached. Try again in a moment.";
+      }
+      return "Friend ratings could not be loaded.";
+    }
+
     function fetchFriendRatings(slug, retriesLeft) {
-      const tries = retriesLeft === undefined ? 2 : retriesLeft;
+      const tries = retriesLeft === undefined ? 4 : retriesLeft;
       const request = () =>
         fetch("/api/friends?slug=" + encodeURIComponent(slug)).then(async (response) => {
           if (!response.ok) {
@@ -363,8 +381,14 @@
         });
       const attempt = (left) =>
         request().catch((err) => {
-          if (left <= 0) throw err;
-          return new Promise((resolve) => setTimeout(resolve, 2500)).then(() =>
+          const normalized =
+            err instanceof Error ? err : new Error(friendFetchErrorMessage(err));
+          if (normalized.message === "Failed to fetch") {
+            normalized.message = "Letterboxd could not be reached. Try again in a moment.";
+          }
+          if (left <= 0) throw normalized;
+          const wait = 1500 * (5 - left);
+          return new Promise((resolve) => setTimeout(resolve, wait)).then(() =>
             attempt(left - 1)
           );
         });
@@ -391,93 +415,143 @@
       }
     }
 
+    function friendGroup(panel, section) {
+      if (!panel) return null;
+      const group = panel.querySelector('[data-friend-section="' + section + '"]');
+      if (!group) return null;
+      return {
+        group,
+        list: group.querySelector(".friend-list"),
+        empty: group.querySelector(".friend-empty"),
+      };
+    }
+
+    function appendFriendRow(list, friend, options) {
+      if (!friend || typeof friend.name !== "string" || !list) return;
+      const item = document.createElement("li");
+      item.className = "friend";
+      const profileUrl = allowedUrl(friend.profile, ["https://letterboxd.com/"]);
+      const avatarUrl = allowedUrl(friend.avatar, [
+        "https://a.ltrbxd.com/",
+        "https://s.ltrbxd.com/",
+      ]);
+      if (profileUrl && avatarUrl) {
+        const avatarLink = document.createElement("a");
+        avatarLink.className = "friend-avatar-link";
+        avatarLink.href = profileUrl;
+        avatarLink.target = "_blank";
+        avatarLink.rel = "noopener noreferrer";
+        avatarLink.setAttribute("aria-label", friend.name);
+        const image = document.createElement("img");
+        image.className = "friend-avatar";
+        image.src = avatarUrl;
+        image.alt = "";
+        image.width = 40;
+        image.height = 40;
+        avatarLink.appendChild(image);
+        item.appendChild(avatarLink);
+      }
+      const body = document.createElement("div");
+      body.className = "friend-body";
+      const top = document.createElement("div");
+      top.className = "friend-top";
+      const name = document.createElement(profileUrl ? "a" : "span");
+      name.className = "friend-name";
+      name.textContent = friend.name;
+      if (profileUrl) {
+        name.href = profileUrl;
+        name.target = "_blank";
+        name.rel = "noopener noreferrer";
+      }
+      top.appendChild(name);
+      if (
+        options.showRating
+        && typeof friend.ratingText === "string"
+        && /^\d(?:\.\d)?$/.test(friend.ratingText)
+      ) {
+        const badge = document.createElement("span");
+        badge.className = "rating-badge";
+        badge.textContent = friend.ratingText;
+        if (
+          typeof friend.ratingStyle === "string"
+          && /^color: rgb\(\d{1,3},\d{1,3},\d{1,3}\); background: rgba\(\d{1,3},\d{1,3},\d{1,3},[\d.]+\);$/.test(friend.ratingStyle)
+        ) {
+          badge.style.cssText = friend.ratingStyle;
+        }
+        top.appendChild(badge);
+      } else if (options.watchlistBadge) {
+        const badge = document.createElement("span");
+        badge.className = "friend-watchlist-badge";
+        badge.textContent = "Watchlist";
+        top.appendChild(badge);
+      }
+      body.appendChild(top);
+      if (options.showRating && typeof friend.comment === "string" && friend.comment.trim()) {
+        const comment = document.createElement("p");
+        comment.className = "friend-comment";
+        comment.textContent = friend.comment;
+        body.appendChild(comment);
+      }
+      item.appendChild(body);
+      list.appendChild(item);
+    }
+
+    function renderFriendSection(section, friends, options) {
+      if (!section || !section.list) return;
+      section.list.replaceChildren();
+      friends.forEach((friend) => appendFriendRow(section.list, friend, options));
+      const hasFriends = friends.length > 0;
+      section.list.hidden = !hasFriends;
+      if (section.empty) section.empty.hidden = hasFriends;
+      section.group.hidden = false;
+    }
+
     function renderFriends(slug, payload) {
       const friends = Array.isArray(payload.friends) ? payload.friends : [];
+      const watchlist = Array.isArray(payload.watchlist) ? payload.watchlist : [];
       friendPanels(slug).forEach((panel) => {
         const status = panel.querySelector(".friend-status");
-        const list = panel.querySelector(".friend-list");
-        if (!list) return;
-        list.replaceChildren();
-        if (!friends.length) {
-          if (status) {
-            status.hidden = false;
-            status.textContent = "None of your Letterboxd friends have rated this.";
+        const rated = friendGroup(panel, "rated");
+        const listed = friendGroup(panel, "watchlist");
+        const legacyList = panel.querySelector(":scope > .friend-list");
+        if (!rated && legacyList) {
+          legacyList.replaceChildren();
+          if (!friends.length) {
+            if (status) {
+              status.hidden = false;
+              status.textContent = "None of your Letterboxd friends have rated this.";
+            }
+            legacyList.hidden = true;
+          } else {
+            if (status) status.hidden = true;
+            friends.forEach((friend) =>
+              appendFriendRow(legacyList, friend, { showRating: true })
+            );
+            legacyList.hidden = false;
           }
-          list.hidden = true;
           panel.dataset.friendState = "ready";
           return;
         }
         if (status) status.hidden = true;
-        friends.forEach((friend) => {
-          if (!friend || typeof friend.name !== "string") return;
-          const item = document.createElement("li");
-          item.className = "friend";
-          const profileUrl = allowedUrl(friend.profile, ["https://letterboxd.com/"]);
-          const avatarUrl = allowedUrl(friend.avatar, [
-            "https://a.ltrbxd.com/",
-            "https://s.ltrbxd.com/",
-          ]);
-          if (profileUrl && avatarUrl) {
-            const avatarLink = document.createElement("a");
-            avatarLink.className = "friend-avatar-link";
-            avatarLink.href = profileUrl;
-            avatarLink.target = "_blank";
-            avatarLink.rel = "noopener noreferrer";
-            avatarLink.setAttribute("aria-label", friend.name);
-            const image = document.createElement("img");
-            image.className = "friend-avatar";
-            image.src = avatarUrl;
-            image.alt = "";
-            image.width = 40;
-            image.height = 40;
-            avatarLink.appendChild(image);
-            item.appendChild(avatarLink);
-          }
-          const body = document.createElement("div");
-          body.className = "friend-body";
-          const top = document.createElement("div");
-          top.className = "friend-top";
-          const name = document.createElement(profileUrl ? "a" : "span");
-          name.className = "friend-name";
-          name.textContent = friend.name;
-          if (profileUrl) {
-            name.href = profileUrl;
-            name.target = "_blank";
-            name.rel = "noopener noreferrer";
-          }
-          top.appendChild(name);
-          if (typeof friend.ratingText === "string" && /^\d(?:\.\d)?$/.test(friend.ratingText)) {
-            const badge = document.createElement("span");
-            badge.className = "rating-badge";
-            badge.textContent = friend.ratingText;
-            if (
-              typeof friend.ratingStyle === "string"
-              && /^color: rgb\(\d{1,3},\d{1,3},\d{1,3}\); background: rgba\(\d{1,3},\d{1,3},\d{1,3},[\d.]+\);$/.test(friend.ratingStyle)
-            ) {
-              badge.style.cssText = friend.ratingStyle;
-            }
-            top.appendChild(badge);
-          }
-          body.appendChild(top);
-          if (typeof friend.comment === "string" && friend.comment.trim()) {
-            const comment = document.createElement("p");
-            comment.className = "friend-comment";
-            comment.textContent = friend.comment;
-            body.appendChild(comment);
-          }
-          item.appendChild(body);
-          list.appendChild(item);
-        });
-        list.hidden = false;
+        renderFriendSection(rated, friends, { showRating: true });
+        renderFriendSection(listed, watchlist, { watchlistBadge: true });
+        if (!friends.length && !watchlist.length && status) {
+          status.hidden = false;
+          status.textContent =
+            "None of your Letterboxd friends have rated this or have it on their watchlist.";
+        }
         panel.dataset.friendState = "ready";
       });
     }
 
     function markFriendError(slug, message) {
-      const text =
+      let text =
         typeof message === "string" && message.trim()
           ? message.trim()
           : "Friend ratings could not be loaded.";
+      if (text === "Failed to fetch") {
+        text = "Letterboxd could not be reached. Try again in a moment.";
+      }
       friendPanels(slug).forEach((panel) => {
         if (panel.dataset.friendState === "ready") return;
         const status = panel.querySelector(".friend-status");
@@ -485,8 +559,12 @@
           status.hidden = false;
           status.textContent = text;
         }
-        const list = panel.querySelector(".friend-list");
-        if (list) list.hidden = true;
+        panel.querySelectorAll(".friend-list").forEach((list) => {
+          list.hidden = true;
+        });
+        panel.querySelectorAll(".friend-group").forEach((group) => {
+          group.hidden = true;
+        });
       });
     }
 
@@ -539,7 +617,9 @@
       return direction === "asc" ? cmp : -cmp;
     }
 
-    document.querySelectorAll("table").forEach((table) => {
+    function bindTableSorting(table) {
+      if (table.dataset.gmfBound) return;
+      table.dataset.gmfBound = "1";
       const tbody = table.querySelector("tbody");
       if (!tbody) return;
       table.querySelectorAll("button.sort").forEach((button) => {
@@ -569,4 +649,124 @@
           }
         });
       });
-    });
+    }
+
+    document.querySelectorAll("table").forEach(bindTableSorting);
+
+    function bindRecommendationsPanel(root) {
+      const panel = root || document.getElementById("recommendations-view");
+      if (!panel) return;
+      panel.querySelectorAll(".program-section").forEach(bindProgramSection);
+      panel.querySelectorAll("[data-movie-row]").forEach(bindMovieRow);
+      panel.querySelectorAll("table").forEach(bindTableSorting);
+    }
+
+    function recommendationsEndpoint() {
+      const node = document.getElementById("viewer-config");
+      let port = 8765;
+      try {
+        const parsed = JSON.parse((node && node.textContent) || "{}");
+        if (parsed && typeof parsed.port === "number") port = parsed.port;
+      } catch (err) {
+        /* static page */
+      }
+      if (location.protocol === "file:") {
+        return "http://127.0.0.1:" + port + "/api/recommendations";
+      }
+      return "/api/recommendations";
+    }
+
+    function applyRecommendationsPayload(payload) {
+      if (!payload || typeof payload.panel !== "string") return;
+      const panel = document.getElementById("recommendations-view");
+      if (!panel) return;
+      panel.innerHTML = payload.panel;
+      bindRecommendationsPanel(panel);
+      const nav = document.getElementById("recommendations-nav");
+      if (nav && typeof payload.pills === "string") {
+        nav.innerHTML = '<span class="nav-pills-label">Jump to</span>' + payload.pills;
+      }
+      applySearch();
+      updateScrolledSection();
+    }
+
+    let tastePollTimer = null;
+
+    function stopTastePoll() {
+      if (tastePollTimer) {
+        clearTimeout(tastePollTimer);
+        tastePollTimer = null;
+      }
+    }
+
+    async function pollRecommendationsRefresh(statusEl, button) {
+      try {
+        const response = await fetch(recommendationsEndpoint());
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload.error || "Could not refresh recommendations.");
+        }
+        if (payload.status === "running") {
+          tastePollTimer = setTimeout(() => pollRecommendationsRefresh(statusEl, button), 2000);
+          return;
+        }
+        if (payload.error) {
+          if (statusEl) {
+            statusEl.hidden = false;
+            statusEl.classList.add("is-error");
+            statusEl.textContent = payload.error;
+          }
+        } else if (statusEl) {
+          statusEl.textContent = "";
+          statusEl.hidden = true;
+          statusEl.classList.remove("is-error");
+        }
+        applyRecommendationsPayload(payload);
+      } catch (err) {
+        if (statusEl) {
+          statusEl.hidden = false;
+          statusEl.classList.add("is-error");
+          statusEl.textContent = err && err.message ? err.message : "Could not refresh recommendations.";
+        }
+      } finally {
+        if (!tastePollTimer && button) button.disabled = false;
+      }
+    }
+
+    async function refreshRecommendations() {
+      const button = document.getElementById("taste-refresh");
+      const statusEl = document.getElementById("taste-refresh-status");
+      if (!button) return;
+      stopTastePoll();
+      button.disabled = true;
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.classList.remove("is-error");
+        statusEl.textContent = "Updating your ratings and recommendations…";
+      }
+      try {
+        const response = await fetch(recommendationsEndpoint(), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const fallback = response.status === 404
+            ? "Restart python3 goodmoviefinder.py --serve, then refresh recommendations."
+            : "Could not refresh recommendations.";
+          throw new Error(payload.error || fallback);
+        }
+        tastePollTimer = setTimeout(() => pollRecommendationsRefresh(statusEl, button), 1500);
+      } catch (err) {
+        if (statusEl) {
+          statusEl.hidden = false;
+          statusEl.classList.add("is-error");
+          statusEl.textContent = err && err.message ? err.message : "Could not refresh recommendations.";
+        }
+        button.disabled = false;
+      }
+    }
+
+    const tasteRefresh = document.getElementById("taste-refresh");
+    if (tasteRefresh) tasteRefresh.addEventListener("click", refreshRecommendations);

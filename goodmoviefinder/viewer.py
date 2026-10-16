@@ -56,8 +56,15 @@ def save_viewer(
     languages: list[str],
     calendars: list[str] | None = None,
     signed_out: bool = False,
+    following_user: str | None = None,
 ) -> None:
     payload: dict[str, object] = {"letterboxd_user": user, "languages": languages}
+    if following_user is not None:
+        payload["following_user"] = following_user
+    elif not signed_out:
+        previous = load_viewer().get("following_user")
+        if isinstance(previous, str) and previous.strip():
+            payload["following_user"] = previous.strip()
     if signed_out:
         payload["signed_out"] = True
     if calendars is None:
@@ -71,6 +78,16 @@ def save_viewer(
 
 def load_signed_out() -> bool:
     return load_viewer().get("signed_out") is True
+
+
+def load_following_user(default: str) -> str:
+    raw = load_viewer().get("following_user")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return normalize_letterboxd_user(raw)
+        except ValueError:
+            pass
+    return default
 
 
 def load_calendars() -> list[str]:
