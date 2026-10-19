@@ -65,7 +65,8 @@ from goodmoviefinder.program import (
     partition_program_movies,
     sort_movies,
 )
-from goodmoviefinder.serve import serve
+from goodmoviefinder import progress
+from goodmoviefinder.serve import ServeHub, start_server, wait_server
 from goodmoviefinder.streaming import resolve_watchlist_streaming
 from goodmoviefinder.taste import build_for_you
 from goodmoviefinder.viewer import (
@@ -95,9 +96,10 @@ def _calendar_for_plan(
     found = []
     ready: list[str] = []
     failed: list[str] = []
-    for source in ordered:
+    for index, source in enumerate(ordered, start=1):
         label = "Apple Calendar" if source == "apple" else "Google Calendar"
         print(f"Reading {label}…", file=sys.stderr)
+        progress.tick(current=index, total=len(ordered), detail=f"Reading {label}")
         try:
             if source == "apple":
                 intervals = fetch_apple_busy(start, end)
@@ -397,47 +399,24 @@ class ProgramPage:
                 upcoming[slug] = min(days)
         return upcoming
 
-    def write(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
+    def _program_groups(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
         if self.no_profile:
-            watchlist: list[Movie] = []
-            recommendations: list[Movie] = []
-            watched: list[Movie] = []
-            program = sort_movies(self.results)
             self.see_first = []
             self.like_you = []
             self.step_outside = []
             self.taste_paragraph = ""
             self.taste_note = None
-        else:
-            watchlist, recommendations, watched, program = partition_program_movies(
-                self.results,
-                self.watched_ratings,
-                self.watchlist_slugs,
-                self.loved_credits,
-            )
-            neighbors, _aborted = ensure_neighbors(
-                self.cache_path,
-                self.letterboxd_user,
-                self.watched_ratings,
-                self.delay,
-                refresh=self.refresh_neighbors,
-            )
-            self.refresh_neighbors = False
-            taste = build_for_you(
-                self.cache,
-                self.cache_path,
-                self.watched_ratings,
-                neighbors,
-                self.watchlist_slugs,
-                known_languages=language_keys(self.languages),
-                user=self.letterboxd_user,
-                delay=self.delay,
-            )
-            self.see_first = taste.see_first
-            self.like_you = taste.like_you
-            self.step_outside = taste.step_outside
-            self.taste_paragraph = taste.paragraph
-            self.taste_note = taste.note
+            return [], [], [], sort_movies(self.results)
+        return partition_program_movies(
+            self.results,
+            self.watched_ratings,
+            self.watchlist_slugs,
+            self.loved_credits,
+        )
+
+    def write_program(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
+        """Write the Nonstop page. Letterboxd recommendations are filled in separately."""
+        watchlist, recommendations, watched, program = self._program_groups()
         found = [
             movie.primary_language
             for movie in self.results
@@ -445,7 +424,6 @@ class ProgramPage:
         ]
         choices = language_choices(found, self.languages)
         self.languages = canonical_languages(self.languages, choices)
-        self._write_account_page()
         output = format_html(
             watchlist,
             recommendations,
@@ -462,6 +440,39 @@ class ProgramPage:
         GENERATED_HTML.parent.mkdir(parents=True, exist_ok=True)
         GENERATED_HTML.write_text(output, encoding="utf-8")
         return watchlist, recommendations, watched, program
+
+    def fill_recommendations(self) -> None:
+        if self.no_profile:
+            return
+        neighbors, _aborted = ensure_neighbors(
+            self.cache_path,
+            self.letterboxd_user,
+            self.watched_ratings,
+            self.delay,
+            refresh=self.refresh_neighbors,
+        )
+        self.refresh_neighbors = False
+        taste = build_for_you(
+            self.cache,
+            self.cache_path,
+            self.watched_ratings,
+            neighbors,
+            self.watchlist_slugs,
+            known_languages=language_keys(self.languages),
+            user=self.letterboxd_user,
+            delay=self.delay,
+        )
+        self.see_first = taste.see_first
+        self.like_you = taste.like_you
+        self.step_outside = taste.step_outside
+        self.taste_paragraph = taste.paragraph
+        self.taste_note = taste.note
+
+    def write(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
+        groups = self.write_program()
+        self.fill_recommendations()
+        self._write_account_page()
+        return groups
 
     def apply_viewer(self, payload: dict) -> bool:
         with self._lock:
@@ -622,8 +633,15 @@ def load_profile(
                 f"{len(watchlist_slugs)} on watchlist.",
                 file=sys.stderr,
             )
+            progress.tick(
+                detail=(
+                    f"Cached profile: {len(watched_ratings)} watched, "
+                    f"{len(watchlist_slugs)} on watchlist"
+                )
+            )
             return watched_ratings, watchlist_slugs, watchlist_films or []
         print(f"Fetching Letterboxd watchlist titles for @{user}…", file=sys.stderr)
+        progress.tick(detail=f"Watchlist titles for @{user}")
         try:
             watchlist_films = fetch_letterboxd_watchlist(user, delay=delay)
         except RuntimeError as exc:
@@ -636,31 +654,69 @@ def load_profile(
         return watched_ratings, watchlist_slugs, watchlist_films
 
     print(f"Fetching Letterboxd watched films for @{user}…", file=sys.stderr)
+    progress.tick(detail=f"Watched films for @{user}")
+    watched_ratings: dict[str, float | None] = {}
     try:
-        watched_ratings = fetch_letterboxd_watched_ratings(user, delay=delay)
-        print(f"Fetching Letterboxd watchlist for @{user}…", file=sys.stderr)
+        watched_ratings = fetch_letterboxd_watched_ratings(
+            user, delay=delay, until_complete=True
+        )
+    except RuntimeError as exc:
+        print(f"{exc}; watched list was not updated.", file=sys.stderr)
+        stale = load_profile_cache(cache, user, allow_stale=True)
+        if stale is not None:
+            watched_ratings, watchlist_slugs, watchlist_films = stale
+            print(
+                f"Using the saved profile "
+                f"({len(watched_ratings)} watched, {len(watchlist_slugs)} on watchlist).",
+                file=sys.stderr,
+            )
+            return watched_ratings, watchlist_slugs, watchlist_films or []
+        watched_ratings = {}
+
+    print(f"Fetching Letterboxd watchlist for @{user}…", file=sys.stderr)
+    progress.tick(detail=f"Watchlist for @{user}")
+    try:
         watchlist_films = fetch_letterboxd_watchlist(user, delay=delay)
     except RuntimeError as exc:
+        print(f"{exc}; watchlist was not updated.", file=sys.stderr)
         stale = load_profile_cache(cache, user, allow_stale=True)
-        if stale is None:
-            raise
-        watched_ratings, watchlist_slugs, watchlist_films = stale
-        print(
-            f"{exc}; using the saved profile "
-            f"({len(watched_ratings)} watched, {len(watchlist_slugs)} on watchlist).",
-            file=sys.stderr,
-        )
-        return watched_ratings, watchlist_slugs, watchlist_films or []
+        if stale is not None:
+            saved_watched, watchlist_slugs, watchlist_films = stale
+            if not watched_ratings:
+                watched_ratings = saved_watched
+            watchlist_films = watchlist_films or []
+            if not watchlist_films:
+                watchlist_slugs = set(watchlist_slugs)
+            else:
+                watchlist_slugs = {str(film["slug"]) for film in watchlist_films}
+            if watched_ratings or watchlist_slugs:
+                save_profile_cache(
+                    cache,
+                    user,
+                    watched_ratings,
+                    watchlist_slugs,
+                    watchlist_films,
+                    profile_complete=False,
+                )
+                save_cache(cache_path, cache)
+            return watched_ratings, watchlist_slugs, watchlist_films
+        watchlist_films = []
 
     watchlist_slugs = {str(film["slug"]) for film in watchlist_films}
-    save_profile_cache(cache, user, watched_ratings, watchlist_slugs, watchlist_films)
-    save_cache(cache_path, cache)
-    rated = sum(1 for value in watched_ratings.values() if value is not None)
-    print(
-        f"Profile: {len(watched_ratings)} watched ({rated} rated), "
-        f"{len(watchlist_slugs)} on watchlist.",
-        file=sys.stderr,
-    )
+    if watched_ratings or watchlist_slugs:
+        save_profile_cache(cache, user, watched_ratings, watchlist_slugs, watchlist_films)
+        save_cache(cache_path, cache)
+        rated = sum(1 for value in watched_ratings.values() if value is not None)
+        print(
+            f"Profile: {len(watched_ratings)} watched ({rated} rated), "
+            f"{len(watchlist_slugs)} on watchlist.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Letterboxd profile is empty; continuing without watchlist or watched filters.",
+            file=sys.stderr,
+        )
     return watched_ratings, watchlist_slugs, watchlist_films
 
 
@@ -730,7 +786,12 @@ def main() -> int:
     parser.add_argument(
         "--serve",
         action="store_true",
-        help="Keep serving the page so Settings can load another Letterboxd profile",
+        help="Serve the page while it builds (default). Kept for compatibility.",
+    )
+    parser.add_argument(
+        "--no-serve",
+        action="store_true",
+        help="Write the HTML files and exit without starting a local server",
     )
     parser.add_argument(
         "--port",
@@ -779,20 +840,50 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    hub = ServeHub()
+    progress.bind(hub.progress)
+    server = None
+    keep_serving = not args.no_serve
+    if keep_serving:
+        server = start_server(hub, args.port)
+        if server is None:
+            print("Continuing without a local preview.", file=sys.stderr)
+
+    def finish(code: int) -> int:
+        if keep_serving and server is not None:
+            wait_server(server)
+        elif server is not None:
+            server.shutdown()
+        progress.bind(None)
+        return code
+
+    if no_profile:
+        progress.skip("profile", "Signed out")
+        progress.skip("credits", "Signed out")
+        progress.skip("streaming", "Signed out")
+        progress.skip("recommendations", "Signed out")
+    if not calendar_sources:
+        progress.skip("calendar", "No calendar connected")
+
     print(f"Fetching program: {args.program_url}", file=sys.stderr)
-    try:
-        program_html = fetch(args.program_url)
-    except urllib.error.URLError as exc:
-        print(f"Failed to fetch program: {exc.reason}", file=sys.stderr)
-        return 1
+    with progress.step("program", detail="Reading the Nonstop program"):
+        try:
+            program_html = fetch(args.program_url)
+        except urllib.error.URLError as exc:
+            message = f"Failed to fetch program: {exc.reason}"
+            print(message, file=sys.stderr)
+            hub.progress.fail(message, "program")
+            return finish(1)
 
-    films = parse_program(program_html)
-    if not films:
-        print("No films found on the program page.", file=sys.stderr)
-        return 1
-
-    if args.limit > 0:
-        films = films[: args.limit]
+        films = parse_program(program_html)
+        if not films:
+            message = "No films found on the program page."
+            print(message, file=sys.stderr)
+            hub.progress.fail(message, "program")
+            return finish(1)
+        if args.limit > 0:
+            films = films[: args.limit]
+        progress.tick(current=len(films), total=len(films), detail=f"{len(films)} films")
 
     cache = load_cache(args.cache)
     cached_program_urls = set(cache.get("entries", {}))
@@ -803,134 +894,152 @@ def main() -> int:
     watchlist_films: list[dict[str, object]] = []
 
     if not no_profile:
-        try:
-            watched_ratings, watchlist_slugs, watchlist_films = load_profile(
-                cache,
-                args.cache,
-                letterboxd_user,
-                args.delay,
-                refresh=args.refresh_profile,
-                no_cache=args.no_cache,
+        with progress.step("profile", detail=f"@{letterboxd_user}"):
+            try:
+                watched_ratings, watchlist_slugs, watchlist_films = load_profile(
+                    cache,
+                    args.cache,
+                    letterboxd_user,
+                    args.delay,
+                    refresh=args.refresh_profile,
+                    no_cache=args.no_cache,
+                )
+            except RuntimeError as exc:
+                print(f"{exc}; continuing without a Letterboxd profile.", file=sys.stderr)
+                watched_ratings, watchlist_slugs, watchlist_films = {}, set(), []
+            progress.tick(
+                detail=(
+                    f"{len(watched_ratings)} watched, {len(watchlist_slugs)} on watchlist"
+                )
             )
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
 
     results: list[Movie] = []
 
-    for index, film in enumerate(films, start=1):
-        print(f"[{index}/{len(films)}] {film.title}", file=sys.stderr)
+    with progress.step("films", total=len(films)):
+        for index, film in enumerate(films, start=1):
+            print(f"[{index}/{len(films)}] {film.title}", file=sys.stderr)
+            progress.tick(current=index, total=len(films), detail=film.title)
 
-        page: NonstopFilmPage | None = None
-        if not args.no_cache:
-            cached = cache_get(cache, film.url)
-            if cached is not None:
-                attach_program(cached, film)
-                updated = False
-                if not cached.primary_language_known or not cached.titles_known:
-                    print("  Looking up Letterboxd title and language…", file=sys.stderr)
-                    updated = backfill_letterboxd_details(cached, args.delay)
-                if not cached.details_known:
-                    print("  Looking up synopsis and cinema websites…", file=sys.stderr)
-                    backfill_nonstop_details(cached, args.delay)
-                    updated = updated or cached.details_known
-                if not cached.duration_known:
-                    print("  Looking up runtime…", file=sys.stderr)
-                    updated = backfill_runtime(cached, args.delay) or updated
-                if cached.match_current:
-                    if updated:
-                        cache_put(cache, cached)
-                        save_cache(args.cache, cache)
-                    results.append(cached)
-                    continue
-                print("  Cross-checking director, runtime, and cast…", file=sys.stderr)
-                try:
-                    page = parse_nonstop_movie_page(fetch(film.url))
-                except urllib.error.URLError as exc:
-                    print(
-                        f"  Nonstop page error: {exc.reason}",
-                        file=sys.stderr,
-                    )
-                    page = None
-                if page is None:
-                    cache_put(cache, cached)
-                    save_cache(args.cache, cache)
-                    results.append(cached)
-                    continue
-                _remember_runtime(cached, page)
-                if cached.letterboxd_url:
-                    print(
-                        "  Checking this Letterboxd link again…",
-                        file=sys.stderr,
-                    )
-                    still_matches = stored_letterboxd_still_matches(
-                        cached.letterboxd_url,
-                        page.year,
-                        page.director,
-                        page.cast,
-                        page.duration_minutes,
-                        args.delay,
-                    )
-                    if still_matches is None:
-                        print(
-                            "  Letterboxd lookup failed; keeping the saved link.",
-                            file=sys.stderr,
-                        )
-                        if cached.duration_minutes is not None:
+            page: NonstopFilmPage | None = None
+            if not args.no_cache:
+                cached = cache_get(cache, film.url)
+                if cached is not None:
+                    attach_program(cached, film)
+                    updated = False
+                    if not cached.primary_language_known or not cached.titles_known:
+                        print("  Looking up Letterboxd title and language…", file=sys.stderr)
+                        updated = backfill_letterboxd_details(cached, args.delay)
+                    if not cached.details_known:
+                        print("  Looking up synopsis and cinema websites…", file=sys.stderr)
+                        backfill_nonstop_details(cached, args.delay)
+                        updated = updated or cached.details_known
+                    if not cached.duration_known:
+                        print("  Looking up runtime…", file=sys.stderr)
+                        updated = backfill_runtime(cached, args.delay) or updated
+                    # Unfound titles stay in cache with no letterboxd_url; keep trying
+                    # to match so "already watched" can use the profile slug.
+                    if cached.match_current and cached.letterboxd_url:
+                        if updated:
                             cache_put(cache, cached)
                             save_cache(args.cache, cache)
                         results.append(cached)
                         continue
-                    if still_matches:
-                        print("  Saved Letterboxd link still matches.", file=sys.stderr)
+                    print("  Cross-checking director, runtime, and cast…", file=sys.stderr)
+                    try:
+                        page = parse_nonstop_movie_page(fetch(film.url))
+                    except urllib.error.URLError as exc:
+                        print(
+                            f"  Nonstop page error: {exc.reason}",
+                            file=sys.stderr,
+                        )
+                        page = None
+                    if page is None:
                         cache_put(cache, cached)
                         save_cache(args.cache, cache)
                         results.append(cached)
                         continue
-                    print(
-                        "  Saved Letterboxd link does not match; searching again…",
-                        file=sys.stderr,
-                    )
+                    _remember_runtime(cached, page)
+                    if cached.letterboxd_url:
+                        print(
+                            "  Checking this Letterboxd link again…",
+                            file=sys.stderr,
+                        )
+                        still_matches = stored_letterboxd_still_matches(
+                            cached.letterboxd_url,
+                            page.year,
+                            page.director,
+                            page.cast,
+                            page.duration_minutes,
+                            args.delay,
+                        )
+                        if still_matches is None:
+                            print(
+                                "  Letterboxd lookup failed; keeping the saved link.",
+                                file=sys.stderr,
+                            )
+                            if cached.duration_minutes is not None:
+                                cache_put(cache, cached)
+                                save_cache(args.cache, cache)
+                            results.append(cached)
+                            continue
+                        if still_matches:
+                            print("  Saved Letterboxd link still matches.", file=sys.stderr)
+                            cache_put(cache, cached)
+                            save_cache(args.cache, cache)
+                            results.append(cached)
+                            continue
+                        print(
+                            "  Saved Letterboxd link does not match; searching again…",
+                            file=sys.stderr,
+                        )
 
-        if page is None:
+            if page is None:
+                try:
+                    page = parse_nonstop_movie_page(fetch(film.url))
+                except urllib.error.URLError as exc:
+                    movie = Movie(
+                        title=film.title,
+                        nonstop_url=film.url,
+                        note=f"Nonstop page error: {exc.reason}",
+                    )
+                    attach_program(movie, film)
+                    results.append(movie)
+                    continue
+
+            page_title = page.title
+            release_year = page.year
+            nonstop_director = page.director
+
             try:
-                page = parse_nonstop_movie_page(fetch(film.url))
-            except urllib.error.URLError as exc:
+                movie = resolve_letterboxd(
+                    film.title,
+                    film.url,
+                    page_title,
+                    release_year,
+                    nonstop_director,
+                    delay=args.delay,
+                    nonstop_cast=page.cast,
+                    nonstop_duration=page.duration_minutes,
+                )
+            except RuntimeError as exc:
+                print(f"  Letterboxd lookup failed: {exc}", file=sys.stderr)
                 movie = Movie(
                     title=film.title,
                     nonstop_url=film.url,
-                    note=f"Nonstop page error: {exc.reason}",
+                    note=str(exc),
                 )
-                attach_program(movie, film)
-                results.append(movie)
-                continue
-
-        page_title = page.title
-        release_year = page.year
-        nonstop_director = page.director
-
-        movie = resolve_letterboxd(
-            film.title,
-            film.url,
-            page_title,
-            release_year,
-            nonstop_director,
-            delay=args.delay,
-            nonstop_cast=page.cast,
-            nonstop_duration=page.duration_minutes,
-        )
-        attach_program(movie, film)
-        if page is not None:
-            movie.synopsis = page.synopsis
-            movie.cinema_sites = page.cinema_sites
-            movie.details_known = True
-            _remember_runtime(movie, page)
-        apply_nonstop_metadata(movie, release_year, nonstop_director)
-        if not first_program_cache_build and film.url not in cached_program_urls:
-            movie.new_in_program = True
-        cache_put(cache, movie)
-        save_cache(args.cache, cache)
-        results.append(movie)
+            attach_program(movie, film)
+            if page is not None:
+                movie.synopsis = page.synopsis
+                movie.cinema_sites = page.cinema_sites
+                movie.details_known = True
+                _remember_runtime(movie, page)
+            apply_nonstop_metadata(movie, release_year, nonstop_director)
+            if not first_program_cache_build and film.url not in cached_program_urls:
+                movie.new_in_program = True
+            cache_put(cache, movie)
+            save_cache(args.cache, cache)
+            results.append(movie)
 
     loved_credits: dict[str, dict] = {}
     if no_profile:
@@ -939,13 +1048,14 @@ def main() -> int:
         grouped_watched: list[Movie] = []
         grouped_program = sort_movies(results)
     else:
-        loved_credits = ensure_loved_film_credits(
-            cache,
-            args.cache,
-            watched_ratings,
-            args.delay,
-            results,
-        )
+        with progress.step("credits", detail="Films you rated 4.0 or higher"):
+            loved_credits = ensure_loved_film_credits(
+                cache,
+                args.cache,
+                watched_ratings,
+                args.delay,
+                results,
+            )
         (
             grouped_watchlist,
             grouped_recommendations,
@@ -954,15 +1064,27 @@ def main() -> int:
         ) = partition_program_movies(
             results, watched_ratings, watchlist_slugs, loved_credits
         )
-    busy_intervals, calendar_status = _calendar_for_plan(
-        calendar_sources,
-        [
-            *grouped_watchlist,
-            *grouped_recommendations,
-            *grouped_watched,
-            *grouped_program,
-        ],
-    )
+    if calendar_sources:
+        with progress.step("calendar", total=len(calendar_sources)):
+            busy_intervals, calendar_status = _calendar_for_plan(
+                calendar_sources,
+                [
+                    *grouped_watchlist,
+                    *grouped_recommendations,
+                    *grouped_watched,
+                    *grouped_program,
+                ],
+            )
+    else:
+        busy_intervals, calendar_status = _calendar_for_plan(
+            calendar_sources,
+            [
+                *grouped_watchlist,
+                *grouped_recommendations,
+                *grouped_watched,
+                *grouped_program,
+            ],
+        )
     page = ProgramPage(
         results,
         cache,
@@ -986,13 +1108,30 @@ def main() -> int:
     page.loved_credits = loved_credits
     if no_profile:
         page.stream_films = None
-    else:
-        page.stream_films = resolve_watchlist_streaming(
-            watchlist_films,
-            args.delay,
-            refresh=args.refresh_streaming,
+    with progress.step("pages", detail="Writing the Nonstop program"):
+        watchlist_movies, recommendation_movies, watched_movies, program_movies = (
+            page.write_program()
         )
-    watchlist_movies, recommendation_movies, watched_movies, program_movies = page.write()
+        if no_profile:
+            page._write_account_page()
+    hub.attach(page)
+    hub.progress.mark_program()
+    print(f"Wrote {GENERATED_HTML}", file=sys.stderr)
+    if not no_profile:
+        with progress.step(
+            "streaming",
+            total=max(len(watchlist_films), 1),
+            detail="Where watchlist films stream",
+        ):
+            page.stream_films = resolve_watchlist_streaming(
+                watchlist_films,
+                args.delay,
+                refresh=args.refresh_streaming,
+            )
+        with progress.step("recommendations", detail="Similar members and For you"):
+            page.fill_recommendations()
+            page._write_account_page()
+    hub.progress.ready()
     if persist_settings or persist_calendars:
         save_viewer(
             page.letterboxd_user,
@@ -1001,7 +1140,6 @@ def main() -> int:
             signed_out=signed_out,
             following_user=page.following_user,
         )
-    print(f"Wrote {GENERATED_HTML}", file=sys.stderr)
     print(f"Wrote {GENERATED_ACCOUNT}", file=sys.stderr)
 
     known = language_keys(page.languages)
@@ -1027,6 +1165,8 @@ def main() -> int:
         f"{rated}/{len(results)} with Letterboxd ratings.",
         file=sys.stderr,
     )
-    if args.serve:
-        return serve(page, args.port)
-    return 0
+    if keep_serving and server is None:
+        server = start_server(hub, args.port, open_browser=True)
+        if server is None:
+            return 1
+    return finish(0)

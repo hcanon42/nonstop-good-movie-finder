@@ -39,7 +39,7 @@ def slugify(title: str) -> str:
     title = normalize_title_chars(title)
     title = unicodedata.normalize("NFKD", title)
     title = title.encode("ascii", "ignore").decode("ascii")
-    title = title.lower().replace("&", "and")
+    title = title.lower().replace("&", "and").replace("'", "")
     title = re.sub(r"[^a-z0-9]+", "-", title)
     return title.strip("-")
 

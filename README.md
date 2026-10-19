@@ -4,7 +4,7 @@ Lists films from the [Nonstop Kino program](https://nonstopkino.at/en/program/?w
 
 ## Requirements
 
-- Python 3.10+. Taste recommendations also need scikit-learn (`python3 -m pip install scikit-learn` in the project virtualenv). The first Apple Calendar run also needs the Xcode command line tools (`xcode-select --install`).
+- Python 3.10+. On Windows, also install `tzdata` (`python3 -m pip install tzdata`) so `Europe/Vienna` time zones work. Taste recommendations also need scikit-learn (`python3 -m pip install scikit-learn` in the project virtualenv). The first Apple Calendar run also needs the Xcode command line tools (`xcode-select --install`).
 
 ## Usage
 
@@ -12,7 +12,7 @@ Lists films from the [Nonstop Kino program](https://nonstopkino.at/en/program/?w
 python3 goodmoviefinder.py
 ```
 
-This writes a styled HTML page (search, color-coded ratings) to `generated/program-ranked.html`. That path is fixed.
+This starts a local server at [http://127.0.0.1:8765](http://127.0.0.1:8765) right away, opens it in your browser, and writes a styled HTML page (search, color-coded ratings) to `generated/program-ranked.html`. That path is fixed. While films and profiles are still being fetched, the page shows each step and how far along it is. The Nonstop program loads as soon as that page is written. Letterboxd recommendations keep building after that; My Letterboxd stays on the progress page until they finish. Leave the process running to keep using Settings, friend ratings, and calendar actions. Press Ctrl+C to stop. Pass `--no-serve` to write the files and exit without a server.
 
 Common options:
 
@@ -34,7 +34,7 @@ Results are cached in `cache/ratings.json` so re-runs are much quicker. Use `--n
 
 The **Watchlist** tab on My Letterboxd lists every film on your [Letterboxd watchlist](https://letterboxd.com/hcanon/watchlist/), not only the ones playing at Nonstop. For each film it shows the services where that film can be watched online in Austria. A logo opens that film on the service. Films with nowhere to watch say so. Those results are cached in `cache/streaming.json` for three days. Use `--refresh-streaming` to look them up again.
 
-By default, program titles that match your [watchlist](https://letterboxd.com/hcanon/watchlist/) are listed first under **Watchlist — now in Nonstop program**. **Recommendations** lists other films now playing whose director also made a film you rated 4.0 or higher. Each row names that film. The **Recommendations** tab on My Letterboxd (`/account` when served; `/for-you` redirects there) recommends films from across Letterboxd, not only the ones at Nonstop: films similar members rated highly, and highly rated films in the countries and themes you tend to like. A short paragraph at the top describes that taste. **See this first** and **More like what you love** are the films the model expects you to rate at least 4.2. **A step outside** is films from nanogenres you have liked only once or twice, still scored by that model with a lower bar. The **For you** column is that prediction. If the check on films the model did not train on is too weak, those sections stay empty and the paragraph says so. The first run reads Letterboxd pages for the films you have rated, then a capped set of other members (up to 30 diaries, each stopped after 40 pages, at least one second between requests). That member list is cached for seven days. `--refresh-profile` fetches it again. If Letterboxd refuses three times in a row, the lookup stops and the page uses what it already saved. Films you have already logged ([@hcanon’s films](https://letterboxd.com/hcanon/films/)) appear in a separate **Already watched — also in program** section, with your Letterboxd rating in a **You** column next to the community score. Films you logged without a rating show a dash there. The full program lists every other film, split into three groups: rated films, Letterboxd matches that have no rating yet, and titles that could not be found on Letterboxd. Watchlist and recommendation titles appear in that listing as well as in their own sections. Profile data is cached for six hours; use `--refresh-profile` to update it.
+By default, program titles that match your [watchlist](https://letterboxd.com/hcanon/watchlist/) are listed first under **Watchlist — now in Nonstop program**. **Recommendations** lists other films now playing whose director also made a film you rated 4.0 or higher. Each row names that film. The **Recommendations** tab on My Letterboxd (`/account` when served; `/for-you` redirects there) recommends films from across Letterboxd, not only the ones at Nonstop: films similar members rated highly, and highly rated films in the countries and themes you tend to like. A short paragraph at the top describes that taste. **See this first** and **More like what you love** are the films the model expects you to rate at least 4.2. **A step outside** is films from nanogenres you have liked only once or twice, still scored by that model with a lower bar. The **For you** column is that prediction. If the check on films the model did not train on is too weak, those sections stay empty and the paragraph says so. The first run reads Letterboxd pages for the films you have rated, then a capped set of other members (up to 30 diaries, each stopped after 40 pages, at least one second between requests). That member list is cached for seven days. `--refresh-profile` fetches it again. If Letterboxd refuses three times in a row, the lookup stops and the page uses what it already saved. Films you have already logged ([@hcanon’s films](https://letterboxd.com/hcanon/films/)) appear in a separate **Already watched — also in program** section, with your Letterboxd rating in a **You** column next to the community score. Films you logged without a rating show a dash there. The full program lists every other film, split into three groups: rated films, Letterboxd matches that have no rating yet, and titles that could not be found on Letterboxd. Watchlist and recommendation titles appear in that listing as well as in their own sections. Your watched films and watchlist are read page by page, and a refused page is requested again until Letterboxd serves it. Profile data is cached for six hours once every page has loaded; use `--refresh-profile` to update it. A profile that stopped early is fetched again on the next run.
 
 Open the account menu to tick the languages you know. That choice stays in this browser. Loading another Letterboxd profile from that menu needs the local server (`--serve`), which reloads the page with that person’s watchlist and ratings. The same settings can be passed on the command line, and are remembered in `viewer.json`.
 
@@ -45,7 +45,10 @@ python3 goodmoviefinder.py --letterboxd-user otheruser
 # Languages you can watch without English subtitles
 python3 goodmoviefinder.py --languages English,French,German
 
-# Serve the page so Settings can load a profile
+# Write the pages without starting a server
+python3 goodmoviefinder.py --no-serve
+
+# Same as the default: serve while building, keep serving after
 python3 goodmoviefinder.py --serve
 
 # Disable watched/watchlist filtering

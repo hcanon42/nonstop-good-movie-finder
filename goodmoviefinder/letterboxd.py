@@ -5,12 +5,14 @@ from __future__ import annotations
 import html
 import json
 import re
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 
 from goodmoviefinder.http import fetch, fetch_status, make_cookie_opener
+from goodmoviefinder.progress import tick
 from goodmoviefinder.matching import (
     director_overlaps,
     duration_relation,
@@ -25,6 +27,7 @@ from goodmoviefinder.matching import (
 from goodmoviefinder.models import LetterboxdCandidate, Movie
 from goodmoviefinder.nonstop import slug_from_nonstop_url
 from goodmoviefinder.program import letterboxd_slug_from_url
+from goodmoviefinder.title_lookup import english_title_from_german_wikipedia
 
 LETTERBOXD_SLUG_RE = re.compile(r'data-item-slug="([^"]+)"')
 # Letterboxd encodes a viewer's score as rated-N, where N is half-stars (rated-7 = 3.5).
@@ -136,6 +139,19 @@ def parse_letterboxd_watched_ratings(html_text: str) -> dict[str, float | None]:
     return ratings
 
 
+# Own-profile reads keep requesting a refused page. Neighbor diaries stay capped.
+_PROFILE_PAGE_LIMIT = 200
+_PROFILE_RETRY_CAP_SECONDS = 90.0
+_PAGE_NUMBER_RE = re.compile(r"/page/(\d+)/")
+
+
+def _profile_page_count(html_text: str) -> int | None:
+    numbers = [int(value) for value in _PAGE_NUMBER_RE.findall(html_text)]
+    if not numbers:
+        return None
+    return max(numbers)
+
+
 def _iter_letterboxd_profile_pages(
     user: str,
     section: str,
@@ -144,16 +160,22 @@ def _iter_letterboxd_profile_pages(
     *,
     page_attempts: int = 4,
     profile_delay: float | None = None,
+    until_complete: bool = False,
 ):
+    """Yield each profile page. `until_complete` retries a refused page until it loads."""
     page = 1
     opener = make_cookie_opener()
     pause = max(profile_delay if profile_delay is not None else delay, 1.0)
     attempts = max(1, page_attempts)
+    label = "watchlist" if section == "watchlist" else "watched films"
+    page_total: int | None = None
 
     while page <= max_pages:
         url = letterboxd_profile_url(user, section, page)
-        html_text = None
-        for attempt in range(attempts):
+        html_text: str | None = None
+        fetch_error: str | None = None
+        attempt = 0
+        while html_text is None:
             _wait_letterboxd_gap(pause)
             try:
                 html_text = fetch(url, opener=opener)
@@ -161,22 +183,57 @@ def _iter_letterboxd_profile_pages(
                 break
             except urllib.error.HTTPError as exc:
                 _mark_letterboxd_fetch()
-                if exc.code in {403, 429, 503} and attempt < attempts - 1:
-                    time.sleep(pause * (attempt + 2) * 1.5)
-                    continue
-                raise RuntimeError(f"Failed to fetch {url}: HTTP {exc.code}") from exc
+                transient = exc.code in {403, 429, 503}
+                fetch_error = f"Failed to fetch {url}: HTTP {exc.code}"
+                if not transient:
+                    raise RuntimeError(fetch_error) from exc
             except urllib.error.URLError as exc:
                 _mark_letterboxd_fetch()
-                raise RuntimeError(f"Failed to fetch {url}: {exc.reason}") from exc
+                fetch_error = f"Failed to fetch {url}: {exc.reason}"
 
-        if html_text is None:
-            raise RuntimeError(f"Failed to fetch {url}")
+            attempt += 1
+            if not until_complete and attempt >= attempts:
+                if page > 1:
+                    print(
+                        f"{fetch_error}; using the profile pages fetched so far.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(fetch_error, file=sys.stderr)
+                return
+            if until_complete:
+                wait = min(_PROFILE_RETRY_CAP_SECONDS, pause * (2 ** min(attempt, 6)))
+            else:
+                wait = pause * (attempt + 2) * 1.5
+            print(
+                f"{fetch_error}; retrying {label} page {page} in {wait:.0f}s…",
+                file=sys.stderr,
+            )
+            tick(detail=f"{label}, page {page}, retrying")
+            time.sleep(wait)
+            if until_complete and attempt % 3 == 0:
+                opener = make_cookie_opener()
 
+        assert html_text is not None
+        found_pages = _profile_page_count(html_text)
+        if found_pages is not None:
+            page_total = max(page_total or 0, found_pages)
+        tick(
+            current=page,
+            total=page_total,
+            detail=f"{label}, page {page}"
+            + (f" of {page_total}" if page_total else ""),
+        )
         yield html_text
         if not LETTERBOXD_NEXT_PAGE_RE.search(html_text):
-            break
+            return
         page += 1
         time.sleep(pause)
+
+    if until_complete:
+        raise RuntimeError(
+            f"Letterboxd still had another {label} page after {max_pages}."
+        )
 
 
 def fetch_letterboxd_profile_slugs(
@@ -195,7 +252,13 @@ def fetch_letterboxd_watchlist(user: str, delay: float) -> list[dict[str, object
     """Watchlist films in page order, with the title and year shown on each poster."""
     films: list[dict[str, object]] = []
     seen: set[str] = set()
-    for html_text in _iter_letterboxd_profile_pages(user, "watchlist", delay):
+    for html_text in _iter_letterboxd_profile_pages(
+        user,
+        "watchlist",
+        delay,
+        max_pages=_PROFILE_PAGE_LIMIT,
+        until_complete=True,
+    ):
         for film in parse_letterboxd_watchlist_films(html_text):
             slug = str(film["slug"])
             if slug in seen:
@@ -212,15 +275,17 @@ def fetch_letterboxd_watched_ratings(
     *,
     page_attempts: int = 4,
     profile_delay: float | None = None,
+    until_complete: bool = False,
 ) -> dict[str, float | None]:
     ratings: dict[str, float | None] = {}
     for html_text in _iter_letterboxd_profile_pages(
         user,
         "films",
         delay,
-        max_pages,
+        _PROFILE_PAGE_LIMIT if until_complete else max_pages,
         page_attempts=page_attempts,
         profile_delay=profile_delay,
+        until_complete=until_complete,
     ):
         ratings.update(parse_letterboxd_watched_ratings(html_text))
     return ratings
@@ -1104,9 +1169,24 @@ def resolve_letterboxd(
         return False
 
     def _search_queries() -> None:
-        for query in flexible_search_queries(
+        queries = flexible_search_queries(
             display_title, nonstop_page_title, nonstop_url
-        ):
+        )
+        seen_queries: set[str] = {q.casefold() for q in queries}
+        for source in (display_title, nonstop_page_title):
+            if not source:
+                continue
+            english = english_title_from_german_wikipedia(source, release_year)
+            if not english:
+                continue
+            slug = slugify(english)
+            if consider_slug(slug, from_search=True):
+                return
+            key = english.casefold()
+            if key not in seen_queries:
+                seen_queries.add(key)
+                queries.insert(0, english)
+        for query in queries:
             for slug in letterboxd_autocomplete_slugs(query, delay, limit=8):
                 if consider_slug(slug, from_search=True):
                     return

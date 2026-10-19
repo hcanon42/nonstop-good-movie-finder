@@ -1,0 +1,106 @@
+    .page-build .page-head { padding-bottom: 0.4rem; }
+    .build-overall-label {
+      margin: 1rem 0 0.4rem;
+      color: var(--gold);
+      font-size: 0.82rem;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+    }
+    .build-bar {
+      height: 0.45rem;
+      border-radius: 999px;
+      background: var(--inset);
+      border: 1px solid var(--line);
+      overflow: hidden;
+    }
+    .build-bar > span {
+      display: block;
+      height: 100%;
+      width: 0%;
+      background: var(--gold);
+      border-radius: inherit;
+      transition: width var(--dur) var(--ease);
+    }
+    .build-bar.is-indeterminate > span {
+      width: 32%;
+      animation: build-slide 1.1s var(--ease) infinite;
+    }
+    .build-bar-overall { max-width: 36rem; }
+    .build-bar-overall > span { background: linear-gradient(90deg, var(--gold), #f0d48a); }
+    @keyframes build-slide {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(360%); }
+    }
+    .build-error {
+      margin: 0.9rem 0 0;
+      padding: 0.7rem 0.9rem;
+      border: 1px solid var(--warn);
+      border-radius: var(--radius-md);
+      background: var(--warn-soft);
+      color: var(--warn-ink);
+      max-width: 46rem;
+    }
+    .build-steps {
+      list-style: none;
+      margin: 1.25rem 0 0;
+      padding: 0.35rem 0;
+      max-width: 46rem;
+    }
+    .build-step {
+      padding: 0.85rem 1.1rem 0.95rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .build-step:last-child { border-bottom: 0; }
+    .build-step-head {
+      display: flex;
+      align-items: baseline;
+      gap: 0.55rem;
+    }
+    .build-step-mark {
+      width: 0.7rem;
+      height: 0.7rem;
+      border-radius: 999px;
+      border: 2px solid var(--line);
+      flex: 0 0 auto;
+      transform: translateY(0.12rem);
+    }
+    .build-step.is-running .build-step-mark {
+      border-color: var(--gold);
+      background: var(--gold);
+      box-shadow: 0 0 0 4px var(--gold-soft);
+    }
+    .build-step.is-done .build-step-mark {
+      border-color: var(--ok);
+      background: var(--ok);
+    }
+    .build-step.is-skipped .build-step-mark {
+      border-color: var(--faint);
+      background: var(--surface-raised);
+    }
+    .build-step.is-error .build-step-mark {
+      border-color: var(--warn);
+      background: var(--warn);
+    }
+    .build-step-label {
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+    .build-step.is-pending .build-step-label { color: var(--muted); }
+    .build-step-count {
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .build-step .build-bar { margin: 0.55rem 0 0 1.25rem; }
+    .build-step.is-pending .build-bar,
+    .build-step.is-skipped .build-bar { opacity: 0.35; }
+    .build-step.is-done .build-bar > span { width: 100%; }
+    .build-step.is-skipped .build-bar > span { width: 100%; background: var(--line); }
+    .build-step-detail {
+      margin: 0.35rem 0 0 1.25rem;
+      color: var(--muted);
+      font-size: 0.82rem;
+      min-height: 1.15em;
+    }
+    .build-step.is-pending .build-step-detail { color: var(--faint); }

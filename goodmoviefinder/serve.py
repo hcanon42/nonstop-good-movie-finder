@@ -4,13 +4,45 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 import urllib.parse
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from goodmoviefinder.config import GENERATED_HTML
+from goodmoviefinder.progress import format_progress_html
 
-def serve(state: Any, port: int) -> int:
-    html_path = state.html_path
+
+class ServeHub:
+    """Holds build progress until the program page is ready, then that page."""
+
+    def __init__(self) -> None:
+        from goodmoviefinder.progress import BuildProgress
+
+        self.progress = BuildProgress()
+        self._page: Any = None
+        self._lock = threading.Lock()
+
+    def attach(self, page: Any) -> None:
+        with self._lock:
+            self._page = page
+
+    @property
+    def page(self) -> Any:
+        with self._lock:
+            return self._page
+
+    @property
+    def html_path(self):
+        page = self.page
+        return page.html_path if page is not None else GENERATED_HTML
+
+
+def start_server(state: Any, port: int, *, open_browser: bool = True) -> ThreadingHTTPServer | None:
+    html_path = GENERATED_HTML
+    hub = state if isinstance(state, ServeHub) else None
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: object) -> None:
@@ -32,6 +64,30 @@ def serve(state: Any, port: int) -> int:
             self.end_headers()
             self.wfile.write(data)
 
+        def _page(self) -> Any:
+            if hub is not None:
+                return hub.page
+            return state
+
+        def _building(self) -> bool:
+            page = self._page()
+            if page is None:
+                return True
+            if hub is None:
+                return False
+            return hub.progress.phase != "ready"
+
+        def _show_progress(self, path: str) -> bool:
+            if not self._building():
+                return False
+            program_paths = {"/", "/index.html", "/program-ranked.html"}
+            account_paths = {"/account", "/account.html", "/for-you"}
+            if path not in program_paths and path not in account_paths:
+                return False
+            if path in program_paths and hub is not None and hub.progress.program_ready:
+                return False
+            return True
+
         def do_OPTIONS(self) -> None:
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -41,6 +97,28 @@ def serve(state: Any, port: int) -> int:
 
         def do_GET(self) -> None:
             path = urllib.parse.urlparse(self.path).path
+            if path == "/api/progress":
+                if hub is None:
+                    self._send(
+                        200,
+                        json.dumps(
+                            {
+                                "phase": "ready",
+                                "programReady": True,
+                                "error": None,
+                                "overall": 1,
+                                "steps": [],
+                            }
+                        ),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps(hub.progress.snapshot()), "application/json")
+                return
+            if self._show_progress(path):
+                self._send(200, format_progress_html(), "text/html; charset=utf-8")
+                return
+            page = self._page()
             if path == "/for-you":
                 self.send_response(302)
                 self.send_header("Location", "/account.html#recommendations")
@@ -63,14 +141,21 @@ def serve(state: Any, port: int) -> int:
                     return
                 self._send(200, body, "text/html; charset=utf-8")
                 return
+            if page is None:
+                self._send(
+                    503,
+                    json.dumps({"error": "Still building the pages."}),
+                    "application/json",
+                )
+                return
             if path == "/api/viewer":
-                self._send(200, json.dumps(state.viewer_payload()), "application/json")
+                self._send(200, json.dumps(page.viewer_payload()), "application/json")
                 return
             if path == "/api/friends":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 slug = (query.get("slug") or [""])[0]
                 try:
-                    payload = state.friend_ratings(slug)
+                    payload = page.friend_ratings(slug)
                 except ValueError as exc:
                     self._send(400, json.dumps({"error": str(exc)}), "application/json")
                     return
@@ -86,7 +171,7 @@ def serve(state: Any, port: int) -> int:
                 return
             if path == "/api/following":
                 try:
-                    payload = state.following_list()
+                    payload = page.following_list()
                 except ValueError as exc:
                     self._send(400, json.dumps({"error": str(exc)}), "application/json")
                     return
@@ -102,7 +187,7 @@ def serve(state: Any, port: int) -> int:
                 return
             if path == "/api/calendar":
                 try:
-                    payload = state.refresh_calendar()
+                    payload = page.refresh_calendar()
                 except ValueError as exc:
                     self._send(400, json.dumps({"error": str(exc)}), "application/json")
                     return
@@ -112,7 +197,7 @@ def serve(state: Any, port: int) -> int:
                 self._send(200, json.dumps({"ok": True, **payload}), "application/json")
                 return
             if path == "/api/recommendations":
-                self._send(200, json.dumps(state.recommendations_status()), "application/json")
+                self._send(200, json.dumps(page.recommendations_status()), "application/json")
                 return
             self._send(404, "Not found", "text/plain; charset=utf-8")
 
@@ -121,9 +206,17 @@ def serve(state: Any, port: int) -> int:
             payload = self._read_json()
             if payload is None:
                 return
+            page = self._page()
+            if page is None:
+                self._send(
+                    503,
+                    json.dumps({"error": "Still building the pages."}),
+                    "application/json",
+                )
+                return
             if path == "/api/viewer":
                 try:
-                    reload = state.apply_viewer(payload)
+                    reload = page.apply_viewer(payload)
                 except ValueError as exc:
                     self._send(400, json.dumps({"error": str(exc)}), "application/json")
                     return
@@ -134,7 +227,7 @@ def serve(state: Any, port: int) -> int:
                 return
             if path == "/api/plan":
                 try:
-                    saved = state.save_plan(payload)
+                    saved = page.save_plan(payload)
                 except ValueError as exc:
                     self._send(400, json.dumps({"error": str(exc)}), "application/json")
                     return
@@ -145,7 +238,7 @@ def serve(state: Any, port: int) -> int:
                 return
             if path == "/api/recommendations":
                 try:
-                    payload = state.start_recommendations_refresh()
+                    payload = page.start_recommendations_refresh()
                 except ValueError as exc:
                     self._send(400, json.dumps({"error": str(exc)}), "application/json")
                     return
@@ -183,10 +276,31 @@ def serve(state: Any, port: int) -> int:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError as exc:
         print(f"Could not listen on 127.0.0.1:{port}: {exc}", file=sys.stderr)
-        return 1
-    print(f"Serving http://127.0.0.1:{port}", file=sys.stderr)
+        return None
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{port}"
+    print(f"Serving {url}", file=sys.stderr)
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception as exc:
+            print(f"Could not open a browser: {exc}", file=sys.stderr)
+    return server
+
+
+def wait_server(server: ThreadingHTTPServer) -> int:
     try:
-        server.serve_forever()
+        while True:
+            time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nStopped.", file=sys.stderr)
+        server.shutdown()
     return 0
+
+
+def serve(state: Any, port: int) -> int:
+    server = start_server(state, port)
+    if server is None:
+        return 1
+    return wait_server(server)

@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from goodmoviefinder.progress import tick
 from goodmoviefinder.letterboxd import (
     LetterboxdRefused,
     fetch_letterboxd_html,
@@ -187,9 +188,14 @@ def ensure_neighbors(
         file=sys.stderr,
     )
     seed_hits: dict[str, set[str]] = {}
-    for slug in seeds:
+    for seed_index, slug in enumerate(seeds, start=1):
         if aborted:
             break
+        tick(
+            current=seed_index,
+            total=max(len(seeds), 1),
+            detail=f"Members who rated {slug}",
+        )
         for page in (1, 2):
             body = polite(letterboxd_film_ratings_url(slug, page))
             if body is None:
@@ -231,6 +237,7 @@ def ensure_neighbors(
             }
             continue
         print(f"  @{name} has logged {count} films. Reading ratings…", file=sys.stderr)
+        tick(detail=f"@{name} ({kept_count} of {NEIGHBOR_KEEP} diaries)")
         try:
             ratings = member_ratings(name)
         except RuntimeError as exc:

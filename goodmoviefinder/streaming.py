@@ -15,6 +15,8 @@ from typing import Any
 from goodmoviefinder.config import STREAMING_CACHE, USER_AGENT
 from goodmoviefinder.http import fetch
 from goodmoviefinder.letterboxd import letterboxd_poster_url, parse_letterboxd_film_card
+from goodmoviefinder.progress import tick
+from goodmoviefinder.title_lookup import english_title_from_german_wikipedia
 
 STREAMING_CACHE_VERSION = 1
 FILM_CARD_VERSION = 2
@@ -204,8 +206,23 @@ def _post_graphql(payload: dict[str, object]) -> dict[str, Any]:
     return parsed
 
 
-def search_austria_offers(title: str, year: int | None) -> list[dict[str, str]]:
-    """Services in Austria for this film. An empty list means none were found."""
+def _justwatch_search_queries(title: str, year: int | None) -> list[str]:
+    queries = [title.strip()]
+    english = english_title_from_german_wikipedia(title, year)
+    if english and english.casefold() != queries[0].casefold():
+        queries.append(english)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for query in queries:
+        key = query.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(query)
+    return ordered
+
+
+def _search_austria_offers_once(title: str, year: int | None) -> list[dict[str, str]]:
     payload = {
         "query": _SEARCH_QUERY,
         "variables": {
@@ -258,6 +275,15 @@ def search_austria_offers(title: str, year: int | None) -> list[dict[str, str]]:
     if chosen is None:
         return []
     return offers_for_node(chosen)
+
+
+def search_austria_offers(title: str, year: int | None) -> list[dict[str, str]]:
+    """Services in Austria for this film. An empty list means none were found."""
+    for query in _justwatch_search_queries(title, year):
+        offers = _search_austria_offers_once(query, year)
+        if offers:
+            return offers
+    return []
 
 
 def _clean_offers(raw: object) -> list[dict[str, str]] | None:
@@ -456,6 +482,7 @@ def resolve_watchlist_streaming(
         if not isinstance(year, int):
             year = None
         print(f"Streaming in Austria [{index}/{total}] {title}", file=sys.stderr)
+        tick(current=index, total=total, detail=title)
         offers: list[dict[str, str]] | None = None
         if not refresh:
             offers = _cached_offers(entries.get(slug), title, year, now=now)

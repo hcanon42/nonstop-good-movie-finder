@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from goodmoviefinder.http import fetch
+from goodmoviefinder.progress import tick
 from goodmoviefinder.letterboxd import (
     LetterboxdRefused,
     fetch_letterboxd_film_credit,
@@ -77,6 +78,9 @@ def load_profile_cache(
     fetched_at = profile.get("fetched_at", 0)
     if not allow_stale and time.time() - fetched_at > PROFILE_CACHE_MAX_AGE:
         return None
+    # A profile saved before every films page loaded must be fetched again.
+    if not allow_stale and not profile.get("profile_complete"):
+        return None
     raw_ratings = profile.get("watched_ratings")
     if not isinstance(raw_ratings, dict):
         return None
@@ -94,6 +98,8 @@ def save_profile_cache(
     watched_ratings: dict[str, float | None],
     watchlist: set[str],
     watchlist_films: list[dict[str, object]],
+    *,
+    profile_complete: bool = True,
 ) -> None:
     cache.setdefault("profile", {})[user] = {
         "watched": sorted(watched_ratings),
@@ -101,6 +107,7 @@ def save_profile_cache(
         "watchlist": sorted(watchlist),
         "watchlist_films": watchlist_films,
         "fetched_at": int(time.time()),
+        "profile_complete": profile_complete,
     }
 
 
@@ -390,6 +397,7 @@ def ensure_loved_film_credits(
         label = credit["title"] or slug
         names = ", ".join(credit["directors"]) or "no director"
         print(f"  [{index}/{len(missing)}] {label} — {names}", file=sys.stderr)
+        tick(current=index, total=len(missing), detail=f"{label} — {names}")
         if index % 10 == 0:
             save_cache(cache_path, cache)
         time.sleep(delay)
@@ -578,6 +586,7 @@ def ensure_film_features(
         countries = list(parsed.get("countries") or [])
         detail = ", ".join([*countries, *themes[:2]]) or "no themes"
         print(f"  [{index}/{len(missing)}] {label} — {detail}", file=sys.stderr)
+        tick(current=index, total=len(missing), detail=f"{label} — {detail}")
         if index % 10 == 0:
             save_cache(cache_path, cache)
         time.sleep(delay)
@@ -645,6 +654,7 @@ def ensure_nanogenres(
                 file=sys.stderr,
             )
             save_cache(cache_path, cache)
+        tick(current=index, total=len(missing), detail=f"Nanogenres {index}/{len(missing)}")
         time.sleep(delay)
     save_cache(cache_path, cache)
     print(f"Nanogenres ready for {found} films.", file=sys.stderr)
@@ -691,5 +701,6 @@ def ensure_film_cards(
         raw["card_known"] = True
         label = raw.get("title") or slug
         print(f"  [{index}/{len(missing)}] {label}", file=sys.stderr)
+        tick(current=index, total=len(missing), detail=str(label))
         time.sleep(delay)
     save_cache(cache_path, cache)
