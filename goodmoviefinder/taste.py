@@ -695,6 +695,7 @@ def _note(
     neighbor_calls: int,
     have_neighbors: bool,
     content_only: bool,
+    use_content: bool,
 ) -> str:
     sentences: list[str] = []
     if content_precision is None:
@@ -717,8 +718,12 @@ def _note(
             "When members like you pointed at a film, you had rated it 4 or higher "
             f"{_percent(neighbor_precision)} of the time ({neighbor_calls} films)."
         )
-    if not content_ok and not neighbor_ok:
+    if not use_content and not neighbor_ok:
         sentences.append("That is not confident enough to recommend a film.")
+    elif use_content and not content_ok and not neighbor_ok:
+        sentences.append(
+            "That check is under the usual bar. These are still the strongest predictions from your ratings."
+        )
     elif content_only:
         sentences.append("These picks use your ratings only.")
     return " ".join(sentences)
@@ -811,7 +816,7 @@ def recommend(
     like_cap: int = 12,
     outside_hits: dict[str, OutsideTag] | None = None,
 ) -> TasteView:
-    """Score the current program. Shelves stay empty when neither model is precise enough."""
+    """Score films. A trained rating model still recommends when its check is under 70%."""
     for movie in movies:
         movie.because = None
         movie.predicted_rating = None
@@ -883,7 +888,8 @@ def recommend(
         except OSError:
             pass
 
-    content_ok = bool(bundle.get("content_ok")) and bundle.get("mean_model") is not None
+    use_content = bundle.get("mean_model") is not None and bundle.get("low_model") is not None
+    content_ok = bool(bundle.get("content_ok")) and use_content
     neighbor_ok = bool(bundle.get("neighbor_ok"))
     content_only = content_ok and not neighbor_ok
     note = _note(
@@ -895,9 +901,10 @@ def recommend(
         neighbor_calls=int(bundle.get("neighbor_calls") or 0),
         have_neighbors=bool(neighbors),
         content_only=content_only,
+        use_content=use_content,
     )
     view = TasteView(paragraph=paragraph, note=note)
-    if not content_ok and not neighbor_ok:
+    if not use_content and not neighbor_ok:
         return view
 
     space = bundle["space"]
@@ -926,14 +933,14 @@ def recommend(
         if not _enough_ratings(feature):
             continue
         predicted = lower = None
-        if content_ok and mean_model is not None and low_model is not None:
+        if use_content and mean_model is not None and low_model is not None:
             predicted, lower = _predict_pair(space, mean_model, low_model, slug, feature)
         member_predicted, support = (None, 0)
         if neighbor_ok:
             member_predicted, support = _neighbor_score(slug, sims, neighbors, user_mean)
         if _carried_by_low(feature, low_keys, high_keys):
             continue
-        if content_ok and neighbor_ok:
+        if use_content and neighbor_ok and content_ok:
             passed = (
                 predicted is not None
                 and lower is not None
@@ -942,7 +949,7 @@ def recommend(
                 and member_predicted is not None
                 and member_predicted >= PREDICT_MIN
             )
-        elif content_ok:
+        elif use_content:
             passed = (
                 predicted is not None
                 and lower is not None

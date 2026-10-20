@@ -25,13 +25,6 @@ NEIGHBOR_KEEP = 30
 NEIGHBOR_DIARY_PAGES = 40
 NEIGHBOR_PROFILE_CHECKS = 150
 NEIGHBOR_SEED_COUNT = 20
-# Slower pacing and more retries than the rest of the app — member lookup is bursty.
-NEIGHBOR_MIN_PAUSE = 2.5
-NEIGHBOR_HTML_ATTEMPTS = 8
-NEIGHBOR_URL_RETRIES = 5
-NEIGHBOR_DIARY_PAGE_ATTEMPTS = 8
-NEIGHBOR_DIARY_FETCH_RETRIES = 4
-NEIGHBOR_MAX_REFUSALS = 24
 
 
 def neighbors_cache_path(cache_path: Path) -> Path:
@@ -109,78 +102,34 @@ def ensure_neighbors(
         print(f"Using cached similar members: {len(fresh)} diaries.", file=sys.stderr)
         return fresh, bool(record.get("aborted"))
 
-    pause = max(delay, NEIGHBOR_MIN_PAUSE)
+    pause = max(delay, 1.0)
     raw_members = record.get("members")
     members: dict[str, Any] = raw_members if isinstance(raw_members, dict) else {}
     aborted = False
     refused = 0
 
-    def _abort_if_needed() -> None:
-        nonlocal aborted
-        if refused >= NEIGHBOR_MAX_REFUSALS:
-            aborted = True
-            print(
-                f"Letterboxd refused {refused} times. Stopping the member lookup.",
-                file=sys.stderr,
-            )
-
     def polite(url: str) -> str | None:
         nonlocal refused, aborted
         if aborted:
             return None
-        for round_index in range(NEIGHBOR_URL_RETRIES):
-            if aborted:
-                return None
-            try:
-                body = fetch_letterboxd_html(
-                    url,
-                    pause,
-                    attempts=NEIGHBOR_HTML_ATTEMPTS,
-                    min_pause=NEIGHBOR_MIN_PAUSE,
-                )
-            except LetterboxdRefused as exc:
-                wait = pause * (2 ** min(round_index, 4))
+        try:
+            body = fetch_letterboxd_html(url, pause)
+        except LetterboxdRefused as exc:
+            refused += 1
+            print(f"  {exc}", file=sys.stderr)
+            if refused >= 3:
+                aborted = True
                 print(
-                    f"  {exc}; retrying in {wait:.0f}s "
-                    f"({round_index + 1}/{NEIGHBOR_URL_RETRIES})…",
+                    "Letterboxd refused three times. Stopping the member lookup.",
                     file=sys.stderr,
                 )
-                time.sleep(wait)
-                continue
-            except RuntimeError as exc:
-                print(f"  {exc}", file=sys.stderr)
-                return None
-            refused = 0
-            time.sleep(pause)
-            return body
-        refused += 1
-        print(f"  Giving up on {url} after {NEIGHBOR_URL_RETRIES} tries.", file=sys.stderr)
-        _abort_if_needed()
-        return None
-
-    def member_ratings(name: str) -> dict[str, float | None]:
-        for round_index in range(NEIGHBOR_DIARY_FETCH_RETRIES):
-            try:
-                return fetch_letterboxd_watched_ratings(
-                    name,
-                    pause,
-                    max_pages=NEIGHBOR_DIARY_PAGES,
-                    page_attempts=NEIGHBOR_DIARY_PAGE_ATTEMPTS,
-                    profile_delay=pause,
-                )
-            except RuntimeError as exc:
-                message = str(exc)
-                transient = any(code in message for code in ("403", "429", "503"))
-                if not transient or round_index >= NEIGHBOR_DIARY_FETCH_RETRIES - 1:
-                    raise
-                wait = pause * (2 ** min(round_index, 4))
-                print(
-                    f"  @{name}: {exc}; retrying diary in {wait:.0f}s "
-                    f"({round_index + 1}/{NEIGHBOR_DIARY_FETCH_RETRIES})…",
-                    file=sys.stderr,
-                )
-                time.sleep(wait)
-        raise RuntimeError(f"Failed to read @{name} diary.")
+            return None
+        except RuntimeError as exc:
+            print(f"  {exc}", file=sys.stderr)
+            return None
+        refused = 0
+        time.sleep(pause)
+        return body
 
     seeds = _seeds(watched_ratings)
     print(
@@ -239,13 +188,22 @@ def ensure_neighbors(
         print(f"  @{name} has logged {count} films. Reading ratings…", file=sys.stderr)
         tick(detail=f"@{name} ({kept_count} of {NEIGHBOR_KEEP} diaries)")
         try:
-            ratings = member_ratings(name)
+            ratings = fetch_letterboxd_watched_ratings(
+                name,
+                pause,
+                max_pages=NEIGHBOR_DIARY_PAGES,
+            )
         except RuntimeError as exc:
             print(f"  @{name}: {exc}", file=sys.stderr)
             message = str(exc)
             if any(code in message for code in ("403", "429", "503")):
                 refused += 1
-                _abort_if_needed()
+                if refused >= 3:
+                    aborted = True
+                    print(
+                        "Letterboxd refused three times. Stopping the member lookup.",
+                        file=sys.stderr,
+                    )
             continue
         rated = {
             slug: float(value)

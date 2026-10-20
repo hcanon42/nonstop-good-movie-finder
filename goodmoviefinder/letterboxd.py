@@ -355,14 +355,11 @@ def fetch_letterboxd_html(
     url: str,
     delay: float,
     extra_headers: dict[str, str] | None = None,
-    *,
-    attempts: int = 4,
-    min_pause: float | None = None,
 ) -> str:
     """Fetch one Letterboxd page. Repeated refusals raise LetterboxdRefused."""
-    pause = max(min_pause if min_pause is not None else delay, 1.0)
+    pause = max(delay, 1.0)
     last: urllib.error.HTTPError | None = None
-    for attempt in range(max(1, attempts)):
+    for attempt in range(4):
         _wait_letterboxd_gap(pause)
         try:
             body = fetch(url, extra_headers=extra_headers)
