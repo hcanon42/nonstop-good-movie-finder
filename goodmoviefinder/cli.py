@@ -21,8 +21,11 @@ from goodmoviefinder.cache import (
     ensure_loved_film_credits,
     load_cache,
     load_profile_cache,
+    load_recommendations_cache,
+    recommendations_updated_label,
     save_cache,
     save_profile_cache,
+    save_recommendations_cache,
     save_watchlist_films,
 )
 from goodmoviefinder.calendar_busy import (
@@ -48,9 +51,12 @@ from goodmoviefinder.account import format_account_html, format_taste_panel_html
 from goodmoviefinder.html import format_html
 from goodmoviefinder.http import fetch
 from goodmoviefinder.letterboxd import (
+    apply_manual_letterboxd_match,
     apply_nonstop_metadata,
     fetch_letterboxd_watched_ratings,
     fetch_letterboxd_watchlist,
+    letterboxd_autocomplete_films,
+    normalize_letterboxd_film_slug,
     resolve_letterboxd,
     stored_letterboxd_still_matches,
 )
@@ -58,6 +64,7 @@ from goodmoviefinder.models import Movie, NonstopFilmPage
 from goodmoviefinder.nonstop import parse_nonstop_movie_page, parse_program
 from goodmoviefinder.neighbors import ensure_neighbors
 from goodmoviefinder.program import (
+    apply_known_letterboxd_posters,
     attach_program,
     letterboxd_slug_from_url,
     counts_as_viewer_language,
@@ -68,7 +75,7 @@ from goodmoviefinder.program import (
 from goodmoviefinder import progress
 from goodmoviefinder.serve import ServeHub, start_server, wait_server
 from goodmoviefinder.streaming import resolve_watchlist_streaming
-from goodmoviefinder.taste import build_for_you
+from goodmoviefinder.taste import TasteView, build_for_you
 from goodmoviefinder.viewer import (
     canonical_languages,
     language_choices,
@@ -216,14 +223,19 @@ class ProgramPage:
         self.refresh_streaming = False
         self.loved_credits: dict[str, dict] = {}
         self.refresh_neighbors = False
+        self.ignore_recommendation_cache = False
         self.see_first: list[Movie] = []
         self.like_you: list[Movie] = []
         self.step_outside: list[Movie] = []
         self.taste_paragraph = ""
         self.taste_note: str | None = None
+        self.taste_fetched_at: int | None = None
         self._rec_running = False
         self._rec_error: str | None = None
-        self._lock = threading.Lock()
+        self._rec_epoch = 0
+        self._epoch = 0
+        self._rebuilding = False
+        self._lock = threading.RLock()
 
     @property
     def html_path(self) -> Path:
@@ -251,6 +263,66 @@ class ProgramPage:
             root_user=self.following_user,
             active_user=self.letterboxd_user,
         )
+
+    def search_letterboxd(self, query: str) -> dict[str, object]:
+        text = query.strip()
+        if not text:
+            raise ValueError("Type a title to search Letterboxd.")
+        if len(text) > 120:
+            raise ValueError("That search is too long.")
+        with self._lock:
+            delay = self.delay
+        films = letterboxd_autocomplete_films(text, delay, limit=8)
+        return {"films": films}
+
+    def letterboxd_backdrop(self, slug: str) -> dict[str, object]:
+        from goodmoviefinder.cache import backdrop_lookup, remember_backdrop
+        from goodmoviefinder.letterboxd import (
+            fetch_letterboxd_html,
+            letterboxd_film_page_url,
+            normalize_letterboxd_film_slug,
+            parse_letterboxd_backdrop,
+        )
+
+        normalized = normalize_letterboxd_film_slug(slug)
+        if not normalized:
+            raise ValueError("That is not a Letterboxd film.")
+        with self._lock:
+            known, url = backdrop_lookup(normalized)
+            delay = self.delay
+        if known:
+            return {"url": url}
+        body = fetch_letterboxd_html(letterboxd_film_page_url(normalized), delay)
+        url = parse_letterboxd_backdrop(body)
+        with self._lock:
+            remember_backdrop(normalized, url)
+            features = self.cache.get("film_features")
+            feature = features.get(normalized) if isinstance(features, dict) else None
+            if isinstance(feature, dict) and url:
+                feature["backdrop"] = url
+        return {"url": url}
+
+    def apply_match(self, payload: dict) -> dict[str, object]:
+        with self._lock:
+            raw_url = payload.get("nonstopUrl")
+            raw_slug = payload.get("slug")
+            if not isinstance(raw_url, str) or not raw_url.strip():
+                raise ValueError("Choose a film from the program.")
+            slug = normalize_letterboxd_film_slug(str(raw_slug or ""))
+            if not slug:
+                raise ValueError("That is not a Letterboxd film address.")
+            movie = next(
+                (item for item in self.results if item.nonstop_url == raw_url.strip()),
+                None,
+            )
+            if movie is None:
+                raise ValueError("That film is not in the current program.")
+            apply_manual_letterboxd_match(movie, slug, self.delay)
+            cache_put(self.cache, movie)
+            save_cache(self.cache_path, self.cache)
+            self.write_program()
+            self._write_account_page()
+            return {"reload": True}
 
     def friend_ratings(self, slug: str) -> dict[str, object]:
         from goodmoviefinder.friends import ensure_friend_ratings, present_friend_ratings
@@ -284,6 +356,7 @@ class ProgramPage:
                 panel, pills = self._taste_panel_parts()
                 payload["panel"] = panel
                 payload["pills"] = pills
+                payload["updatedLabel"] = recommendations_updated_label(self.taste_fetched_at)
             if self._rec_error:
                 payload["error"] = self._rec_error
                 self._rec_error = None
@@ -293,60 +366,26 @@ class ProgramPage:
         with self._lock:
             if self.no_profile:
                 raise ValueError("Sign in to refresh recommendations.")
-            if self._rec_running:
+            if self._rec_running or self._rebuilding:
                 return {"status": "running"}
             self._rec_running = True
+            self._rec_epoch = self._epoch
         threading.Thread(target=self._recommendations_refresh_worker, daemon=True).start()
         return {"status": "running"}
 
     def _recommendations_refresh_worker(self) -> None:
+        epoch = self._rec_epoch
         try:
+            self.fill_recommendations(force=True, refresh_profile=True)
             with self._lock:
-                user = self.letterboxd_user
-                cache = self.cache
-                cache_path = self.cache_path
-                delay = self.delay
-                languages = language_keys(self.languages)
-                results = self.results
-            watched, watchlist, _films = load_profile(
-                cache,
-                cache_path,
-                user,
-                delay,
-                refresh=True,
-                no_cache=False,
-            )
-            neighbors, _aborted = ensure_neighbors(
-                cache_path,
-                user,
-                watched,
-                delay,
-                refresh=True,
-            )
-            taste = build_for_you(
-                cache,
-                cache_path,
-                watched,
-                neighbors,
-                watchlist,
-                known_languages=languages,
-                user=user,
-                delay=delay,
-            )
-            with self._lock:
-                self.watched_ratings = watched
-                self.watchlist_slugs = watchlist
-                self.see_first = taste.see_first
-                self.like_you = taste.like_you
-                self.step_outside = taste.step_outside
-                self.taste_paragraph = taste.paragraph
-                self.taste_note = taste.note
+                if epoch != self._epoch:
+                    return
                 self.loved_credits = ensure_loved_film_credits(
-                    cache,
-                    cache_path,
-                    watched,
-                    delay,
-                    results,
+                    self.cache,
+                    self.cache_path,
+                    self.watched_ratings,
+                    self.delay,
+                    self.results,
                 )
                 self._write_account_page()
         except Exception as exc:
@@ -376,6 +415,7 @@ class ProgramPage:
             step_outside=self.step_outside,
             paragraph=self.taste_paragraph,
             note=self.taste_note or "",
+            updated_label=recommendations_updated_label(self.taste_fetched_at),
             known_languages=self.languages,
             language_options=choices,
         )
@@ -406,6 +446,7 @@ class ProgramPage:
             self.step_outside = []
             self.taste_paragraph = ""
             self.taste_note = None
+            self.taste_fetched_at = None
             return [], [], [], sort_movies(self.results)
         return partition_program_movies(
             self.results,
@@ -416,6 +457,7 @@ class ProgramPage:
 
     def write_program(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
         """Write the Nonstop page. Letterboxd recommendations are filled in separately."""
+        apply_known_letterboxd_posters(self.results, self.cache)
         watchlist, recommendations, watched, program = self._program_groups()
         found = [
             movie.primary_language
@@ -441,32 +483,84 @@ class ProgramPage:
         GENERATED_HTML.write_text(output, encoding="utf-8")
         return watchlist, recommendations, watched, program
 
-    def fill_recommendations(self) -> None:
-        if self.no_profile:
-            return
+    def _apply_taste(self, view: TasteView, fetched_at: int | None) -> None:
+        self.see_first = view.see_first
+        self.like_you = view.like_you
+        self.step_outside = view.step_outside
+        self.taste_paragraph = view.paragraph
+        self.taste_note = view.note
+        self.taste_fetched_at = fetched_at
+
+    def load_cached_recommendations(self) -> bool:
+        if self.no_profile or self.ignore_recommendation_cache:
+            return False
+        loaded = load_recommendations_cache(self.cache, self.letterboxd_user)
+        if loaded is None:
+            return False
+        view, fetched_at = loaded
+        self._apply_taste(view, fetched_at)
+        print(
+            f"Using cached recommendations for @{self.letterboxd_user}.",
+            file=sys.stderr,
+        )
+        return True
+
+    def fill_recommendations(self, *, force: bool = False, refresh_profile: bool = False) -> None:
+        with self._lock:
+            epoch = self._epoch
+            if self.no_profile:
+                return
+            if not force and self.load_cached_recommendations():
+                return
+            user = self.letterboxd_user
+            cache = self.cache
+            cache_path = self.cache_path
+            delay = self.delay
+            languages = language_keys(self.languages)
+            if refresh_profile:
+                refresh_neighbors = True
+            else:
+                watched = dict(self.watched_ratings)
+                watchlist = set(self.watchlist_slugs)
+                refresh_neighbors = self.refresh_neighbors
+                self.refresh_neighbors = False
+        if refresh_profile:
+            watched, watchlist, films = load_profile(
+                cache,
+                cache_path,
+                user,
+                delay,
+                refresh=True,
+                no_cache=False,
+            )
+        print(f"Building recommendations for @{user}…", file=sys.stderr)
         neighbors, _aborted = ensure_neighbors(
-            self.cache_path,
-            self.letterboxd_user,
-            self.watched_ratings,
-            self.delay,
-            refresh=self.refresh_neighbors,
+            cache_path,
+            user,
+            watched,
+            delay,
+            refresh=refresh_neighbors,
         )
-        self.refresh_neighbors = False
         taste = build_for_you(
-            self.cache,
-            self.cache_path,
-            self.watched_ratings,
+            cache,
+            cache_path,
+            watched,
             neighbors,
-            self.watchlist_slugs,
-            known_languages=language_keys(self.languages),
-            user=self.letterboxd_user,
-            delay=self.delay,
+            watchlist,
+            known_languages=languages,
+            user=user,
+            delay=delay,
         )
-        self.see_first = taste.see_first
-        self.like_you = taste.like_you
-        self.step_outside = taste.step_outside
-        self.taste_paragraph = taste.paragraph
-        self.taste_note = taste.note
+        fetched_at = save_recommendations_cache(cache, cache_path, user, taste)
+        with self._lock:
+            if epoch != self._epoch or self.no_profile:
+                return
+            if refresh_profile:
+                self.watched_ratings = watched
+                self.watchlist_slugs = watchlist
+                self.watchlist_films = films
+            self._apply_taste(taste, fetched_at)
+            self.ignore_recommendation_cache = False
 
     def write(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
         groups = self.write_program()
@@ -475,7 +569,10 @@ class ProgramPage:
         return groups
 
     def apply_viewer(self, payload: dict) -> bool:
+        switch: tuple[str, bool, bool] | None = None
         with self._lock:
+            if self._rebuilding:
+                raise ValueError("Still switching accounts.")
             reload = False
             if "languages" in payload:
                 raw = payload["languages"]
@@ -504,46 +601,135 @@ class ProgramPage:
                 user = normalize_letterboxd_user(str(payload["letterboxdUser"]))
                 changed = user.casefold() != self.letterboxd_user.casefold()
                 root_changed = user.casefold() != self.following_user.casefold()
-                if changed or self.no_profile:
-                    watched, watchlist, films = load_profile(
-                        self.cache,
-                        self.cache_path,
-                        user,
-                        self.delay,
-                        refresh=changed,
-                        no_cache=False,
-                    )
-                    self.watched_ratings = watched
-                    self.watchlist_slugs = watchlist
-                    self.watchlist_films = films
-                    self.stream_films = resolve_watchlist_streaming(
-                        films,
-                        self.delay,
-                        refresh=self.refresh_streaming,
-                    )
-                    self.loved_credits = ensure_loved_film_credits(
-                        self.cache,
-                        self.cache_path,
-                        watched,
-                        self.delay,
-                        self.results,
-                    )
-                    self.letterboxd_user = user
-                    self.refresh_neighbors = True
-                    self.no_profile = False
-                    self.signed_out = False
-                self.following_user = user
                 if changed or self.no_profile or root_changed:
+                    switch = (user, changed or self.no_profile, changed)
                     reload = True
-            if reload:
+                else:
+                    self.following_user = user
+            if switch is not None and progress.get() is not None:
+                # Hand the browser the building page while this account reloads.
+                self._epoch += 1
+                self._rebuilding = True
+                generation = self._begin_switch_progress(load_profile=switch[1])
+                threading.Thread(
+                    target=self._switch_worker,
+                    args=(switch, generation),
+                    daemon=True,
+                ).start()
+                return True
+            if switch is not None:
+                self._epoch += 1
+                self._switch_to(*switch)
+            elif reload:
                 self.write()
-            save_viewer(
-                self.letterboxd_user,
-                self.languages,
-                signed_out=self.signed_out,
-                following_user=self.following_user,
-            )
+            self._save_viewer()
             return reload
+
+    def _save_viewer(self) -> None:
+        save_viewer(
+            self.letterboxd_user,
+            self.languages,
+            signed_out=self.signed_out,
+            following_user=self.following_user,
+        )
+
+    def _begin_switch_progress(self, *, load_profile: bool) -> int:
+        tracker = progress.get()
+        assert tracker is not None
+        done = {
+            "program": "Already loaded",
+            "films": "Already matched",
+        }
+        skipped: dict[str, str] = {}
+        if self.calendar_sources:
+            done["calendar"] = "Already loaded"
+        else:
+            skipped["calendar"] = "No calendar connected"
+        if not load_profile:
+            skipped["profile"] = "Already loaded"
+            skipped["credits"] = "Already loaded"
+            skipped["streaming"] = "Already loaded"
+        return tracker.restart(done=done, skipped=skipped)
+
+    def _switch_worker(self, switch: tuple[str, bool, bool], generation: int) -> None:
+        progress.adopt(generation)
+        user, load_profile, refresh = switch
+        print(f"Switching to @{user}…", file=sys.stderr)
+        try:
+            with self._lock:
+                self._switch_to(user, load_profile, refresh)
+                tracker = progress.get()
+                if tracker is not None:
+                    tracker.ready()
+        except Exception as exc:
+            print(f"[serve] account switch: {exc}", file=sys.stderr)
+            tracker = progress.get()
+            if tracker is not None and tracker.phase != "error":
+                tracker.fail(str(exc))
+        finally:
+            with self._lock:
+                self._rebuilding = False
+
+    def _switch_to(self, user: str, load_profile: bool, refresh: bool) -> None:
+        if load_profile:
+            with progress.step("profile", detail=f"@{user}"):
+                watched, watchlist, films = load_profile(
+                    self.cache,
+                    self.cache_path,
+                    user,
+                    self.delay,
+                    refresh=refresh,
+                    no_cache=False,
+                )
+                progress.tick(
+                    detail=f"{len(watched)} watched, {len(watchlist)} on watchlist"
+                )
+            with progress.step(
+                "streaming",
+                total=max(len(films), 1),
+                detail="Where watchlist films stream",
+            ):
+                stream_films = resolve_watchlist_streaming(
+                    films,
+                    self.delay,
+                    refresh=self.refresh_streaming,
+                )
+            with progress.step("credits", detail="Films you rated 4.0 or higher"):
+                loved_credits = ensure_loved_film_credits(
+                    self.cache,
+                    self.cache_path,
+                    watched,
+                    self.delay,
+                    self.results,
+                )
+            self.watched_ratings = watched
+            self.watchlist_slugs = watchlist
+            self.watchlist_films = films
+            self.stream_films = stream_films
+            self.loved_credits = loved_credits
+            self.letterboxd_user = user
+            self.no_profile = False
+            self.signed_out = False
+            self.see_first = []
+            self.like_you = []
+            self.step_outside = []
+            self.taste_paragraph = ""
+            self.taste_note = None
+            self.taste_fetched_at = None
+        self.following_user = user
+        self._save_viewer()
+        with progress.step("pages", detail="Writing the Nonstop program"):
+            self.write_program()
+        if self.no_profile:
+            progress.skip("recommendations", "Signed out")
+        elif self.load_cached_recommendations():
+            progress.skip("recommendations", "Using saved recommendations")
+        else:
+            self._write_account_page()
+            with progress.step("recommendations", detail="Similar members and For you"):
+                self.fill_recommendations(force=True)
+        self._write_account_page()
+        self._save_viewer()
 
     def save_plan(self, payload: dict) -> dict[str, object]:
         with self._lock:
@@ -842,6 +1028,7 @@ def main() -> int:
 
     hub = ServeHub()
     progress.bind(hub.progress)
+    progress.adopt(hub.progress.generation)
     server = None
     keep_serving = not args.no_serve
     if keep_serving:
@@ -1105,6 +1292,7 @@ def main() -> int:
     page.watchlist_films = watchlist_films
     page.refresh_streaming = args.refresh_streaming
     page.refresh_neighbors = args.refresh_profile
+    page.ignore_recommendation_cache = args.no_cache or args.refresh_profile
     page.loved_credits = loved_credits
     if no_profile:
         page.stream_films = None
@@ -1114,6 +1302,7 @@ def main() -> int:
         )
         if no_profile:
             page._write_account_page()
+    page_epoch = page._epoch
     hub.attach(page)
     hub.progress.mark_program()
     print(f"Wrote {GENERATED_HTML}", file=sys.stderr)
@@ -1123,15 +1312,30 @@ def main() -> int:
             total=max(len(watchlist_films), 1),
             detail="Where watchlist films stream",
         ):
-            page.stream_films = resolve_watchlist_streaming(
+            streamed = resolve_watchlist_streaming(
                 watchlist_films,
                 args.delay,
                 refresh=args.refresh_streaming,
             )
-        with progress.step("recommendations", detail="Similar members and For you"):
-            page.fill_recommendations()
-            page._write_account_page()
-    hub.progress.ready()
+        cached_recommendations = False
+        with page._lock:
+            still_current = page._epoch == page_epoch
+            if still_current:
+                page.stream_films = streamed
+                cached_recommendations = page.load_cached_recommendations()
+                if cached_recommendations:
+                    page._write_account_page()
+        if still_current and cached_recommendations:
+            progress.skip("recommendations", "Using saved recommendations")
+        elif still_current:
+            with progress.step("recommendations", detail="Similar members and For you"):
+                page.fill_recommendations(force=True)
+                with page._lock:
+                    if page._epoch == page_epoch:
+                        page._write_account_page()
+    with page._lock:
+        if page._epoch == page_epoch:
+            hub.progress.ready()
     if persist_settings or persist_calendars:
         save_viewer(
             page.letterboxd_user,

@@ -5,7 +5,8 @@ from __future__ import annotations
 import calendar
 import html
 import json
-from datetime import date, timedelta
+import re
+from datetime import date
 from pathlib import Path
 
 from goodmoviefinder.config import (
@@ -13,12 +14,14 @@ from goodmoviefinder.config import (
     DEFAULT_LETTERBOXD_USER,
     DEFAULT_SERVE_PORT,
 )
-from goodmoviefinder.letterboxd import letterboxd_poster_url
+from goodmoviefinder.cache import backdrop_lookup
+from goodmoviefinder.letterboxd import letterboxd_backdrop_url, letterboxd_poster_url
 from goodmoviefinder.layout import render_page
 from goodmoviefinder.models import Movie, Screening
 from goodmoviefinder.program import (
     _MONTHS,
     LOVED_RATING,
+    _DISPLAY_DIRECTOR_LIMIT,
     _format_directors,
     _format_genres,
     _format_user_rating,
@@ -29,7 +32,9 @@ from goodmoviefinder.program import (
     film_title,
     format_language,
     format_screening_date,
+    is_last_chance,
     language_filter_blurb,
+    last_followable_day,
     letterboxd_slug_from_url,
     movie_is_watchable,
     sort_movies,
@@ -187,7 +192,7 @@ def _screenings_by_day(screenings: list[Screening]) -> dict[date, list[Screening
 
 
 def _friend_ratings_html(slug: str | None) -> str:
-    """Placeholder filled when the film is opened, if the page is being served."""
+    """Placeholder filled in the background, and shown when the film is opened."""
     if not slug or len(slug) > 160:
         return ""
     if any(not (character.isalnum() or character == "-") for character in slug):
@@ -197,14 +202,18 @@ def _friend_ratings_html(slug: str | None) -> str:
         f'<section class="friend-ratings" data-friend-slug="{safe}">'
         f'<h3 class="schedule-label">Letterboxd friends</h3>'
         f'<p class="friend-status muted">Loading friend ratings and watchlists…</p>'
+        f'<div class="friend-group" data-friend-section="comments" hidden>'
+        f'<h4 class="friend-group-label">Comments</h4>'
+        f'<ul class="friend-list" hidden></ul>'
+        f"</div>"
         f'<div class="friend-group" data-friend-section="rated">'
         f'<h4 class="friend-group-label">Rated</h4>'
-        f'<ul class="friend-list" hidden></ul>'
+        f'<ul class="friend-list friend-list-compact" hidden></ul>'
         f'<p class="friend-empty muted" hidden>None of your Letterboxd friends have rated this.</p>'
         f"</div>"
         f'<div class="friend-group" data-friend-section="watchlist">'
         f'<h4 class="friend-group-label">On watchlist</h4>'
-        f'<ul class="friend-list" hidden></ul>'
+        f'<ul class="friend-list friend-list-compact" hidden></ul>'
         f'<p class="friend-empty muted" hidden>None of your Letterboxd friends have this on their watchlist.</p>'
         f"</div>"
         f"</section>"
@@ -331,13 +340,201 @@ def _schedule_html(movie: Movie, known: frozenset[str]) -> str:
     )
 
 
-def _detail_panel_html(movie: Movie, detail_id: str, known: frozenset[str]) -> str:
-    poster = ""
+def _format_runtime(minutes: int | None) -> str:
+    if not isinstance(minutes, int) or minutes <= 0:
+        return ""
+    hours, mins = divmod(minutes, 60)
+    if hours and mins:
+        return f"{hours}h {mins:02d}m"
+    if hours:
+        return f"{hours}h"
+    return f"{mins} min"
+
+
+def _detail_facts_html(movie: Movie) -> str:
+    parts: list[str] = []
+    year = _format_year(movie)
+    if year != "—":
+        parts.append(year)
+    directors = _format_directors(movie)
+    if directors != "—":
+        parts.append(html.escape(directors))
+    runtime = _format_runtime(movie.duration_minutes)
+    if runtime:
+        parts.append(html.escape(runtime))
+    language = format_language(movie)
+    if language and language != "—":
+        parts.append(html.escape(language))
+    if not parts:
+        return ""
+    return '<p class="detail-facts">' + "".join(f"<span>{part}</span>" for part in parts) + "</p>"
+
+
+def _detail_genres_html(movie: Movie) -> str:
+    chips = [
+        f'<span class="chip">{html.escape(genre.strip())}</span>'
+        for genre in movie.genres
+        if genre.strip()
+    ]
+    if not chips:
+        return ""
+    return f'<p class="detail-genres">{"".join(chips)}</p>'
+
+
+def _on_nonstop(movie: Movie) -> bool:
+    return movie.nonstop_url.startswith("https://nonstopkino.at/")
+
+
+_SKIP_REASON = re.compile(
+    r"^Predicted \d+(?:\.\d+)?(?: \(lower \d+(?:\.\d+)?\))?\.$"
+    r"|^From your own ratings only\.$"
+)
+
+
+def because_reasons(text: str) -> list[str]:
+    """Split a recommendation explanation into one reason per line."""
+    raw = text.strip()
+    if not raw:
+        return []
+    if "\n" in raw:
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    else:
+        lines = _split_because_sentences(raw)
+    reasons: list[str] = []
+    for line in lines:
+        for reason in _split_nearest_reasons(line):
+            if _SKIP_REASON.match(reason):
+                continue
+            if reasons and reason.startswith("It showed up"):
+                previous = reasons[-1].rstrip(".")
+                reasons[-1] = f"{previous}. {reason}"
+            else:
+                reasons.append(reason)
+    return reasons
+
+
+def _split_because_sentences(text: str) -> list[str]:
+    """Split on sentence ends without breaking ratings such as 4.6."""
+    reasons: list[str] = []
+    buf = ""
+    for piece in text.split(". "):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if not buf:
+            buf = piece
+            continue
+        if re.match(r"\d{4}\b", piece) or re.match(r"[A-Z]", piece):
+            reasons.append(buf if buf.endswith(".") else f"{buf}.")
+            buf = piece
+        else:
+            buf = f"{buf}. {piece}"
+    if buf:
+        reasons.append(buf if buf.endswith(".") else f"{buf}.")
+    return reasons
+
+
+def _split_nearest_reasons(sentence: str) -> list[str]:
+    """One bullet per loved film inside a 'nearest of your ratings' sentence."""
+    prefix = "Nearest of your own ratings: "
+    if not sentence.startswith(prefix):
+        return [sentence]
+    body = sentence[len(prefix) :].strip()
+    if body.endswith("."):
+        body = body[:-1]
+    clauses: list[str] = []
+    buf = ""
+    for part in body.split(" and "):
+        candidate = f"{buf} and {part}" if buf else part
+        if re.search(r", which you rated \d+(?:\.\d+)?$", candidate):
+            clauses.append(candidate)
+            buf = ""
+        else:
+            buf = candidate
+    if buf:
+        if clauses:
+            clauses[-1] = f"{clauses[-1]} and {buf}"
+        else:
+            clauses = [buf]
+    if len(clauses) <= 1:
+        return [sentence]
+    return [f"Close to {clause}." for clause in clauses]
+
+
+def _why_recommend_html(movie: Movie) -> str:
+    reasons = because_reasons(movie.because or "")
+    if not reasons:
+        return ""
+    items = "".join(f"<li>{html.escape(reason)}</li>" for reason in reasons)
+    return (
+        '<div class="why-recommend">'
+        '<p class="why-recommend-label">Why you would like this</p>'
+        f'<ul class="why-recommend-list">{items}</ul>'
+        "</div>"
+    )
+
+
+def _chosen_poster(movie: Movie) -> tuple[str, str] | None:
+    """Vertical Letterboxd poster when we have one, otherwise the wide Nonstop image."""
+    vertical = letterboxd_poster_url(movie.letterboxd_poster_url) or letterboxd_poster_url(
+        movie.poster_url
+    )
+    if vertical:
+        return vertical, "vertical"
     if movie.poster_url:
-        poster = (
-            f'<img class="poster" src="{html.escape(movie.poster_url, quote=True)}" '
-            f'alt="{html.escape(film_title(movie), quote=True)}">'
+        return movie.poster_url, "wide"
+    return None
+
+
+def _detail_hero_html(backdrop: str | None, slug: str | None) -> str:
+    """Wide Letterboxd header. A slug with no saved image is filled in when the row opens."""
+    url = letterboxd_backdrop_url(backdrop)
+    known = url is not None
+    if url is None and slug:
+        known, url = backdrop_lookup(slug)
+    safe_slug = ""
+    if slug and len(slug) <= 160 and all(character.isalnum() or character == "-" for character in slug):
+        safe_slug = html.escape(slug, quote=True)
+    if url:
+        src = html.escape(url, quote=True)
+        slug_attr = f' data-backdrop-slug="{safe_slug}"' if safe_slug else ""
+        return (
+            f'<div class="detail-hero"{slug_attr}>'
+            f'<img class="detail-backdrop" src="{src}" alt="">'
+            f"</div>"
         )
+    if not safe_slug or known:
+        return ""
+    return f'<div class="detail-hero" data-backdrop-slug="{safe_slug}" hidden></div>'
+
+
+def _poster_img(movie: Movie, *, row: bool) -> str:
+    chosen = _chosen_poster(movie)
+    if chosen is None:
+        return ""
+    url, kind = chosen
+    src = html.escape(url, quote=True)
+    if row and kind == "wide":
+        return f'<img class="row-poster row-poster-wide" src="{src}" alt="">'
+    if row:
+        return (
+            f'<img class="row-poster" src="{src}" alt="" width="32" height="48">'
+        )
+    alt = html.escape(film_title(movie), quote=True)
+    css = "poster poster-wide" if kind == "wide" else "poster"
+    return f'<img class="{css}" src="{src}" alt="{alt}">'
+
+
+def _detail_panel_html(
+    movie: Movie,
+    detail_id: str,
+    known: frozenset[str],
+    *,
+    because_in_detail: bool = False,
+) -> str:
+    poster = _poster_img(movie, row=False)
+    slug = letterboxd_slug_from_url(movie.letterboxd_url) if movie.letterboxd_url else None
+    hero = _detail_hero_html(movie.letterboxd_backdrop_url, slug)
     if movie.synopsis:
         synopsis = f'<p class="synopsis">{html.escape(movie.synopsis)}</p>'
     elif movie.details_known:
@@ -346,18 +543,57 @@ def _detail_panel_html(movie: Movie, detail_id: str, known: frozenset[str]) -> s
         synopsis = ""
     if movie.letterboxd_url:
         label = html.escape(film_title(movie))
-        letterboxd = (
-            f'<p class="detail-links">{_external_link(movie.letterboxd_url, label, "link-lb")}</p>'
-        )
-        friends = _friend_ratings_html(letterboxd_slug_from_url(movie.letterboxd_url))
+        letterboxd = _external_link(movie.letterboxd_url, label, "link-lb")
+        friends = _friend_ratings_html(slug)
     else:
-        letterboxd = ""
+        letterboxd = '<span class="muted">No Letterboxd page matched this title.</span>'
         friends = ""
+    # The pencil only saves a match for a Nonstop title. Recommendation films
+    # are already Letterboxd pages, so the control cannot do anything there.
+    if _on_nonstop(movie):
+        if movie.letterboxd_url:
+            match_label = "Wrong Letterboxd page"
+            match_kind = "fix"
+        else:
+            match_label = "Find on Letterboxd"
+            match_kind = "find"
+        query = html.escape(film_title(movie), quote=True)
+        match_url = html.escape(movie.nonstop_url, quote=True)
+        match_label_attr = html.escape(match_label, quote=True)
+        match_repair = (
+            f'<section class="match-repair" data-match-url="{match_url}">'
+            f'<p class="detail-links">'
+            f"{letterboxd}"
+            f'<button type="button" class="match-toggle match-toggle-{match_kind}" '
+            f'aria-expanded="false" title="{match_label_attr}" '
+            f'aria-label="{match_label_attr}">'
+            f'<span class="match-toggle-icon" aria-hidden="true"></span>'
+            f"</button>"
+            f"</p>"
+            f'<form class="match-form" hidden>'
+            f'<label class="match-label">Search Letterboxd'
+            f'<input type="search" class="match-query" value="{query}" maxlength="120" '
+            f'autocomplete="off" spellcheck="false">'
+            f"</label>"
+            f'<button type="submit" class="match-search">Search</button>'
+            f'<p class="match-status muted" role="status" hidden></p>'
+            f'<ul class="match-results" hidden></ul>'
+            f"</form>"
+            f"</section>"
+        )
+    else:
+        match_repair = f'<p class="detail-links">{letterboxd}</p>'
+    why = _why_recommend_html(movie) if because_in_detail else ""
     return (
         f'<div class="detail panel panel-inset" id="{html.escape(detail_id, quote=True)}">'
+        f"{hero}"
+        f'<div class="detail-main">'
         f"{poster}"
-        f'<div class="detail-body">{synopsis}{letterboxd}{friends}{_schedule_html(movie, known)}</div>'
-        f"</div>"
+        f'<div class="detail-body">'
+        f'<div class="detail-about">{_detail_facts_html(movie)}{_detail_genres_html(movie)}'
+        f"{synopsis}{why}{match_repair}</div>"
+        f'<div class="detail-columns">{friends}{_schedule_html(movie, known)}</div>'
+        f"</div></div></div>"
     )
 
 
@@ -369,25 +605,30 @@ def _because_html(movie: Movie, css_class: str = "because") -> str:
     )
 
 
-def _leaving_soon(movie: Movie) -> bool:
-    today = date.today()
-    last: date | None = None
-    for screening in movie.screenings:
-        try:
-            day = date.fromisoformat(screening.weekday)
-        except ValueError:
-            continue
-        if last is None or day > last:
-            last = day
-    return last is not None and today <= last <= today + timedelta(days=7)
+def _last_chance_chip_html(movie: Movie, known: frozenset[str]) -> str:
+    if not is_last_chance(movie, known):
+        return ""
+    last = last_followable_day(movie, known)
+    title = ""
+    if last is not None:
+        label = format_screening_date(last.isoformat())
+        title = f' title="Last followable screening {html.escape(label, quote=True)}"'
+    return f'<span class="chip chip-soon"{title}>Leaving soon</span> '
 
 
-def _movie_search_blob(movie: Movie) -> str:
+def _movie_search_blob(movie: Movie, known: frozenset[str] | None = None) -> str:
     versions = " ".join(movie.versions)
     because = movie.because or ""
+    extras = []
+    if movie.new_in_program:
+        extras.append("new")
+    if known is not None and is_last_chance(movie, known):
+        extras.append("leaving soon")
+    extra = f" {' '.join(extras)}" if extras else ""
+    directors = ", ".join(movie.directors) if movie.directors else ""
     return html.escape(
-        f"{film_title(movie)} {movie.title} {_format_directors(movie)} {_format_genres(movie)} "
-        f"{movie.year or ''} {format_language(movie)} {versions} {because}".lower()
+        f"{film_title(movie)} {movie.title} {directors} {_format_genres(movie)} "
+        f"{movie.year or ''} {format_language(movie)} {versions} {because}{extra}".lower()
     )
 
 
@@ -404,6 +645,7 @@ def _calendar_groups(
     see_first: list[Movie] | None = None,
     like_you: list[Movie] | None = None,
     step_outside: list[Movie] | None = None,
+    just_arrived: list[Movie] | None = None,
 ) -> list[tuple[str, str, list[tuple[str, Movie]]]]:
     """Same section order and row ids as the list tables."""
     rated, unrated, unfound = split_program_groups(program)
@@ -416,6 +658,7 @@ def _calendar_groups(
     else:
         taste_labeled = (("recommendations", "Recommended", recommendations),)
     labeled = (
+        ("just-arrived", "Just arrived", just_arrived or []),
         *taste_labeled,
         ("watchlist", "Watchlist", watchlist),
         ("watched", "Watched", watched),
@@ -546,12 +789,12 @@ def _day_film_html(
         f'data-primary-language="{primary}" '
         f'data-rating="{rating_attr}" data-title="{title_attr}" '
         f'data-lang-hide="{lang_hide}"{hidden} '
-        f'data-search="{_movie_search_blob(movie)}">'
+        f'data-search="{_movie_search_blob(movie, known)}">'
         f'<div class="day-film-line">'
         f"{_rating_badge(movie.rating, rating_text)}"
         f"{_plan_add_button(movie)}"
         f'<button type="button" class="day-film-title" aria-expanded="false">{title}</button>'
-        f"{_new_program_chip_html(movie)}"
+        f"{_new_program_chip_html(movie)}{_last_chance_chip_html(movie, known)}"
         f'<span class="chip section-chip chip-{html.escape(section_id, quote=True)}">'
         f"{html.escape(label)}</span>"
         f"</div>"
@@ -593,11 +836,15 @@ def _calendar_day_button(
     preview_attr = html.escape(preview, quote=True)
     preview_html = html.escape(preview)
     count = len(follow)
+    last_chance = any(
+        last_followable_day(entry[3], known) == day for entry in follow
+    )
+    last_class = " is-last-chance" if last_chance else ""
     filtered = "" if follow else " is-filtered-out"
     disabled = "" if follow else " disabled"
     iso = day.isoformat()
     return (
-        f'<button type="button" class="month-day has{today_class}{filtered}"{disabled} '
+        f'<button type="button" class="month-day has{today_class}{filtered}{last_class}"{disabled} '
         f'data-day="{iso}" data-count="{count}" data-title="{preview_attr}" '
         f'aria-expanded="false" aria-controls="day-{iso}">'
         f'<span class="month-day-num">{day.day}</span>'
@@ -696,6 +943,7 @@ def _program_calendar_html(
     see_first: list[Movie] | None = None,
     like_you: list[Movie] | None = None,
     step_outside: list[Movie] | None = None,
+    just_arrived: list[Movie] | None = None,
 ) -> str:
     today = today or date.today()
     by_day = _calendar_by_day(
@@ -707,6 +955,7 @@ def _program_calendar_html(
             see_first,
             like_you,
             step_outside,
+            just_arrived,
         )
     )
     current = (today.year, today.month)
@@ -744,13 +993,21 @@ def _format_html_movie_row(
     unavailable: bool = False,
     show_because: bool = True,
     show_follow_badge: bool = True,
+    because_in_detail: bool = False,
 ) -> str:
     rating_text = f"{m.rating:.2f}" if m.rating is not None else "—"
     title = html.escape(film_title(m))
     if m.note:
         note_esc = html.escape(m.note)
         title += f' <span class="note" title="{note_esc}">⚠</span>'
-    directors = html.escape(_format_directors(m))
+    full_directors = _format_directors(m)
+    shown_directors = _format_directors(m, limit=_DISPLAY_DIRECTOR_LIMIT)
+    directors = html.escape(shown_directors)
+    director_title = (
+        f' title="{html.escape(full_directors, quote=True)}"'
+        if shown_directors != full_directors and full_directors != "—"
+        else ""
+    )
     genres = _format_genres(m)
     genre_html = " ".join(
         f'<span class="chip">{html.escape(g.strip())}</span>'
@@ -775,11 +1032,7 @@ def _format_html_movie_row(
         f'{" hidden" if not show_badge else ""}>no followable version</span>'
     )
     because_html = _because_html(m) if show_because else ""
-    soon_html = (
-        '<span class="chip chip-soon" title="Last screening is within 7 days">Leaving soon</span> '
-        if (show_predicted or m.predicted_rating is not None) and _leaving_soon(m)
-        else ""
-    )
+    soon_html = _last_chance_chip_html(m, known)
     new_html = _new_program_chip_html(m)
     classes = " ".join(
         part for part in (row_class, "row-no-follow" if show_badge else "") if part
@@ -791,7 +1044,7 @@ def _format_html_movie_row(
     versions = html.escape(" ".join(m.versions), quote=True)
     detail_classes = " ".join(part for part in ("detail-row", row_class) if part)
     language = html.escape(format_language(m))
-    search_blob = _movie_search_blob(m)
+    search_blob = _movie_search_blob(m, known)
     detail_id = f"{row_id}-detail" if row_id else "detail"
     movie_id_attr = (
         f' data-movie-id="{html.escape(row_id, quote=True)}"' if row_id else ""
@@ -827,12 +1080,20 @@ def _format_html_movie_row(
         predicted_value = f"{m.predicted_rating:.4f}" if m.predicted_rating is not None else ""
         sort_predicted = f' data-sort-predicted="{predicted_value}"'
         columns += 1
+    columns += 1
     sort_rating = f"{m.rating:.4f}" if m.rating is not None else ""
     sort_year = str(m.year) if m.year is not None else ""
     sort_title = html.escape(film_title(m), quote=True)
     sort_director = html.escape(", ".join(m.directors), quote=True)
     sort_genres = html.escape(", ".join(m.genres), quote=True)
     sort_language = html.escape(m.primary_language or "", quote=True)
+    chosen = _chosen_poster(m)
+    # Unfound titles only have the wide Nonstop still. The opened detail keeps
+    # it; the folded row stays a text line.
+    wide_poster = (
+        _poster_img(m, row=True) if chosen and chosen[1] == "wide" and m.letterboxd_url else ""
+    )
+    thumb = _poster_img(m, row=True) if chosen and chosen[1] == "vertical" else ""
     return (
         f'<tr data-movie-row{extra}{row_hidden}{movie_id_attr}{plan_id_attr} '
         f'data-search="{search_blob}"'
@@ -847,18 +1108,23 @@ def _format_html_movie_row(
         f'<td class="col-rating">{_rating_badge(m.rating, rating_text)}</td>'
         f"{predicted_cell}"
         f"{user_cell}"
-        f"<td class=\"col-year\">{year}</td>"
-        f'<td class="col-title"><span class="title-line">{_plan_add_button(m)}'
+        f'<td class="col-title"><span class="title-stack">{wide_poster}'
+        f'<span class="title-line">{thumb}'
         f'<button type="button" class="expand" '
         f'aria-expanded="false" aria-controls="{html.escape(detail_id, quote=True)}">'
         f"<strong>{title}</strong> {follow_badge}{new_html}{soon_html}{because_html}</button>"
-        f'<span class="row-chevron" aria-hidden="true"></span></span></td>'
-        f"<td class=\"col-director\">{directors}</td>"
+        f"</span></span></td>"
+        f"<td class=\"col-director\"{director_title}>{directors}</td>"
         f"<td class=\"col-genres\">{genre_html}</td>"
+        f"<td class=\"col-year\">{year}</td>"
         f"<td class=\"col-language\">{language}</td>"
+        f'<td class="col-actions"><span class="row-actions">{_plan_add_button(m)}'
+        f'<span class="row-chevron" aria-hidden="true"></span></span></td>'
         f"</tr>"
         f'<tr class="{detail_classes}" data-movie-detail hidden>'
-        f'<td colspan="{columns}">{_detail_panel_html(m, detail_id, known)}</td>'
+        f'<td colspan="{columns}">'
+        f"{_detail_panel_html(m, detail_id, known, because_in_detail=because_in_detail)}"
+        f"</td>"
         f"</tr>"
     )
 
@@ -893,6 +1159,7 @@ def _html_table_section(
     show_because: bool = True,
     start_folded: bool = False,
     show_follow_badge: bool = True,
+    because_in_detail: bool = False,
 ) -> str:
     if not movies:
         return ""
@@ -908,6 +1175,7 @@ def _html_table_section(
             unavailable=unavailable,
             show_because=show_because,
             show_follow_badge=show_follow_badge,
+            because_in_detail=because_in_detail,
         )
         for index, movie in enumerate(movies)
     )
@@ -924,8 +1192,13 @@ def _html_table_section(
     folded_class = " is-folded" if start_folded else ""
     folded_attr = " data-start-folded" if start_folded else ""
     expanded = "false" if start_folded else "true"
-    you_header = _sortable_header("You", "you", "number", extra_class="col-rating") if show_user_rating else ""
-    rating_sort = None if show_predicted else "descending"
+    you_sort = "descending" if show_user_rating and not show_predicted else None
+    you_header = (
+        _sortable_header("You", "you", "number", sorted_dir=you_sort, extra_class="col-rating")
+        if show_user_rating
+        else ""
+    )
+    rating_sort = None if show_predicted or show_user_rating else "descending"
     predicted_header = (
         _sortable_header(
             "For you",
@@ -963,11 +1236,12 @@ def _html_table_section(
               {_sortable_header("Rating", "rating", "number", sorted_dir=rating_sort, extra_class="col-rating")}
               {predicted_header}
               {you_header}
-              {_sortable_header("Year", "year", "number", extra_class="col-year")}
               {_sortable_header("Film", "title", "text", extra_class="col-title")}
               {_sortable_header("Director", "director", "text", extra_class="col-director")}
               {_sortable_header("Genres", "genres", "text", extra_class="col-genres")}
+              {_sortable_header("Year", "year", "number", extra_class="col-year")}
               {_sortable_header("Language", "language", "text", extra_class="col-language")}
+              <th class="col-actions"><span class="visually-hidden">Actions</span></th>
             </tr>
           </thead>
           <tbody>
@@ -1028,11 +1302,23 @@ def format_html(
     user_label = f"@{letterboxd_user}"
     rated, unrated, unfound = split_program_groups(program)
     unavailable_movies = _language_candidates(watchlist, recommendations, watched, program)
+    just_arrived = [movie for movie in watchlist if movie.new_in_program]
 
     def section(*args: object, **kwargs: object) -> str:
         return _html_table_section(*args, **kwargs)  # type: ignore[arg-type]
 
     personal: list[str] = []
+    if just_arrived:
+        personal.append(
+            section(
+                "just-arrived",
+                "Just arrived",
+                f"On {user_label}'s watchlist and new in the program since the last run",
+                just_arrived,
+                known,
+                row_class="row-just-arrived",
+            )
+        )
     if watchlist:
         personal.append(
             section(
@@ -1123,9 +1409,14 @@ def format_html(
         )
     groups: list[str] = []
     if personal:
+        heading = (
+            f"Picked for {html.escape(user_label)}"
+            if signed_in
+            else "This week"
+        )
         groups.append(
             '<section class="section-group" id="group-personal">'
-            f'<h2 class="group-title">Picked for {html.escape(user_label)}</h2>'
+            f'<h2 class="group-title">{heading}</h2>'
             + "\n".join(personal)
             + "</section>"
         )
@@ -1145,7 +1436,14 @@ def format_html(
         )
     list_html = "\n".join(groups)
 
-    calendar_html = _program_calendar_html(watchlist, recommendations, watched, program, known)
+    calendar_html = _program_calendar_html(
+        watchlist,
+        recommendations,
+        watched,
+        program,
+        known,
+        just_arrived=just_arrived,
+    )
     catalog_json = _plan_catalog_json([*watchlist, *recommendations, *watched, *program])
     busy_json = json.dumps(
         {"intervals": busy_intervals or []},
@@ -1162,6 +1460,12 @@ def format_html(
 
     nav_links = "".join(
         (
+            _nav_link(
+                "just-arrived",
+                "Just arrived",
+                bool(just_arrived),
+                any(movie_is_watchable(movie, known) for movie in just_arrived),
+            ),
             _nav_link("watchlist", "Watchlist", bool(watchlist), bool(watchlist)),
             _nav_link(
                 "recommendations",

@@ -6,6 +6,7 @@ import json
 import sys
 import time
 import urllib.error
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +16,11 @@ from goodmoviefinder.letterboxd import (
     LetterboxdRefused,
     fetch_letterboxd_film_credit,
     fetch_letterboxd_html,
+    letterboxd_backdrop_url,
     letterboxd_film_nanogenres_url,
     letterboxd_film_page_url,
+    letterboxd_poster_url,
+    parse_letterboxd_backdrop,
     parse_letterboxd_film_features,
     parse_letterboxd_nanogenres,
     parse_letterboxd_poster,
@@ -31,6 +35,7 @@ from goodmoviefinder.program import LOVED_RATING, letterboxd_slug_from_url
 
 CACHE_VERSION = 4
 PROFILE_CACHE_MAX_AGE = 6 * 60 * 60  # seconds
+RECOMMENDATIONS_CACHE_VERSION = 1
 
 LANGUAGE_PARSER = 2
 # Bump to re-check cached Letterboxd pages against Nonstop director, runtime, and cast.
@@ -124,6 +129,170 @@ def save_watchlist_films(
     profile["watchlist_films"] = watchlist_films
 
 
+def _opt_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _opt_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _taste_movie_payload(movie: Movie) -> dict[str, Any]:
+    return {
+        "title": movie.title,
+        "nonstop_url": movie.nonstop_url,
+        "letterboxd_url": movie.letterboxd_url,
+        "letterboxd_title": movie.letterboxd_title,
+        "rating": movie.rating,
+        "year": movie.year,
+        "directors": list(movie.directors),
+        "genres": list(movie.genres),
+        "primary_language": movie.primary_language,
+        "primary_language_known": movie.primary_language_known,
+        "poster_url": movie.poster_url,
+        "synopsis": movie.synopsis,
+        "details_known": movie.details_known,
+        "because": movie.because,
+        "predicted_rating": movie.predicted_rating,
+        "lower_estimate": movie.lower_estimate,
+        "member_average": movie.member_average,
+        "member_support": movie.member_support,
+    }
+
+
+def _taste_movie_from_payload(raw: object) -> Movie | None:
+    if not isinstance(raw, dict):
+        return None
+    title = raw.get("title")
+    url = raw.get("nonstop_url")
+    if not isinstance(title, str) or not title.strip():
+        return None
+    if not isinstance(url, str) or not url.strip():
+        return None
+    letterboxd_url = raw.get("letterboxd_url")
+    letterboxd_title = raw.get("letterboxd_title")
+    poster = raw.get("poster_url")
+    synopsis = raw.get("synopsis")
+    because = raw.get("because")
+    language = raw.get("primary_language")
+    support = raw.get("member_support")
+    return Movie(
+        title=title.strip(),
+        nonstop_url=url.strip(),
+        letterboxd_url=letterboxd_url.strip()
+        if isinstance(letterboxd_url, str) and letterboxd_url.strip()
+        else None,
+        letterboxd_title=letterboxd_title.strip()
+        if isinstance(letterboxd_title, str) and letterboxd_title.strip()
+        else None,
+        rating=_opt_float(raw.get("rating")),
+        year=_opt_int(raw.get("year")),
+        directors=_string_list(raw.get("directors")),
+        genres=_string_list(raw.get("genres")),
+        primary_language=language.strip() if isinstance(language, str) and language.strip() else None,
+        primary_language_known=bool(raw.get("primary_language_known")),
+        poster_url=poster.strip() if isinstance(poster, str) and poster.strip() else None,
+        synopsis=synopsis if isinstance(synopsis, str) else None,
+        details_known=bool(raw.get("details_known")),
+        because=because.strip() if isinstance(because, str) and because.strip() else None,
+        predicted_rating=_opt_float(raw.get("predicted_rating")),
+        lower_estimate=_opt_float(raw.get("lower_estimate")),
+        member_average=_opt_float(raw.get("member_average")),
+        member_support=support if isinstance(support, int) and support > 0 else 0,
+    )
+
+
+def _taste_movies(raw: object) -> list[Movie] | None:
+    if not isinstance(raw, list):
+        return None
+    movies: list[Movie] = []
+    for item in raw:
+        movie = _taste_movie_from_payload(item)
+        if movie is not None:
+            movies.append(movie)
+    return movies
+
+
+def load_recommendations_cache(
+    cache: dict[str, Any],
+    user: str,
+) -> tuple[Any, int] | None:
+    """Saved For you lists for this Letterboxd user, if a complete cache exists."""
+    from goodmoviefinder.taste import TasteView
+
+    record = cache.get("recommendations", {}).get(user)
+    if not isinstance(record, dict):
+        return None
+    if record.get("version") != RECOMMENDATIONS_CACHE_VERSION:
+        return None
+    fetched_at = record.get("fetched_at")
+    if not isinstance(fetched_at, (int, float)):
+        return None
+    paragraph = record.get("paragraph")
+    note = record.get("note")
+    if not isinstance(paragraph, str) or not isinstance(note, str):
+        return None
+    see_first = _taste_movies(record.get("see_first"))
+    like_you = _taste_movies(record.get("like_you"))
+    step_outside = _taste_movies(record.get("step_outside"))
+    if see_first is None or like_you is None or step_outside is None:
+        return None
+    view = TasteView(
+        paragraph=paragraph,
+        note=note,
+        see_first=see_first,
+        like_you=like_you,
+        step_outside=step_outside,
+    )
+    profile = load_profile_cache(cache, user, allow_stale=True)
+    if profile is not None:
+        from goodmoviefinder.taste import refresh_view_because
+
+        watched_ratings, _watchlist, _films = profile
+        refresh_view_because(view, cache, watched_ratings)
+    return (
+        view,
+        int(fetched_at),
+    )
+
+
+def save_recommendations_cache(
+    cache: dict[str, Any],
+    cache_path: Path,
+    user: str,
+    view: Any,
+    *,
+    fetched_at: int | None = None,
+) -> int:
+    saved_at = int(time.time() if fetched_at is None else fetched_at)
+    cache.setdefault("recommendations", {})[user] = {
+        "version": RECOMMENDATIONS_CACHE_VERSION,
+        "fetched_at": saved_at,
+        "paragraph": view.paragraph,
+        "note": view.note,
+        "see_first": [_taste_movie_payload(movie) for movie in view.see_first],
+        "like_you": [_taste_movie_payload(movie) for movie in view.like_you],
+        "step_outside": [_taste_movie_payload(movie) for movie in view.step_outside],
+    }
+    save_cache(cache_path, cache)
+    return saved_at
+
+
+def recommendations_updated_label(fetched_at: int | None) -> str:
+    if not fetched_at:
+        return ""
+    when = datetime.fromtimestamp(int(fetched_at)).astimezone().strftime("%d %b %Y, %H:%M")
+    return f"Last built {when}"
+
+
 def load_cache(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {"version": CACHE_VERSION, "entries": {}}
@@ -181,7 +350,11 @@ def cache_get(cache: dict[str, Any], nonstop_url: str) -> Movie | None:
         duration_minutes=duration_minutes,
         duration_known=duration_known,
         note=entry.get("note"),
-        match_current=entry.get("matcher") == MATCHER_VERSION,
+        letterboxd_poster_url=letterboxd_poster_url(entry.get("letterboxd_poster_url")),
+        letterboxd_backdrop_url=letterboxd_backdrop_url(entry.get("letterboxd_backdrop_url")),
+        manual_match=bool(entry.get("manual_match")),
+        match_current=entry.get("matcher") == MATCHER_VERSION
+        or bool(entry.get("manual_match")),
     )
 
 
@@ -197,6 +370,14 @@ def cache_put(cache: dict[str, Any], movie: Movie) -> None:
         "note": movie.note,
         "matcher": MATCHER_VERSION,
     }
+    poster = letterboxd_poster_url(movie.letterboxd_poster_url)
+    if poster:
+        entry["letterboxd_poster_url"] = poster
+    backdrop = letterboxd_backdrop_url(movie.letterboxd_backdrop_url)
+    if backdrop:
+        entry["letterboxd_backdrop_url"] = backdrop
+    if movie.manual_match:
+        entry["manual_match"] = True
     if movie.titles_known:
         entry["original_title"] = movie.original_title
         entry["original_language"] = movie.original_language
@@ -236,6 +417,15 @@ def backfill_letterboxd_details(movie: Movie, delay: float) -> bool:
             file=sys.stderr,
         )
         return False
+    poster = parse_letterboxd_poster(body)
+    if poster:
+        movie.letterboxd_poster_url = poster
+    backdrop = parse_letterboxd_backdrop(body)
+    if backdrop:
+        movie.letterboxd_backdrop_url = backdrop
+        slug = letterboxd_slug_from_url(movie.letterboxd_url)
+        if slug:
+            remember_backdrop(slug, backdrop)
     if not movie.primary_language_known:
         movie.primary_language = parse_primary_language(body)
         movie.primary_language_known = True
@@ -491,9 +681,102 @@ def film_feature_get(cache: dict[str, Any], slug: str) -> dict[str, Any] | None:
         "themes_known": bool(raw.get("themes_known")),
         "synopsis": raw.get("synopsis") if isinstance(raw.get("synopsis"), str) else "",
         "poster": raw.get("poster") if isinstance(raw.get("poster"), str) else None,
+        "backdrop": letterboxd_backdrop_url(raw.get("backdrop")),
         "card_known": bool(raw.get("card_known")),
         "fetched": True,
     }
+
+
+_BACKDROP_MAP: dict[str, str | None] | None = None
+_BACKDROP_MTIME: float | None = None
+
+
+def backdrop_path(cache_path: Path | None = None) -> Path:
+    from goodmoviefinder.config import DEFAULT_CACHE
+
+    folder = cache_path.parent if cache_path is not None else DEFAULT_CACHE.parent
+    return folder / "backdrops.json"
+
+
+def load_backdrops(cache_path: Path | None = None) -> dict[str, str | None]:
+    """Slug to wide Letterboxd header image. None means the film page has no backdrop."""
+    global _BACKDROP_MAP, _BACKDROP_MTIME
+    path = backdrop_path(cache_path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        _BACKDROP_MAP = {}
+        _BACKDROP_MTIME = None
+        return _BACKDROP_MAP
+    if _BACKDROP_MAP is not None and _BACKDROP_MTIME == mtime:
+        return _BACKDROP_MAP
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    mapping: dict[str, str | None] = {}
+    if isinstance(raw, dict):
+        for slug, url in raw.items():
+            if not isinstance(slug, str) or not slug:
+                continue
+            if url is None:
+                mapping[slug] = None
+                continue
+            cleaned = letterboxd_backdrop_url(url)
+            if cleaned:
+                mapping[slug] = cleaned
+    _BACKDROP_MAP = mapping
+    _BACKDROP_MTIME = mtime
+    return mapping
+
+
+def backdrop_for_slug(slug: str | None, cache_path: Path | None = None) -> str | None:
+    known, url = backdrop_lookup(slug, cache_path)
+    return url if known else None
+
+
+def backdrop_lookup(
+    slug: str | None,
+    cache_path: Path | None = None,
+) -> tuple[bool, str | None]:
+    """(already checked, image url). A checked film can still have no header image."""
+    if not slug:
+        return False, None
+    mapping = load_backdrops(cache_path)
+    if slug not in mapping:
+        return False, None
+    url = mapping[slug]
+    return True, url if isinstance(url, str) else None
+
+
+def remember_backdrop(
+    slug: str,
+    url: str | None,
+    cache_path: Path | None = None,
+) -> None:
+    """Remember whether a film has a wide Letterboxd header, including when it does not."""
+    if not slug:
+        return
+    mapping = dict(load_backdrops(cache_path))
+    mapping[slug] = letterboxd_backdrop_url(url)
+    path = backdrop_path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    global _BACKDROP_MAP, _BACKDROP_MTIME
+    _BACKDROP_MAP = mapping
+    try:
+        _BACKDROP_MTIME = path.stat().st_mtime
+    except OSError:
+        _BACKDROP_MTIME = None
+
+
+def _kept_backdrop(previous: object, feature: dict[str, Any]) -> str | None:
+    backdrop = letterboxd_backdrop_url(feature.get("backdrop"))
+    if backdrop:
+        return backdrop
+    if isinstance(previous, dict):
+        return letterboxd_backdrop_url(previous.get("backdrop"))
+    return None
 
 
 def _film_feature_put(cache: dict[str, Any], slug: str, feature: dict[str, Any]) -> None:
@@ -528,9 +811,13 @@ def _film_feature_put(cache: dict[str, Any], slug: str, feature: dict[str, Any])
         "themes_known": bool(feature.get("themes_known")),
         "synopsis": feature.get("synopsis") or "",
         "poster": feature.get("poster"),
+        "backdrop": _kept_backdrop(previous, feature),
         "card_known": bool(feature.get("card_known")),
         "fetched": True,
     }
+    stored_backdrop = letterboxd_backdrop_url(cache["film_features"][slug].get("backdrop"))
+    if stored_backdrop and backdrop_for_slug(slug) != stored_backdrop:
+        remember_backdrop(slug, stored_backdrop)
 
 
 def ensure_film_features(
@@ -698,6 +985,10 @@ def ensure_film_cards(
         refused = 0
         raw["synopsis"] = parse_letterboxd_synopsis(body) or ""
         raw["poster"] = parse_letterboxd_poster(body)
+        backdrop = parse_letterboxd_backdrop(body)
+        if backdrop:
+            raw["backdrop"] = backdrop
+            remember_backdrop(slug, backdrop)
         raw["card_known"] = True
         label = raw.get("title") or slug
         print(f"  [{index}/{len(missing)}] {label}", file=sys.stderr)

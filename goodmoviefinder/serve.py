@@ -199,12 +199,53 @@ def start_server(state: Any, port: int, *, open_browser: bool = True) -> Threadi
             if path == "/api/recommendations":
                 self._send(200, json.dumps(page.recommendations_status()), "application/json")
                 return
+            if path == "/api/letterboxd-backdrop":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                slug = (query.get("slug") or [""])[0]
+                try:
+                    payload = page.letterboxd_backdrop(slug)
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] letterboxd backdrop: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": "Letterboxd could not be reached."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps(payload), "application/json")
+                return
+            if path == "/api/letterboxd-search":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                q = (query.get("q") or [""])[0]
+                try:
+                    payload = page.search_letterboxd(q)
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] letterboxd search: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": "Letterboxd could not be reached."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps(payload), "application/json")
+                return
             self._send(404, "Not found", "text/plain; charset=utf-8")
 
         def do_POST(self) -> None:
             path = urllib.parse.urlparse(self.path).path
             payload = self._read_json()
             if payload is None:
+                return
+            if path == "/api/progress/dismiss":
+                if hub is not None:
+                    hub.progress.resume()
+                self._send(200, json.dumps({"ok": True}), "application/json")
                 return
             page = self._page()
             if page is None:
@@ -251,6 +292,22 @@ def start_server(state: Any, port: int, *, open_browser: bool = True) -> Threadi
                     )
                     return
                 self._send(200, json.dumps({"ok": True, **payload}), "application/json")
+                return
+            if path == "/api/match":
+                try:
+                    saved = page.apply_match(payload)
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] match repair: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": str(exc) or "Letterboxd could not be reached."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps({"ok": True, **saved}), "application/json")
                 return
             self._send(404, json.dumps({"error": "Not found"}), "application/json")
 

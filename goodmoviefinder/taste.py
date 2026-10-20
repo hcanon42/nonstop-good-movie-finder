@@ -235,6 +235,209 @@ def _join(phrases: list[str]) -> str:
     return f"{', '.join(phrases[:-1])}, and {phrases[-1]}"
 
 
+def _shared_labels(left: object, right: object, *, limit: int = 2) -> list[str]:
+    theirs = {
+        str(name).strip().casefold()
+        for name in (right or [])
+        if isinstance(name, str) and name.strip()
+    }
+    shared: list[str] = []
+    seen: set[str] = set()
+    for name in left or []:
+        if not isinstance(name, str) or not name.strip():
+            continue
+        text = name.strip()
+        key = text.casefold()
+        if key not in theirs or key in seen:
+            continue
+        seen.add(key)
+        shared.append(text)
+        if len(shared) >= limit:
+            break
+    return shared
+
+
+def _shared_people(left: object, right: object, *, limit: int = 2) -> list[str]:
+    right_keys = director_person_keys(
+        [str(name) for name in (right or []) if isinstance(name, str) and name.strip()]
+    )
+    shared: list[str] = []
+    seen: set[str] = set()
+    for name in left or []:
+        if not isinstance(name, str) or not name.strip():
+            continue
+        keys = director_person_keys([name])
+        if not (keys & right_keys):
+            continue
+        text = name.strip()
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        shared.append(text)
+        if len(shared) >= limit:
+            break
+    return shared
+
+
+def _theme_list(feature: dict) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for name in [*(feature.get("mini_themes") or []), *(feature.get("themes") or [])]:
+        if not isinstance(name, str) or not name.strip():
+            continue
+        text = name.strip()
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(text)
+    return names
+
+
+def _loved_theme_counts(rows: list[tuple[str, float, dict]]) -> tuple[dict[str, int], int]:
+    counts: dict[str, int] = {}
+    for _slug, _rating, feature in rows:
+        for name in _theme_list(feature):
+            key = name.casefold()
+            counts[key] = counts.get(key, 0) + 1
+    return counts, len(rows)
+
+
+def _shared_themes(
+    left: dict,
+    right: dict,
+    counts: dict[str, int],
+    total: int,
+    *,
+    limit: int = 2,
+) -> list[str]:
+    shared = _shared_labels(_theme_list(left), _theme_list(right), limit=12)
+    if not shared:
+        return []
+
+    def rarity(name: str) -> tuple[int, int]:
+        return (counts.get(name.casefold(), 0), len(name))
+
+    uncommon = [
+        name
+        for name in shared
+        if not total or counts.get(name.casefold(), 0) / total <= 0.22
+    ]
+    uncommon.sort(key=rarity)
+    if uncommon:
+        return uncommon[:limit]
+    shared.sort(key=rarity)
+    return shared[:1]
+
+
+def _close_why(
+    left: dict,
+    right: dict,
+    counts: dict[str, int],
+    total: int,
+) -> str:
+    """What this film shares with a loved film: director, cast, themes, or genre."""
+    directors = _shared_people(left.get("directors"), right.get("directors"), limit=2)
+    actors = _shared_people(left.get("actors"), right.get("actors"), limit=2)
+    themes = _shared_themes(left, right, counts, total)
+    genres = _shared_labels(left.get("genres"), right.get("genres"), limit=2)
+    countries = _shared_labels(left.get("countries"), right.get("countries"), limit=1)
+    parts: list[str] = []
+    if directors:
+        parts.append(f"same director ({_join(directors)})")
+    if actors:
+        parts.append(
+            f"shares cast ({_join(actors)})" if len(actors) > 1 else f"shares {actors[0]}"
+        )
+    if themes:
+        parts.append(f"similar themes ({_join(themes)})")
+    elif genres:
+        parts.append(f"same genres ({_join(genres)})")
+    elif countries:
+        parts.append(f"also from {countries[0]}")
+    return _join(parts)
+
+
+def nearest_loved_titles(
+    slug: str,
+    feature: dict,
+    rows: list[tuple[str, float, dict]],
+    *,
+    limit: int = 2,
+) -> list[str]:
+    """Loved films this one overlaps, with a short reason for the overlap."""
+    counts, total = _loved_theme_counts(rows)
+    scored: list[tuple[float, float, str]] = []
+    for other_slug, rating, other in rows:
+        if other_slug == slug or rating < LOVED_RATING:
+            continue
+        overlap = _theme_overlap(feature, other)
+        directors = _shared_people(feature.get("directors"), other.get("directors"), limit=1)
+        score = overlap + (1.0 if directors else 0.0)
+        if score <= 0:
+            continue
+        title = other.get("title") or other_slug
+        year = other.get("year")
+        film = f"{title} ({year})" if isinstance(year, int) else str(title)
+        why = _close_why(feature, other, counts, total)
+        rated = f"{film}, which you rated {rating:.1f}"
+        phrase = f"{rated} — {why}" if why else rated
+        scored.append((score, rating, phrase))
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2].casefold()))
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for _score, _rating, phrase in scored:
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        phrases.append(phrase)
+        if len(phrases) >= limit:
+            break
+    return phrases
+
+
+_YEAR_REASON = re.compile(r"^\d{4}, older than most films you rate highly\.?$")
+_DROP_REASON = re.compile(
+    r"^Predicted \d+(?:\.\d+)?(?: \(lower \d+(?:\.\d+)?\))?\.$"
+    r"|^From your own ratings only\.$"
+    r"|^Close to "
+    r"|^Nearest of "
+)
+
+
+def refresh_view_because(view: TasteView, cache: dict, watched_ratings: dict[str, float | None]) -> None:
+    """Rewrite cached reasons: drop scores, and name why a film is close to one you loved."""
+    from goodmoviefinder.cache import film_feature_get
+    from goodmoviefinder.html import because_reasons
+
+    rows: list[tuple[str, float, dict]] = []
+    for slug, rating in watched_ratings.items():
+        if not isinstance(rating, (int, float)) or rating < LOVED_RATING:
+            continue
+        feature = film_feature_get(cache, slug)
+        if feature:
+            rows.append((slug, float(rating), feature))
+    for movie in (*view.see_first, *view.like_you, *view.step_outside):
+        slug = letterboxd_slug_from_url(movie.letterboxd_url)
+        feature = film_feature_get(cache, slug) if slug else None
+        kept: list[str] = []
+        year_reason = ""
+        for reason in because_reasons(movie.because or ""):
+            if _DROP_REASON.match(reason):
+                continue
+            if _YEAR_REASON.match(reason):
+                year_reason = reason
+                continue
+            kept.append(reason)
+        close: list[str] = []
+        if feature and slug and not any(item.startswith("Same director as") for item in kept):
+            close = [f"Close to {phrase}." for phrase in nearest_loved_titles(slug, feature, rows)]
+        if year_reason:
+            close.append(year_reason)
+        movie.because = "\n".join([*kept, *close])
+
+
 def _label_stats(
     rows: list[tuple[str, float]],
     features: dict[str, dict],
@@ -500,33 +703,7 @@ class _Space:
         return values
 
     def nearest_titles(self, slug: str, feature: dict, limit: int = 2) -> list[str]:
-        my_directors = set(director_person_keys([str(name) for name in feature.get("directors") or []]))
-        scored: list[tuple[float, float, str]] = []
-        for other_slug, rating, other in self.rows:
-            if other_slug == slug or rating < LOVED_RATING:
-                continue
-            overlap = _theme_overlap(feature, other)
-            their_directors = set(
-                director_person_keys([str(name) for name in other.get("directors") or []])
-            )
-            score = overlap + (1.0 if my_directors & their_directors else 0.0)
-            if score <= 0:
-                continue
-            title = other.get("title") or other_slug
-            year = other.get("year")
-            film = f"{title} ({year})" if isinstance(year, int) else str(title)
-            scored.append((score, rating, f"{film}, which you rated {rating:.1f}"))
-        scored.sort(key=lambda item: (-item[0], -item[1], item[2].casefold()))
-        phrases: list[str] = []
-        seen: set[str] = set()
-        for _score, _rating, phrase in scored:
-            if phrase in seen:
-                continue
-            seen.add(phrase)
-            phrases.append(phrase)
-            if len(phrases) >= limit:
-                break
-        return phrases
+        return nearest_loved_titles(slug, feature, self.rows, limit=limit)
 
 
 def _fit_models(space: _Space):
@@ -995,31 +1172,25 @@ def recommend(
                 f"Rated {float(community):.1f} overall. "
                 f"Members close to you average {member_predicted:.1f}."
             )
-        if lower is not None:
-            bits.append(f"Predicted {predicted:.1f} (lower {lower:.1f}).")
-        else:
-            bits.append(f"Predicted {predicted:.1f}.")
         if not content_only and member_predicted is not None and support >= MIN_NEIGHBORS:
             bits.append(
                 f"{support} members with taste close to yours average {member_predicted:.1f}."
             )
-        if content_only:
-            bits.append("From your own ratings only.")
         if loved_phrase is not None:
             bits.append(f"Same director as {loved_phrase[1]}.")
         elif space is not None:
             nearest = space.nearest_titles(slug, feature)
             if nearest:
-                bits.append(f"Nearest of your own ratings: {_join(nearest)}.")
+                bits.extend(f"Close to {phrase}." for phrase in nearest)
         year = feature.get("year")
         if isinstance(year, int) and median_year is not None and year < median_year:
             bits.append(f"{year}, older than most films you rate highly.")
         if outside_ok and hit is not None:
             bits.insert(0, f"{hit.name} is a nanogenre you have barely logged. It showed up on {hit.example}.")
             outside_label[id(movie)] = hit.name
-        movie.because = " ".join(bits)
         if slug in watchlist_slugs:
-            movie.because = f"On your watchlist. {movie.because}"
+            bits.insert(0, "On your watchlist.")
+        movie.because = "\n".join(bits)
         if outside_ok:
             step_outside.append(movie)
         elif passed:
@@ -1392,6 +1563,9 @@ def movie_from_letterboxd(slug: str, feature: dict) -> Movie:
         primary_language_known=bool(language),
         synopsis=feature.get("synopsis") if isinstance(feature.get("synopsis"), str) else None,
         poster_url=feature.get("poster") if isinstance(feature.get("poster"), str) else None,
+        letterboxd_backdrop_url=feature.get("backdrop")
+        if isinstance(feature.get("backdrop"), str)
+        else None,
         details_known=bool(feature.get("card_known")),
     )
 
@@ -1490,7 +1664,10 @@ def build_for_you(
             continue
         synopsis = feature.get("synopsis")
         poster = feature.get("poster")
+        backdrop = feature.get("backdrop")
         movie.synopsis = synopsis if isinstance(synopsis, str) and synopsis else None
         movie.poster_url = poster if isinstance(poster, str) else None
+        if isinstance(backdrop, str) and backdrop:
+            movie.letterboxd_backdrop_url = backdrop
         movie.details_known = bool(feature.get("card_known"))
     return view

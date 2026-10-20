@@ -215,6 +215,7 @@
       slot.replaceChildren(clone);
       slot.hidden = false;
       button.setAttribute("aria-expanded", "true");
+      loadBackdrop(clone);
       loadFriends(slot);
     }
 
@@ -316,40 +317,261 @@
       });
     });
 
+    const posterMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const POSTER_FLIGHT_MS = 320;
+
+    const ROW_POSTER_W = 32;
+    const ROW_POSTER_H = 48;
+    const ROW_POSTER_WIDE_H = 72;
+
+    function posterBox(rect) {
+      return rect.width > 1 && rect.height > 1;
+    }
+
+    // Matches cubic-bezier(0.2, 0.8, 0.2, 1). Sampled per frame so scrolling can move the target.
+    function posterEase(x) {
+      if (x <= 0) return 0;
+      if (x >= 1) return 1;
+      const x1 = 0.2;
+      const y1 = 0.8;
+      const x2 = 0.2;
+      const y2 = 1;
+      const cx = 3 * x1;
+      const bx = 3 * (x2 - x1) - cx;
+      const ax = 1 - cx - bx;
+      const cy = 3 * y1;
+      const by = 3 * (y2 - y1) - cy;
+      const ay = 1 - cy - by;
+      const sampleX = (t) => ((ax * t + bx) * t + cx) * t;
+      const sampleDX = (t) => (3 * ax * t + 2 * bx) * t + cx;
+      let t = x;
+      for (let i = 0; i < 6; i += 1) {
+        const slope = sampleDX(t);
+        if (Math.abs(slope) < 1e-6) break;
+        t -= (sampleX(t) - x) / slope;
+      }
+      return ((ay * t + by) * t + cy) * t;
+    }
+
+    function scrollAnchor(rect, el) {
+      const scrolls = [];
+      let node = el && el.parentElement;
+      while (node && node !== document.body && node !== document.documentElement) {
+        const style = getComputedStyle(node);
+        if (/(auto|scroll)/.test(style.overflowX + style.overflowY)) {
+          scrolls.push({ node, left: node.scrollLeft, top: node.scrollTop });
+        }
+        node = node.parentElement;
+      }
+      scrolls.push({ left: window.scrollX, top: window.scrollY });
+      return { left: rect.left, top: rect.top, scrolls };
+    }
+
+    function anchoredPoint(anchor) {
+      let dx = 0;
+      let dy = 0;
+      for (const item of anchor.scrolls) {
+        if (item.node) {
+          dx += item.node.scrollLeft - item.left;
+          dy += item.node.scrollTop - item.top;
+        } else {
+          dx += window.scrollX - item.left;
+          dy += window.scrollY - item.top;
+        }
+      }
+      return { left: anchor.left - dx, top: anchor.top - dy };
+    }
+
+    function livePoint(el, anchor) {
+      if (el && el.isConnected) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 || rect.height > 0) return { left: rect.left, top: rect.top };
+      }
+      return anchoredPoint(anchor);
+    }
+
+    function rowPosterTarget(thumb) {
+      const rect = thumb.getBoundingClientRect();
+      if (thumb.classList.contains("row-poster-wide")) {
+        return {
+          left: rect.left,
+          top: rect.top,
+          width: Math.max(rect.width, ROW_POSTER_W),
+          height: ROW_POSTER_WIDE_H,
+        };
+      }
+      return {
+        left: rect.left,
+        top: rect.top,
+        width: ROW_POSTER_W,
+        height: ROW_POSTER_H,
+      };
+    }
+
+    function cancelPosterFlight(row) {
+      const flight = row._posterFlight;
+      if (!flight) return;
+      flight.cancelled = true;
+      if (flight.frame) cancelAnimationFrame(flight.frame);
+      if (flight.clone) flight.clone.remove();
+      row._posterFlight = null;
+    }
+
+    function cornerRadius(el) {
+      const value = parseFloat(getComputedStyle(el).borderTopLeftRadius);
+      return Number.isFinite(value) ? value : 0;
+    }
+
+    function flyPoster(fromRect, toRect, src, fromRadius, toRadius, fromEl, toEl, done) {
+      const flight = { cancelled: false, clone: null, frame: 0 };
+      const clone = document.createElement("img");
+      flight.clone = clone;
+      clone.className = "poster-flight";
+      clone.alt = "";
+      clone.src = src;
+      clone.style.left = "0";
+      clone.style.top = "0";
+      clone.style.width = fromRect.width + "px";
+      clone.style.height = fromRect.height + "px";
+      clone.style.transformOrigin = "top left";
+      clone.style.borderRadius = fromRadius + "px";
+      clone.style.transform = `translate3d(${fromRect.left}px, ${fromRect.top}px, 0) scale(1, 1)`;
+      document.body.appendChild(clone);
+      const fromAnchor = scrollAnchor(fromRect, fromEl);
+      const toAnchor = scrollAnchor(toRect, toEl);
+      const started = performance.now();
+      const step = (now) => {
+        if (flight.cancelled) return;
+        const t = Math.min(1, (now - started) / POSTER_FLIGHT_MS);
+        const eased = posterEase(t);
+        const from = livePoint(fromEl, fromAnchor);
+        const to = livePoint(toEl, toAnchor);
+        const width = fromRect.width + (toRect.width - fromRect.width) * eased;
+        const height = fromRect.height + (toRect.height - fromRect.height) * eased;
+        const x = from.left + (to.left - from.left) * eased;
+        const y = from.top + (to.top - from.top) * eased;
+        const scaleX = fromRect.width ? width / fromRect.width : 1;
+        const scaleY = fromRect.height ? height / fromRect.height : 1;
+        clone.style.transform = `translate3d(${x}px, ${y}px, 0) scale(${scaleX}, ${scaleY})`;
+        const radius = fromRadius + (toRadius - fromRadius) * eased;
+        clone.style.borderRadius = `${radius / scaleX}px / ${radius / scaleY}px`;
+        if (t < 1) {
+          flight.frame = requestAnimationFrame(step);
+          return;
+        }
+        flight.cancelled = true;
+        clone.remove();
+        done();
+      };
+      flight.frame = requestAnimationFrame(step);
+      return flight;
+    }
+
+    function settlePoster(thumb, poster, open) {
+      if (thumb) thumb.style.visibility = open ? "hidden" : "";
+      if (poster) poster.style.visibility = "";
+    }
+
+    function togglePosterRow(row, detail) {
+      const button = row.querySelector(".expand");
+      if (!button) return;
+      const open = button.getAttribute("aria-expanded") !== "true";
+      const thumb = row.querySelector(".title-line .row-poster") || row.querySelector(".row-poster");
+      const poster = detail.querySelector(".poster");
+      cancelPosterFlight(row);
+      const canFly = thumb && poster && thumb.getAttribute("src") && !posterMotion.matches;
+      if (!canFly) {
+        button.setAttribute("aria-expanded", open ? "true" : "false");
+        row.classList.toggle("is-open", open);
+        detail.hidden = !open;
+        settlePoster(thumb, poster, open);
+        if (open) {
+          loadBackdrop(detail);
+          loadFriends(detail);
+        }
+        return;
+      }
+      if (open) {
+        const from = thumb.getBoundingClientRect();
+        button.setAttribute("aria-expanded", "true");
+        row.classList.add("is-open");
+        thumb.style.visibility = "hidden";
+        poster.style.visibility = "hidden";
+        detail.hidden = false;
+        loadBackdrop(detail);
+        loadFriends(detail);
+        const to = poster.getBoundingClientRect();
+        if (!posterBox(from) || !posterBox(to)) {
+          settlePoster(thumb, poster, true);
+          return;
+        }
+        const flight = flyPoster(from, to, thumb.src, cornerRadius(thumb), cornerRadius(poster), thumb, poster, () => {
+          if (row._posterFlight !== flight) return;
+          poster.style.visibility = "";
+          row._posterFlight = null;
+        });
+        row._posterFlight = flight;
+        return;
+      }
+      const from = poster.getBoundingClientRect();
+      const to = rowPosterTarget(thumb);
+      if (!posterBox(from) || !posterBox(to)) {
+        poster.style.visibility = "hidden";
+        detail.hidden = true;
+        button.setAttribute("aria-expanded", "false");
+        row.classList.remove("is-open");
+        settlePoster(thumb, poster, false);
+        return;
+      }
+      poster.style.visibility = "hidden";
+      const flight = flyPoster(from, to, thumb.src, cornerRadius(poster), cornerRadius(thumb), poster, thumb, () => {
+        if (row._posterFlight !== flight) return;
+        settlePoster(thumb, poster, false);
+        row._posterFlight = null;
+      });
+      row._posterFlight = flight;
+      detail.hidden = true;
+      button.setAttribute("aria-expanded", "false");
+      row.classList.remove("is-open");
+    }
+
     function bindMovieRow(row) {
       if (row.dataset.gmfBound) return;
       row.dataset.gmfBound = "1";
       row.addEventListener("click", (event) => {
-        if (event.target.closest(".plan-add")) return;
-        const button = row.querySelector(".expand");
+        if (event.target.closest(".plan-add, .match-repair")) return;
         const detail = row.nextElementSibling;
-        if (!button || !detail || !detail.hasAttribute("data-movie-detail")) return;
-        const open = button.getAttribute("aria-expanded") !== "true";
-        button.setAttribute("aria-expanded", open ? "true" : "false");
-        row.classList.toggle("is-open", open);
-        detail.hidden = !open;
-        if (open) loadFriends(detail);
+        if (!detail || !detail.hasAttribute("data-movie-detail")) return;
+        togglePosterRow(row, detail);
       });
     }
 
     document.querySelectorAll("[data-movie-row]").forEach(bindMovieRow);
 
     document.querySelectorAll("[data-stream-row]").forEach((row) => {
+      if (row.dataset.gmfBound) return;
+      row.dataset.gmfBound = "1";
       row.addEventListener("click", (event) => {
         if (event.target.closest("a")) return;
-        const button = row.querySelector(".expand");
         const detail = row.nextElementSibling;
-        if (!button || !detail || !detail.hasAttribute("data-stream-detail")) return;
-        const open = button.getAttribute("aria-expanded") !== "true";
-        button.setAttribute("aria-expanded", open ? "true" : "false");
-        row.classList.toggle("is-open", open);
-        detail.hidden = !open;
-        if (open) loadFriends(detail);
+        if (!detail || !detail.hasAttribute("data-stream-detail")) return;
+        togglePosterRow(row, detail);
       });
     });
 
     const friendLoads = new Map();
-    let friendFetchChain = Promise.resolve();
+    const friendQueue = [];
+    let friendBusy = false;
+
+    function viewerIsSignedIn() {
+      try {
+        const node = document.getElementById("viewer-config");
+        const parsed = JSON.parse((node && node.textContent) || "{}");
+        return Boolean(parsed && parsed.signedIn && parsed.letterboxdUser);
+      } catch (err) {
+        return false;
+      }
+    }
 
     function friendFetchErrorMessage(err) {
       if (err && typeof err.message === "string" && err.message.trim()) {
@@ -392,9 +614,58 @@
             attempt(left - 1)
           );
         });
-      const job = friendFetchChain.then(() => attempt(tries));
-      friendFetchChain = job.catch(() => {});
+      return attempt(tries);
+    }
+
+    function promoteFriendSlug(slug) {
+      const index = friendQueue.findIndex((item) => item.slug === slug);
+      if (index > 0) {
+        const item = friendQueue.splice(index, 1)[0];
+        friendQueue.unshift(item);
+      }
+    }
+
+    function pumpFriendQueue() {
+      if (friendBusy || !friendQueue.length) return;
+      const item = friendQueue.shift();
+      friendBusy = true;
+      fetchFriendRatings(item.slug)
+        .then((payload) => item.resolve(payload))
+        .catch((err) => {
+          friendLoads.delete(item.slug);
+          item.reject(err);
+        })
+        .finally(() => {
+          friendBusy = false;
+          pumpFriendQueue();
+        });
+    }
+
+    function enqueueFriendRatings(slug, priority) {
+      const existing = friendLoads.get(slug);
+      if (existing) {
+        if (priority) promoteFriendSlug(slug);
+        return existing;
+      }
+      let resolve;
+      let reject;
+      const job = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      friendLoads.set(slug, job);
+      const item = { slug, resolve, reject };
+      if (priority) friendQueue.unshift(item);
+      else friendQueue.push(item);
+      pumpFriendQueue();
       return job;
+    }
+
+    function startFriendLoad(slug, priority) {
+      if (!slug) return;
+      enqueueFriendRatings(slug, priority)
+        .then((payload) => renderFriends(slug, payload))
+        .catch((err) => markFriendError(slug, err && err.message));
     }
 
     function friendPanels(slug) {
@@ -427,9 +698,10 @@
     }
 
     function appendFriendRow(list, friend, options) {
+      options = options || {};
       if (!friend || typeof friend.name !== "string" || !list) return;
       const item = document.createElement("li");
-      item.className = "friend";
+      item.className = options.commentCard ? "friend is-comment" : "friend";
       const profileUrl = allowedUrl(friend.profile, ["https://letterboxd.com/"]);
       const avatarUrl = allowedUrl(friend.avatar, [
         "https://a.ltrbxd.com/",
@@ -486,7 +758,7 @@
         top.appendChild(badge);
       }
       body.appendChild(top);
-      if (options.showRating && typeof friend.comment === "string" && friend.comment.trim()) {
+      if (options.showComment && typeof friend.comment === "string" && friend.comment.trim()) {
         const comment = document.createElement("p");
         comment.className = "friend-comment";
         comment.textContent = friend.comment;
@@ -497,10 +769,17 @@
     }
 
     function renderFriendSection(section, friends, options) {
+      options = options || {};
       if (!section || !section.list) return;
+      const hasFriends = friends.length > 0;
+      if (options.hideIfEmpty && !hasFriends) {
+        section.group.hidden = true;
+        section.list.replaceChildren();
+        section.list.hidden = true;
+        return;
+      }
       section.list.replaceChildren();
       friends.forEach((friend) => appendFriendRow(section.list, friend, options));
-      const hasFriends = friends.length > 0;
       section.list.hidden = !hasFriends;
       if (section.empty) section.empty.hidden = hasFriends;
       section.group.hidden = false;
@@ -511,8 +790,12 @@
       const watchlist = Array.isArray(payload.watchlist) ? payload.watchlist : [];
       friendPanels(slug).forEach((panel) => {
         const status = panel.querySelector(".friend-status");
+        const comments = friendGroup(panel, "comments");
         const rated = friendGroup(panel, "rated");
         const listed = friendGroup(panel, "watchlist");
+        const commented = friends.filter(
+          (friend) => typeof friend.comment === "string" && friend.comment.trim()
+        );
         const legacyList = panel.querySelector(":scope > .friend-list");
         if (!rated && legacyList) {
           legacyList.replaceChildren();
@@ -525,7 +808,7 @@
           } else {
             if (status) status.hidden = true;
             friends.forEach((friend) =>
-              appendFriendRow(legacyList, friend, { showRating: true })
+              appendFriendRow(legacyList, friend, { showRating: true, showComment: true })
             );
             legacyList.hidden = false;
           }
@@ -533,8 +816,14 @@
           return;
         }
         if (status) status.hidden = true;
-        renderFriendSection(rated, friends, { showRating: true });
-        renderFriendSection(listed, watchlist, { watchlistBadge: true });
+        renderFriendSection(comments, commented, {
+          showRating: true,
+          showComment: true,
+          commentCard: true,
+          hideIfEmpty: true,
+        });
+        renderFriendSection(rated, friends, { showRating: true, hideIfEmpty: true });
+        renderFriendSection(listed, watchlist, { watchlistBadge: true, hideIfEmpty: true });
         if (!friends.length && !watchlist.length && status) {
           status.hidden = false;
           status.textContent =
@@ -568,29 +857,92 @@
       });
     }
 
-    function loadFriends(root) {
+    const backdropLoads = new Map();
+
+    function detailFilmSlug(detail) {
+      const marked = detail.querySelector("[data-backdrop-slug]");
+      if (marked) return marked.getAttribute("data-backdrop-slug") || "";
+      const friend = detail.querySelector("[data-friend-slug]");
+      if (friend) return friend.getAttribute("data-friend-slug") || "";
+      const link = detail.querySelector('a[href*="letterboxd.com/film/"]');
+      if (!link) return "";
+      const match = String(link.getAttribute("href") || "").match(/letterboxd\.com\/film\/([^/?#]+)/i);
+      return match ? match[1] : "";
+    }
+
+    function showBackdrop(detail, url) {
+      const safe = allowedUrl(url, ["https://a.ltrbxd.com/"]);
+      if (!safe) return;
+      let hero = detail.querySelector(".detail-hero");
+      const main = detail.querySelector(".detail-main");
+      if (!hero) {
+        hero = document.createElement("div");
+        hero.className = "detail-hero";
+        detail.insertBefore(hero, main || detail.firstChild);
+      }
+      let image = hero.querySelector(".detail-backdrop");
+      if (!image) {
+        image = document.createElement("img");
+        image.className = "detail-backdrop";
+        image.alt = "";
+        hero.prepend(image);
+      }
+      if (image.getAttribute("src") !== safe) image.src = safe;
+      hero.hidden = false;
+    }
+
+    function loadBackdrop(detail) {
+      if (!detail || detail.querySelector(".detail-backdrop")) return;
+      const slug = detailFilmSlug(detail);
+      if (!slug) return;
+      let pending = backdropLoads.get(slug);
+      if (!pending) {
+        pending = fetch("/api/letterboxd-backdrop?slug=" + encodeURIComponent(slug))
+          .then((response) => (response.ok ? response.json() : null))
+          .then((data) => (data && typeof data.url === "string" ? data.url : ""))
+          .catch(() => "");
+        backdropLoads.set(slug, pending);
+      }
+      pending.then((url) => {
+        if (!url || !detail.isConnected) return;
+        showBackdrop(detail, url);
+      });
+    }
+
+    function loadFriends(root, priority) {
       if (!root) return;
+      const signedIn = viewerIsSignedIn();
       root.querySelectorAll("[data-friend-slug]").forEach((panel) => {
         const slug = panel.getAttribute("data-friend-slug");
-        if (typeof viewerConfig !== "undefined" && viewerConfig.signedIn === false) {
+        if (!signedIn) {
           panel.hidden = true;
           return;
         }
         if (!slug || panel.dataset.friendState === "ready") return;
-        const existing = friendLoads.get(slug);
-        if (existing) {
-          existing
-            .then((payload) => renderFriends(slug, payload))
-            .catch((err) => markFriendError(slug, err && err.message));
-          return;
-        }
-        const job = fetchFriendRatings(slug);
-        friendLoads.set(slug, job);
-        job.then((payload) => renderFriends(slug, payload)).catch((err) => {
-          friendLoads.delete(slug);
-          markFriendError(slug, err && err.message);
-        });
+        startFriendLoad(slug, priority !== false);
       });
+    }
+
+    function uniqueFriendSlugs() {
+      const slugs = [];
+      const seen = new Set();
+      document.querySelectorAll("[data-friend-slug]").forEach((panel) => {
+        const slug = panel.getAttribute("data-friend-slug");
+        if (!slug || seen.has(slug)) return;
+        seen.add(slug);
+        slugs.push(slug);
+      });
+      return slugs;
+    }
+
+    function prefetchFriendRatings() {
+      if (!viewerIsSignedIn()) {
+        document.querySelectorAll("[data-friend-slug]").forEach((panel) => {
+          panel.hidden = true;
+        });
+        return;
+      }
+      uniqueFriendSlugs().forEach((slug) => startFriendLoad(slug, false));
     }
 
     function sortValue(row, key, type) {
@@ -686,6 +1038,12 @@
       if (nav && typeof payload.pills === "string") {
         nav.innerHTML = '<span class="nav-pills-label">Jump to</span>' + payload.pills;
       }
+      const updated = document.getElementById("taste-updated");
+      if (updated) {
+        const label = typeof payload.updatedLabel === "string" ? payload.updatedLabel : "";
+        updated.textContent = label;
+        updated.hidden = !label;
+      }
       applySearch();
       updateScrolledSection();
     }
@@ -770,3 +1128,183 @@
 
     const tasteRefresh = document.getElementById("taste-refresh");
     if (tasteRefresh) tasteRefresh.addEventListener("click", refreshRecommendations);
+
+    function matchApi(path) {
+      const node = document.getElementById("viewer-config");
+      let port = 8765;
+      try {
+        const parsed = JSON.parse((node && node.textContent) || "{}");
+        if (parsed && typeof parsed.port === "number") port = parsed.port;
+      } catch (err) {
+        /* static page */
+      }
+      if (location.protocol === "file:") {
+        return "http://127.0.0.1:" + port + path;
+      }
+      return path;
+    }
+
+    function matchRoot(node) {
+      return node && node.closest(".match-repair");
+    }
+
+    function setMatchStatus(root, message, isError) {
+      const status = root.querySelector(".match-status");
+      if (!status) return;
+      status.hidden = !message;
+      status.textContent = message || "";
+      status.classList.toggle("is-error", !!isError);
+    }
+
+    function renderMatchResults(root, films) {
+      const list = root.querySelector(".match-results");
+      if (!list) return;
+      list.replaceChildren();
+      if (!films.length) {
+        list.hidden = true;
+        return;
+      }
+      films.forEach((film) => {
+        if (!film || typeof film.slug !== "string") return;
+        const item = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "match-pick";
+        button.setAttribute("data-slug", film.slug);
+        const title = document.createElement("span");
+        title.className = "match-pick-title";
+        title.textContent = typeof film.title === "string" ? film.title : film.slug;
+        button.appendChild(title);
+        const bits = [];
+        if (typeof film.year === "number") bits.push(String(film.year));
+        if (Array.isArray(film.directors) && film.directors.length) {
+          const names = film.directors.filter((name) => typeof name === "string" && name.trim());
+          bits.push(names.length > 2 ? names.slice(0, 2).join(", ") + ", …" : names.join(", "));
+        }
+        if (bits.length) {
+          const meta = document.createElement("span");
+          meta.className = "match-pick-meta";
+          meta.textContent = bits.join(" · ");
+          button.appendChild(meta);
+        }
+        item.appendChild(button);
+        list.appendChild(item);
+      });
+      list.hidden = list.childElementCount === 0;
+    }
+
+    async function searchLetterboxdMatch(root) {
+      const input = root.querySelector(".match-query");
+      const query = input && input.value ? input.value.trim() : "";
+      if (!query) {
+        setMatchStatus(root, "Type a title to search Letterboxd.", true);
+        return;
+      }
+      const searchButton = root.querySelector(".match-search");
+      if (searchButton) searchButton.disabled = true;
+      setMatchStatus(root, "Searching Letterboxd…", false);
+      renderMatchResults(root, []);
+      try {
+        const response = await fetch(
+          matchApi("/api/letterboxd-search?q=" + encodeURIComponent(query))
+        );
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const fallback = response.status === 404
+            ? "Restart python3 goodmoviefinder.py --serve to fix the Letterboxd match."
+            : "Letterboxd could not be reached.";
+          throw new Error(payload.error || fallback);
+        }
+        const films = Array.isArray(payload.films) ? payload.films : [];
+        if (!films.length) {
+          setMatchStatus(root, "No Letterboxd films matched that search.", true);
+          return;
+        }
+        setMatchStatus(root, "Pick the right film.", false);
+        renderMatchResults(root, films);
+      } catch (err) {
+        setMatchStatus(
+          root,
+          err && err.message ? err.message : "Letterboxd could not be reached.",
+          true
+        );
+      } finally {
+        if (searchButton) searchButton.disabled = false;
+      }
+    }
+
+    async function applyLetterboxdMatch(root, slug) {
+      const url = root.getAttribute("data-match-url");
+      if (!url || !slug) return;
+      setMatchStatus(root, "Saving this Letterboxd page…", false);
+      root.querySelectorAll(".match-pick, .match-search, .match-toggle").forEach((el) => {
+        el.disabled = true;
+      });
+      try {
+        const response = await fetch(matchApi("/api/match"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ nonstopUrl: url, slug }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const fallback = response.status === 404
+            ? "Restart python3 goodmoviefinder.py --serve to fix the Letterboxd match."
+            : "That Letterboxd page could not be saved.";
+          throw new Error(payload.error || fallback);
+        }
+        setMatchStatus(root, "Saved. Reloading…", false);
+        window.location.reload();
+      } catch (err) {
+        setMatchStatus(
+          root,
+          err && err.message ? err.message : "That Letterboxd page could not be saved.",
+          true
+        );
+        root.querySelectorAll(".match-pick, .match-search, .match-toggle").forEach((el) => {
+          el.disabled = false;
+        });
+      }
+    }
+
+    document.addEventListener("click", (event) => {
+      const toggle = event.target.closest(".match-toggle");
+      if (toggle) {
+        event.preventDefault();
+        event.stopPropagation();
+        const root = matchRoot(toggle);
+        const form = root && root.querySelector(".match-form");
+        if (!form) return;
+        const open = form.hidden;
+        form.hidden = !open;
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+        if (open) {
+          const input = form.querySelector(".match-query");
+          if (input) input.focus();
+        }
+        return;
+      }
+      const pick = event.target.closest(".match-pick");
+      if (pick) {
+        event.preventDefault();
+        event.stopPropagation();
+        const root = matchRoot(pick);
+        if (root) applyLetterboxdMatch(root, pick.getAttribute("data-slug") || "");
+      }
+    });
+
+    document.addEventListener("submit", (event) => {
+      const form = event.target.closest(".match-form");
+      if (!form) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const root = matchRoot(form);
+      if (root) searchLetterboxdMatch(root);
+    });
+
+    const startFriendPrefetch = () => prefetchFriendRatings();
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(startFriendPrefetch, { timeout: 800 });
+    } else {
+      setTimeout(startFriendPrefetch, 0);
+    }

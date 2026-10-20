@@ -51,6 +51,8 @@ class Movie:
     primary_language_known: bool = False
     versions: list[str] = field(default_factory=list)
     poster_url: str | None = None
+    letterboxd_poster_url: str | None = None
+    letterboxd_backdrop_url: str | None = None
     synopsis: str | None = None
     cinema_sites: dict[str, str] = field(default_factory=dict)
     details_known: bool = False
@@ -67,6 +69,8 @@ class Movie:
     member_support: int = 0
     # False when a cached Letterboxd link was stored by an older matcher.
     match_current: bool = True
+    # True when the viewer chose the Letterboxd page; keep it across matcher bumps.
+    manual_match: bool = False
     # True when this program title was looked up fresh (not from cache) this run.
     new_in_program: bool = False
 

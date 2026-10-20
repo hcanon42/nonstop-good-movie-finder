@@ -6,6 +6,7 @@ import html
 
 from goodmoviefinder.config import DEFAULT_KNOWN_LANGUAGES
 from goodmoviefinder.html import (
+    _detail_hero_html,
     _external_link,
     _friend_ratings_html,
     _html_table_section,
@@ -13,7 +14,7 @@ from goodmoviefinder.html import (
     _sortable_header,
 )
 from goodmoviefinder.layout import NONSTOP_HREF, render_page, sign_in_card
-from goodmoviefinder.letterboxd import letterboxd_poster_url
+from goodmoviefinder.letterboxd import letterboxd_backdrop_url, letterboxd_poster_url
 from goodmoviefinder.models import Movie
 from goodmoviefinder.program import format_screening_date
 from goodmoviefinder.viewer import canonical_languages, settings_stamp
@@ -60,6 +61,11 @@ def _stream_detail_html(film: dict[str, object], detail_id: str, title: str, fil
             f'<img class="poster" src="{html.escape(poster_url, quote=True)}" '
             f'alt="{html.escape(title, quote=True)}">'
         )
+    slug = str(film.get("slug") or "")
+    hero = _detail_hero_html(
+        letterboxd_backdrop_url(film.get("backdrop")),
+        slug or None,
+    )
     synopsis_text = film.get("synopsis")
     if film.get("details_known"):
         if isinstance(synopsis_text, str) and synopsis_text.strip():
@@ -70,11 +76,30 @@ def _stream_detail_html(film: dict[str, object], detail_id: str, title: str, fil
         synopsis = '<p class="synopsis muted">Letterboxd details could not be loaded.</p>'
     letterboxd = _external_link(film_url, html.escape(title), "link-lb")
     friends = _friend_ratings_html(str(film.get("slug") or ""))
+    facts: list[str] = []
+    year = film.get("year")
+    if isinstance(year, int):
+        facts.append(str(year))
+    directors = film.get("directors")
+    if isinstance(directors, list):
+        names = ", ".join(str(name) for name in directors if str(name).strip())
+        if names:
+            facts.append(html.escape(names))
+    facts_html = (
+        '<p class="detail-facts">' + "".join(f"<span>{part}</span>" for part in facts) + "</p>"
+        if facts
+        else ""
+    )
     return (
         f'<div class="detail panel panel-inset" id="{html.escape(detail_id, quote=True)}">'
+        f"{hero}"
+        f'<div class="detail-main">'
         f"{poster}"
-        f'<div class="detail-body">{synopsis}'
-        f'<p class="detail-links">{letterboxd}</p>{friends}</div></div>'
+        f'<div class="detail-body">'
+        f'<div class="detail-about">{facts_html}{synopsis}'
+        f'<p class="detail-links">{letterboxd}</p></div>'
+        f'<div class="detail-columns">{friends}</div>'
+        f"</div></div></div>"
     )
 
 
@@ -120,6 +145,13 @@ def _watchlist_html(
         detail_id = f"watchlist-{index}-detail"
         safe_slug = html.escape(slug, quote=True)
         sort_title = html.escape(title, quote=True)
+        poster_url = letterboxd_poster_url(film.get("poster"))
+        row_poster = ""
+        if poster_url:
+            row_poster = (
+                f'<img class="row-poster" src="{html.escape(poster_url, quote=True)}" '
+                f'alt="" width="32" height="48">'
+            )
         rows.append(
             f'<tr data-stream-row class="row-watchlist" data-stream-id="{safe_slug}" data-search="{search}"'
             f' data-streamable="{1 if offer_html else 0}" data-nonstop="{1 if next_day else 0}"'
@@ -127,7 +159,7 @@ def _watchlist_html(
             f' data-sort-title="{sort_title}">'
             f'<td class="col-rating">{_rating_badge(rating, rating_text, title="Letterboxd rating")}</td>'
             f'<td class="col-year">{year_html}</td>'
-            f'<td class="col-title"><span class="title-line"><button type="button" class="expand" '
+            f'<td class="col-title"><span class="title-line">{row_poster}<button type="button" class="expand" '
             f'aria-expanded="false" aria-controls="{html.escape(detail_id, quote=True)}">'
             f"<strong>{html.escape(title)}</strong></button>"
             f'<span class="row-chevron" aria-hidden="true"></span></span></td>'
@@ -221,6 +253,8 @@ def format_taste_panel_html(
                     row_class=row_class,
                     show_predicted=True,
                     show_follow_badge=False,
+                    show_because=False,
+                    because_in_detail=True,
                 )
             )
     if len(sections) == 1:
@@ -251,6 +285,7 @@ def format_account_html(
     step_outside: list[Movie],
     paragraph: str,
     note: str,
+    updated_label: str = "",
     known_languages: list[str] | None = None,
     language_options: list[str] | None = None,
     following_user: str | None = None,
@@ -297,6 +332,9 @@ def format_account_html(
             '      <div class="taste-refresh-bar" data-tools="recommendations">\n'
             '        <button type="button" id="taste-refresh" class="taste-refresh">'
             "Refresh recommendations</button>\n"
+            f'        <span class="taste-updated" id="taste-updated"'
+            f'{" hidden" if not updated_label else ""}>'
+            f"{html.escape(updated_label)}</span>\n"
             '        <p class="taste-refresh-status" id="taste-refresh-status" role="status" hidden></p>\n'
             "      </div>\n"
             '      <nav class="nav-pills" aria-label="Recommendation sections" data-tools="recommendations" '

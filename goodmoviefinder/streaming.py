@@ -14,7 +14,12 @@ from typing import Any
 
 from goodmoviefinder.config import STREAMING_CACHE, USER_AGENT
 from goodmoviefinder.http import fetch
-from goodmoviefinder.letterboxd import letterboxd_poster_url, parse_letterboxd_film_card
+from goodmoviefinder.cache import remember_backdrop
+from goodmoviefinder.letterboxd import (
+    letterboxd_backdrop_url,
+    letterboxd_poster_url,
+    parse_letterboxd_film_card,
+)
 from goodmoviefinder.progress import tick
 from goodmoviefinder.title_lookup import english_title_from_german_wikipedia
 
@@ -347,6 +352,7 @@ def _clean_details(raw: object) -> dict[str, object] | None:
         "rating": rating,
         "synopsis": synopsis,
         "poster": letterboxd_poster_url(raw.get("poster")),
+        "backdrop": letterboxd_backdrop_url(raw.get("backdrop")),
     }
 
 
@@ -383,10 +389,19 @@ def fetch_letterboxd_film_card(slug: str) -> dict[str, object]:
         body = _fetch_film_html(slug)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            return {"card": FILM_CARD_VERSION, "rating": None, "synopsis": "", "poster": None}
+            return {
+                "card": FILM_CARD_VERSION,
+                "rating": None,
+                "synopsis": "",
+                "poster": None,
+                "backdrop": None,
+            }
         raise
     card = parse_letterboxd_film_card(body)
     card["card"] = FILM_CARD_VERSION
+    backdrop = letterboxd_backdrop_url(card.get("backdrop"))
+    if backdrop:
+        remember_backdrop(slug, backdrop)
     return card
 
 
@@ -546,6 +561,7 @@ def resolve_watchlist_streaming(
                 "rating": None if details is None else details.get("rating"),
                 "synopsis": "" if details is None else details.get("synopsis") or "",
                 "poster": None if details is None else details.get("poster"),
+                "backdrop": None if details is None else details.get("backdrop"),
                 "details_known": details is not None,
             }
         )

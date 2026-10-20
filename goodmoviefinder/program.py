@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import urllib.parse
-from datetime import date
+from datetime import date, timedelta
 
 from goodmoviefinder.config import DEFAULT_KNOWN_LANGUAGE_KEYS
 from goodmoviefinder.matching import director_person_keys
@@ -80,6 +80,44 @@ def attach_program(movie: Movie, film: ProgramFilm) -> None:
     movie.poster_url = film.poster_url
 
 
+def apply_known_letterboxd_posters(movies: list[Movie], cache: dict) -> None:
+    """Use a saved Letterboxd poster when this program film was recognized."""
+    import json
+
+    from goodmoviefinder.config import DEFAULT_CACHE
+    from goodmoviefinder.letterboxd import letterboxd_poster_url
+
+    features = cache.get("film_features")
+    if not isinstance(features, dict):
+        features = {}
+    saved: dict[str, str] = {}
+    sidecar = DEFAULT_CACHE.parent / "program-posters.json"
+    if sidecar.is_file():
+        try:
+            raw = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        if isinstance(raw, dict):
+            saved = {
+                slug: url
+                for slug, url in raw.items()
+                if isinstance(slug, str) and letterboxd_poster_url(url)
+            }
+    for movie in movies:
+        if letterboxd_poster_url(movie.letterboxd_poster_url):
+            continue
+        slug = letterboxd_slug_from_url(movie.letterboxd_url)
+        if not slug:
+            continue
+        poster = letterboxd_poster_url(saved.get(slug))
+        if poster is None:
+            feature = features.get(slug)
+            if isinstance(feature, dict):
+                poster = letterboxd_poster_url(feature.get("poster"))
+        if poster:
+            movie.letterboxd_poster_url = poster
+
+
 def primary_language_constrains_versions(movie: Movie) -> bool:
     """False when the film has no dialogue language to match (unknown or none spoken)."""
     if movie.primary_language is None:
@@ -129,6 +167,35 @@ def watchable_screenings(
     return [screening for screening in movie.screenings if screening.language in allowed]
 
 
+def last_followable_day(
+    movie: Movie,
+    known_languages: frozenset[str] | None = None,
+) -> date | None:
+    """Latest date with a screening in a version this viewer can follow."""
+    last: date | None = None
+    for screening in watchable_screenings(movie, known_languages):
+        try:
+            day = date.fromisoformat(screening.weekday)
+        except ValueError:
+            continue
+        if last is None or day > last:
+            last = day
+    return last
+
+
+def is_last_chance(
+    movie: Movie,
+    known_languages: frozenset[str] | None = None,
+    *,
+    today: date | None = None,
+    within_days: int = 7,
+) -> bool:
+    """True when the last followable screening is still ahead and within a week."""
+    today = today or date.today()
+    last = last_followable_day(movie, known_languages)
+    return last is not None and today <= last <= today + timedelta(days=within_days)
+
+
 def language_filter_blurb(languages: list[str]) -> str:
     """Subtitle for the main program, from the languages the viewer knows."""
     names = [name.strip() for name in languages if name.strip()]
@@ -174,6 +241,17 @@ def sort_movies(movies: list[Movie]) -> list[Movie]:
         if m.rating is None:
             return (1, 0.0, film_title(m).casefold())
         return (0, -m.rating, film_title(m).casefold())
+
+    return sorted(movies, key=sort_key)
+
+
+def sort_watched(movies: list[Movie]) -> list[Movie]:
+    """Already-watched films, highest personal rating first."""
+
+    def sort_key(m: Movie) -> tuple[int, float, str]:
+        if m.user_rating is None:
+            return (1, 0.0, film_title(m).casefold())
+        return (0, -m.user_rating, film_title(m).casefold())
 
     return sorted(movies, key=sort_key)
 
@@ -264,7 +342,7 @@ def partition_program_movies(
     return (
         sort_movies(watchlist),
         sort_movies(recommendations),
-        sort_movies(watched),
+        sort_watched(watched),
         sort_movies(program),
     )
 
@@ -288,8 +366,21 @@ def _format_year(m: Movie) -> str:
     return str(m.year) if m.year is not None else "—"
 
 
-def _format_directors(m: Movie) -> str:
-    return ", ".join(m.directors) if m.directors else "—"
+# Keep table cells short; hover still shows the full credit.
+_DISPLAY_DIRECTOR_LIMIT = 2
+
+
+def _format_names(names: list[str], *, limit: int | None = None) -> str:
+    cleaned = [name.strip() for name in names if isinstance(name, str) and name.strip()]
+    if not cleaned:
+        return "—"
+    if limit is not None and len(cleaned) > limit:
+        return ", ".join(cleaned[:limit]) + ", …"
+    return ", ".join(cleaned)
+
+
+def _format_directors(m: Movie, *, limit: int | None = None) -> str:
+    return _format_names(m.directors, limit=limit)
 
 
 def _format_genres(m: Movie) -> str:

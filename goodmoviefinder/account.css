@@ -79,6 +79,10 @@
     }
     .taste-refresh:hover { border-color: var(--gold); color: var(--text); }
     .taste-refresh:disabled { opacity: 0.6; cursor: progress; }
+    .taste-updated {
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
     .taste-refresh-status {
       margin: 0;
       color: var(--muted);

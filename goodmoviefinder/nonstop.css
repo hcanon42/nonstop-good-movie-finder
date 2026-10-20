@@ -132,6 +132,11 @@
     button.month-day:hover,
     button.month-day[aria-expanded="true"] { border-color: var(--gold); }
     button.month-day[aria-expanded="true"] { background: var(--gold-soft); }
+    button.month-day.is-last-chance { border-color: var(--gold); }
+    button.month-day.is-last-chance .month-day-count {
+      background: var(--gold-soft);
+      color: var(--gold);
+    }
     button.month-day.is-filtered-out,
     button.also-day-button.is-filtered-out {
       opacity: 0.4;
@@ -208,6 +213,7 @@
       letter-spacing: 0.04em;
       text-transform: uppercase;
     }
+    .chip-just-arrived { color: var(--ok); background: var(--ok-soft); }
     .chip-watchlist { color: var(--lb); background: var(--lb-soft); }
     .chip-recommendations { color: #efe4ff; background: var(--rec-soft); }
     .chip-watched {
@@ -244,13 +250,14 @@
       color: var(--muted);
     }
     .day-times li { margin: 0.1rem 0; }
-    .day-film:has(.day-film-title[aria-expanded="true"]) .day-times-line { display: none; }
-    .day-film:has(.day-film-title[aria-expanded="true"]) .day-times { display: block; }
+    .day-film:has(.day-film-title[aria-expanded="true"]) .day-times-line,
+    .day-film:has(.day-film-title[aria-expanded="true"]) .day-times { display: none; }
     .day-film-detail { margin-top: 0.65rem; }
     .day-film-detail .detail {
       position: static;
       width: auto;
     }
+    .schedule { min-width: 0; }
     .also-showing { margin-top: 1.5rem; }
     .also-showing h2 {
       margin: 0 0 0.6rem;
@@ -288,7 +295,7 @@
       flex: 0 0 auto;
       width: 1.45rem;
       height: 1.45rem;
-      margin-top: 0.05rem;
+      margin-top: 0;
       border-radius: 999px;
       border: 1px solid var(--line);
       background: transparent;
@@ -300,6 +307,12 @@
       cursor: pointer;
     }
     .plan-add:hover { border-color: var(--gold); color: var(--text); }
+    /* The system plus glyph sits below the middle of its em box. */
+    .plan-add-icon {
+      display: inline-block;
+      transform: translateY(-0.077em);
+    }
+    .plan-add[aria-pressed="true"] .plan-add-icon { transform: none; }
     .plan-add[aria-pressed="true"] {
       background: var(--gold);
       border-color: var(--gold);

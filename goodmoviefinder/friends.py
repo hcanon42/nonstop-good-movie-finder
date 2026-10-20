@@ -153,28 +153,66 @@ def parse_friend_rating_rows(html_text: str) -> list[dict[str, object]]:
                 "avatar": _avatar(html.unescape(image.group(1))) if image else None,
                 "rating": rating,
                 "comment": None,
-                "has_review": "icon-review" in row,
+                "has_review": bool(
+                    re.search(r"icon-review|has-review|js-review|/reviews/", row, re.I)
+                ),
             }
         )
     return friends
+
+
+def _review_username(item: str) -> str | None:
+    person = re.search(r'data-person="([^"]+)"', item)
+    if person and _USER_RE.fullmatch(person.group(1)):
+        return person.group(1)
+    return _username(item)
+
+
+def _review_body(item: str) -> tuple[str, str | None]:
+    match = re.search(
+        r'<div[^>]*class="[^"]*\b(?:js-review-body|body-text)\b[^"]*"([^>]*)>(.*)',
+        item,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return "", None
+    attrs, rest = match.group(1), match.group(2)
+    cut = re.search(
+        r'</div>\s*(?:<div[^>]*class="[^"]*viewing-actions|</article>|$)',
+        rest,
+        re.DOTALL | re.IGNORECASE,
+    )
+    fragment = rest[: cut.start()] if cut else rest
+    comment = _plain_text(fragment)
+    full_url = None
+    full_match = re.search(r'data-full-text-url="([^"]+)"', attrs + fragment)
+    if full_match and full_match.group(1).startswith("/s/full-text/"):
+        full_url = full_match.group(1)
+    return comment, full_url
 
 
 def parse_friend_reviews(html_text: str) -> list[dict[str, object]]:
     """Review text from the same viewer's friends-reviews page for one film."""
     reviews: list[dict[str, object]] = []
     seen: set[str] = set()
-    parts = html_text.split('<article class="production-viewing')
+    parts = re.split(
+        r'<article(?=[^>]*class="[^"]*(?:js-production-viewing|production-viewing|film-detail)[^"]*")',
+        html_text,
+    )
     for part in parts[1:]:
         end = part.find("</article>")
         item = part if end < 0 else part[:end]
-        username = _username(item)
+        username = _review_username(item)
         if username is None:
             continue
         key = username.casefold()
         if key in seen:
             continue
         seen.add(key)
-        name_match = re.search(r'class="displayname">\s*([^<]+?)\s*</', item)
+        name_match = re.search(
+            r'class="(?:displayname|name)"[^>]*>\s*([^<]+?)\s*</',
+            item,
+        )
         name = html.unescape(name_match.group(1)).strip() if name_match else username
         image = re.search(r'<img[^>]+src="([^"]+)"', item)
         rating = None
@@ -182,17 +220,7 @@ def parse_friend_reviews(html_text: str) -> list[dict[str, object]]:
             rating = _stars(html.unescape(label))
             if rating is not None:
                 break
-        body = re.search(
-            r'js-review-body([^>]*)>(.*?)</div>\s*<div class="viewing-actions"',
-            item,
-            re.DOTALL,
-        )
-        comment = _plain_text(body.group(2)) if body else ""
-        full_url = None
-        if body:
-            full_match = re.search(r'data-full-text-url="([^"]+)"', body.group(1))
-            if full_match and full_match.group(1).startswith("/s/full-text/"):
-                full_url = full_match.group(1)
+        comment, full_url = _review_body(item)
         reviews.append(
             {
                 "username": username,
@@ -572,8 +600,7 @@ def fetch_friend_ratings(user: str, slug: str, delay: float) -> list[dict[str, o
                 continue
             by_user[key] = friend
             order.append(key)
-    wants_reviews = any(friend.get("has_review") for friend in by_user.values())
-    if wants_reviews:
+    if by_user:
         _pause(delay)
         try:
             review_pages = _fetch_pages(reviews_url, delay)

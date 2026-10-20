@@ -506,6 +506,7 @@ def parse_letterboxd_film_features(html_text: str) -> dict[str, object]:
         "themes_known": bool(taxonomy["themes"] or taxonomy["mini_themes"] or taxonomy["nanogenres"]),
         "synopsis": parse_letterboxd_synopsis(html_text) or "",
         "poster": parse_letterboxd_poster(html_text),
+        "backdrop": parse_letterboxd_backdrop(html_text),
         "card_known": True,
     }
 
@@ -584,11 +585,49 @@ def fetch_letterboxd_film_credit(slug: str) -> dict[str, object]:
     raise RuntimeError(f"Failed to fetch {url}: {last_error}")
 
 
-def letterboxd_autocomplete_slugs(
+_FILM_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def normalize_letterboxd_film_slug(value: str) -> str | None:
+    """A Letterboxd film slug, or one taken from a film URL."""
+    text = (value or "").strip()
+    if not text or len(text) > 200:
+        return None
+    if "letterboxd.com" in text.casefold():
+        slug = letterboxd_slug_from_url(text)
+    else:
+        slug = text.strip("/")
+        if "/" in slug:
+            return None
+    if not slug:
+        return None
+    slug = slug.casefold()
+    if len(slug) > 160 or not _FILM_SLUG_RE.fullmatch(slug):
+        return None
+    return slug
+
+
+def _autocomplete_director_names(value: object) -> list[str]:
+    names: list[str] = []
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    if not isinstance(value, list):
+        return names
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            names.append(item.strip())
+        elif isinstance(item, dict):
+            name = item.get("name")
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+    return names
+
+
+def letterboxd_autocomplete_films(
     query: str,
     delay: float,
     limit: int = 5,
-) -> list[str]:
+) -> list[dict[str, object]]:
     query = query.strip()
     if not query:
         return []
@@ -604,18 +643,47 @@ def letterboxd_autocomplete_slugs(
         payload = json.loads(body)
     except json.JSONDecodeError:
         return []
-    slugs: list[str] = []
+    films: list[dict[str, object]] = []
+    seen: set[str] = set()
     for item in payload.get("data") or []:
-        if item.get("type") != "film":
+        if not isinstance(item, dict):
             continue
-        slug = item.get("slug")
-        if not slug:
+        kind = item.get("type")
+        if kind not in (None, "film"):
             continue
-        slugs.append(slug)
-        if len(slugs) >= limit:
+        slug = normalize_letterboxd_film_slug(str(item.get("slug") or ""))
+        if not slug or slug in seen:
+            continue
+        title = item.get("name") or item.get("originalName")
+        if not isinstance(title, str) or not title.strip():
+            title = slug.replace("-", " ")
+        year = item.get("year") if item.get("year") is not None else item.get("releaseYear")
+        year_value = year if isinstance(year, int) else None
+        films.append(
+            {
+                "slug": slug,
+                "title": title.strip(),
+                "year": year_value,
+                "directors": _autocomplete_director_names(item.get("directors")),
+            }
+        )
+        seen.add(slug)
+        if len(films) >= limit:
             break
     time.sleep(delay)
-    return slugs
+    return films
+
+
+def letterboxd_autocomplete_slugs(
+    query: str,
+    delay: float,
+    limit: int = 5,
+) -> list[str]:
+    return [
+        str(film["slug"])
+        for film in letterboxd_autocomplete_films(query, delay, limit=limit)
+        if film.get("slug")
+    ]
 
 
 def parse_primary_language(html_text: str) -> str | None:
@@ -749,6 +817,10 @@ _SYNOPSIS_RE = re.compile(
 _POSTER_RE = re.compile(
     r'"image"\s*:\s*"(https://a\.ltrbxd\.com/resized/(?:film-poster|sm/upload)/[^"]+)"'
 )
+_BACKDROP_RE = re.compile(
+    r'\bdata-backdrop="(https://a\.ltrbxd\.com/resized/[^"]+)"',
+    re.IGNORECASE,
+)
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -782,13 +854,31 @@ def parse_letterboxd_poster(html_text: str) -> str | None:
     return letterboxd_poster_url(match.group(1))
 
 
+def letterboxd_backdrop_url(value: object) -> str | None:
+    """The wide header image on a Letterboxd film page, not the vertical poster."""
+    if not isinstance(value, str) or not value.startswith("https://a.ltrbxd.com/resized/"):
+        return None
+    if "/film-poster/" in value or "-0-600-0-900-crop" in value or "-crop" not in value:
+        return None
+    return value
+
+
+def parse_letterboxd_backdrop(html_text: str) -> str | None:
+    """Backdrop URL from the film page header. Films without one are left out."""
+    match = _BACKDROP_RE.search(html_text)
+    if not match:
+        return None
+    return letterboxd_backdrop_url(html.unescape(match.group(1)))
+
+
 def parse_letterboxd_film_card(html_text: str) -> dict[str, object]:
-    """Community score, synopsis, and poster from a Letterboxd film page."""
+    """Community score, synopsis, poster, and backdrop from a Letterboxd film page."""
     rating = parse_letterboxd_film(html_text)[2]
     return {
         "rating": rating,
         "synopsis": parse_letterboxd_synopsis(html_text) or "",
         "poster": parse_letterboxd_poster(html_text),
+        "backdrop": parse_letterboxd_backdrop(html_text),
     }
 
 
@@ -808,6 +898,21 @@ def apply_nonstop_metadata(
         movie.year = release_year
     if nonstop_director and not movie.directors:
         movie.directors = [nonstop_director]
+
+
+_POSTER_BY_URL: dict[str, str] = {}
+_BACKDROP_BY_URL: dict[str, str] = {}
+
+
+def remember_letterboxd_poster(url: str, html_text: str) -> None:
+    """Keep the poster and wide header from a film page we already downloaded."""
+    key = url.rstrip("/") + "/"
+    poster = parse_letterboxd_poster(html_text)
+    if poster and url:
+        _POSTER_BY_URL[key] = poster
+    backdrop = parse_letterboxd_backdrop(html_text)
+    if backdrop and url:
+        _BACKDROP_BY_URL[key] = backdrop
 
 
 def apply_letterboxd_candidate(
@@ -840,6 +945,54 @@ def apply_letterboxd_candidate(
     if isinstance(duration_minutes, int) and duration_minutes > 0:
         movie.duration_minutes = duration_minutes
     movie.duration_known = True
+    key = url.rstrip("/") + "/"
+    poster = _POSTER_BY_URL.get(key)
+    if poster:
+        movie.letterboxd_poster_url = poster
+    backdrop = _BACKDROP_BY_URL.get(key)
+    if backdrop:
+        movie.letterboxd_backdrop_url = backdrop
+
+
+def apply_manual_letterboxd_match(movie: Movie, slug: str, delay: float) -> None:
+    """Attach the Letterboxd page the viewer picked, without identity checks."""
+    normalized = normalize_letterboxd_film_slug(slug)
+    if not normalized:
+        raise ValueError("That is not a Letterboxd film address.")
+    candidate, error = _letterboxd_fetch_candidate(normalized, delay)
+    if error:
+        raise RuntimeError(error)
+    if candidate is None:
+        raise ValueError("Letterboxd has no film at that address.")
+    (
+        url,
+        lb_title,
+        lb_year,
+        rating,
+        genres,
+        directors,
+        primary_language,
+        original_title,
+        original_language,
+        _actors,
+        duration,
+    ) = candidate
+    apply_letterboxd_candidate(
+        movie,
+        url,
+        lb_title,
+        lb_year,
+        rating,
+        genres,
+        directors,
+        primary_language,
+        original_title,
+        original_language,
+        duration,
+    )
+    movie.manual_match = True
+    movie.match_current = True
+    movie.note = None
 
 
 def letterboxd_slug_candidates(
@@ -930,6 +1083,7 @@ def _letterboxd_fetch_candidate(
     if status != 200 or "/film/" not in final_url:
         return None, None
 
+    remember_letterboxd_poster(final_url, body)
     (
         lb_title,
         lb_year,

@@ -5,6 +5,7 @@
   var overallLabel = document.getElementById("build-overall-label");
   var tagline = document.getElementById("build-tagline");
   var errorBox = document.getElementById("build-error");
+  var back = document.getElementById("build-back");
   var timer = null;
 
   function pct(value) {
@@ -50,6 +51,8 @@
         tagline.textContent = running.detail
           ? running.label + " — " + running.detail
           : running.label + "…";
+      } else if (percent >= 100) {
+        tagline.textContent = "Opening the pages…";
       } else {
         tagline.textContent = "Fetching the Nonstop program and Letterboxd data.";
       }
@@ -63,6 +66,7 @@
         errorBox.textContent = "";
       }
     }
+    if (back) back.hidden = !(data.phase === "error" && data.resume);
     (data.steps || []).forEach(function (step) {
       var row = stepsRoot.querySelector('[data-step="' + step.id + '"]');
       if (!row) return;
@@ -98,6 +102,15 @@
       })
       .then(render)
       .catch(function () {});
+  }
+
+  if (back) {
+    back.addEventListener("click", function () {
+      back.disabled = true;
+      fetch("/api/progress/dismiss", { method: "POST" }).finally(function () {
+        window.location.href = "/";
+      });
+    });
   }
 
   poll();

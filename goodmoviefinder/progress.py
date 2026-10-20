@@ -23,39 +23,78 @@ STEP_DEFS: tuple[tuple[str, str], ...] = (
 
 _tracker: BuildProgress | None = None
 _active_step: ContextVar[str | None] = ContextVar("progress_step", default=None)
+_build_generation: ContextVar[int | None] = ContextVar("progress_generation", default=None)
 
 
 class BuildProgress:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._generation = 0
         self.phase = "starting"
         self.program_ready = False
         self.error: str | None = None
+        self._can_resume = False
+        self._hold_until_seen = False
+        self._reveal_next = False
+        self._queued_program = False
+        self._queued_ready = False
         self.steps: dict[str, dict[str, object]] = {
-            step_id: {
-                "id": step_id,
-                "label": label,
-                "status": "pending",
-                "current": 0,
-                "total": None,
-                "detail": "",
-            }
-            for step_id, label in STEP_DEFS
+            step_id: _blank_step(step_id, label) for step_id, label in STEP_DEFS
         }
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
+            self._release_held()
             steps = [dict(step) for step in self.steps.values()]
             return {
                 "phase": self.phase,
                 "programReady": self.program_ready,
                 "error": self.error,
+                "resume": self.phase == "error" and self._can_resume,
                 "overall": _overall(steps),
                 "steps": steps,
             }
 
+    def restart(
+        self,
+        *,
+        done: dict[str, str] | None = None,
+        skipped: dict[str, str] | None = None,
+    ) -> int:
+        """Start another visible build. Returns the generation the worker should adopt."""
+        done = done or {}
+        skipped = skipped or {}
+        with self._lock:
+            self._generation += 1
+            self.phase = "running"
+            self.program_ready = False
+            self.error = None
+            self._can_resume = True
+            self._hold_until_seen = True
+            self._reveal_next = False
+            self._queued_program = False
+            self._queued_ready = False
+            for step_id, label in STEP_DEFS:
+                step = self.steps[step_id]
+                step.clear()
+                step.update(_blank_step(step_id, label))
+                if step_id in done:
+                    step["status"] = "done"
+                    step["detail"] = done[step_id]
+                elif step_id in skipped:
+                    step["status"] = "skipped"
+                    step["detail"] = skipped[step_id]
+            return self._generation
+
     def start(self, step_id: str, *, total: int | None = None, detail: str = "") -> None:
         with self._lock:
+            if not self._accepts():
+                return
             self.phase = "running"
             step = self.steps[step_id]
             step["status"] = "running"
@@ -74,6 +113,8 @@ class BuildProgress:
         detail: str | None = None,
     ) -> None:
         with self._lock:
+            if not self._accepts():
+                return
             step = self.steps[step_id]
             if step["status"] == "pending":
                 step["status"] = "running"
@@ -87,6 +128,8 @@ class BuildProgress:
 
     def finish(self, step_id: str, *, detail: str = "") -> None:
         with self._lock:
+            if not self._accepts():
+                return
             step = self.steps[step_id]
             step["status"] = "done"
             if step["total"] is not None:
@@ -98,14 +141,22 @@ class BuildProgress:
 
     def skip(self, step_id: str, detail: str = "Skipped") -> None:
         with self._lock:
+            if not self._accepts():
+                return
             step = self.steps[step_id]
             step["status"] = "skipped"
             step["detail"] = detail
 
     def fail(self, message: str, step_id: str | None = None) -> None:
         with self._lock:
+            if not self._accepts():
+                return
             self.phase = "error"
             self.error = message
+            self._hold_until_seen = False
+            self._reveal_next = False
+            self._queued_program = False
+            self._queued_ready = False
             if step_id is not None:
                 step = self.steps[step_id]
                 step["status"] = "error"
@@ -113,18 +164,80 @@ class BuildProgress:
 
     def mark_program(self) -> None:
         with self._lock:
+            if not self._accepts():
+                return
+            self._can_resume = True
+            if self._hold_until_seen or self._reveal_next:
+                self._queued_program = True
+                return
             self.program_ready = True
 
     def ready(self) -> None:
         with self._lock:
-            self.phase = "ready"
-            self.program_ready = True
-            self.error = None
+            if not self._accepts():
+                return
+            self._can_resume = True
+            if self._hold_until_seen or self._reveal_next:
+                self._queued_ready = True
+                self._queued_program = True
+                return
+            self._mark_ready()
+
+    def resume(self) -> bool:
+        """Leave an account-switch error and show the pages already on disk."""
+        with self._lock:
+            if self.phase != "error" or not self._can_resume:
+                return False
+            self._mark_ready()
+            return True
+
+    def _mark_ready(self) -> None:
+        self.phase = "ready"
+        self.program_ready = True
+        self.error = None
+        self._hold_until_seen = False
+        self._reveal_next = False
+        self._queued_program = False
+        self._queued_ready = False
+
+    def _accepts(self) -> bool:
+        """True when this thread is still the build allowed to publish progress."""
+        generation = _build_generation.get()
+        if generation is None:
+            return True
+        return generation == self._generation
+
+    def _release_held(self) -> None:
+        """Keep a rebuild on screen until the building page has polled twice.
+
+        The first poll learns that the page was seen. If the work already
+        finished, the next poll is the one that opens the finished pages.
+        """
+        if self._reveal_next:
+            if self.phase != "error":
+                if self._queued_ready:
+                    self._mark_ready()
+                elif self._queued_program:
+                    self.program_ready = True
+            self._queued_ready = False
+            self._queued_program = False
+            self._reveal_next = False
+            return
+        if not self._hold_until_seen:
+            return
+        self._hold_until_seen = False
+        if self.phase != "error" and (self._queued_ready or self._queued_program):
+            self._reveal_next = True
 
 
 def bind(tracker: BuildProgress | None) -> None:
     global _tracker
     _tracker = tracker
+
+
+def adopt(generation: int) -> None:
+    """Mark this thread as the owner of a build generation."""
+    _build_generation.set(generation)
 
 
 def get() -> BuildProgress | None:
@@ -144,7 +257,11 @@ def step(step_id: str, *, total: int | None = None, detail: str = ""):
             tracker.fail(str(exc), step_id)
         raise
     else:
-        if tracker is not None and tracker.steps[step_id]["status"] == "running":
+        if (
+            tracker is not None
+            and tracker._accepts()
+            and tracker.steps[step_id]["status"] == "running"
+        ):
             tracker.finish(step_id)
     finally:
         _active_step.reset(token)
@@ -166,6 +283,17 @@ def tick(
     if tracker is None or not step_id:
         return
     tracker.update(step_id, current=current, total=total, detail=detail)
+
+
+def _blank_step(step_id: str, label: str) -> dict[str, object]:
+    return {
+        "id": step_id,
+        "label": label,
+        "status": "pending",
+        "current": 0,
+        "total": None,
+        "detail": "",
+    }
 
 
 def _overall(steps: list[dict[str, object]]) -> float:
@@ -225,6 +353,7 @@ def format_progress_html() -> str:
     <p class="build-overall-label" id="build-overall-label">0%</p>
     <div class="build-bar build-bar-overall" id="build-overall"><span></span></div>
     <p class="build-error" id="build-error" hidden></p>
+    <button type="button" class="btn build-back" id="build-back" hidden>Back to the pages</button>
   </section>
   <main>
     <ol class="build-steps panel" id="build-steps">{rows}</ol>
