@@ -1286,8 +1286,10 @@ def format_html(
     serve_port: int = DEFAULT_SERVE_PORT,
     busy_intervals: list[dict[str, str]] | None = None,
     calendar_status: str = "",
+    calendar_sources: list[str] | None = None,
     signed_in: bool = True,
     following_user: str | None = None,
+    letterboxd_avatar: str = "",
 ) -> str:
     """The Nonstop Kino page: List, Calendar and Plan tabs."""
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
@@ -1449,6 +1451,20 @@ def format_html(
         {"intervals": busy_intervals or []},
         ensure_ascii=False,
     ).replace("<", "\\u003c")
+    connected = set(calendar_sources or [])
+    calendar_buttons = []
+    for source, label in (("google", "Google Calendar"), ("apple", "Apple Calendar")):
+        on = source in connected
+        pressed = "true" if on else "false"
+        text = label if on else f"Add {label}"
+        title = f"Stop using {label}" if on else f"Skip showtimes that overlap {label}"
+        calendar_buttons.append(
+            f'<button type="button" class="plan-calendar-add" data-calendar="{source}" '
+            f'aria-pressed="{pressed}" title="{html.escape(title)}">{text}</button>'
+        )
+    connect_html = (
+        f'<div class="plan-calendars" id="plan-calendars">{"".join(calendar_buttons)}</div>'
+    )
     bar_hidden = "" if calendar_status else " hidden"
     status_html = (
         f'<div class="plan-calendar-bar" id="plan-calendar-bar"{bar_hidden}>'
@@ -1527,6 +1543,7 @@ def format_html(
     </div>
     <div id="plan-view" role="tabpanel" aria-labelledby="tab-plan" hidden>
       <div class="plan-board">
+        {connect_html}
         {status_html}
         <p class="empty-hint" id="plan-empty">Add films from the list or calendar with the + button. A plan holds up to 12.</p>
         <div class="plan-picked" id="plan-picked" hidden>
@@ -1580,6 +1597,7 @@ def format_html(
             "port": serve_port,
             "stamp": settings_stamp(letterboxd_user, selected),
             "followingUser": following_user or letterboxd_user,
+            "letterboxdAvatar": letterboxd_avatar,
         },
         scripts=("page.js", "shell.js", "plan.js"),
         styles=("base.css", "nonstop.css"),

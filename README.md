@@ -53,16 +53,11 @@ python3 goodmoviefinder.py --serve
 
 # Disable watched/watchlist filtering
 python3 goodmoviefinder.py --no-letterboxd-profile
-
-# Keep the plan off times you are already busy
-python3 goodmoviefinder.py --calendar google
-python3 goodmoviefinder.py --calendar apple
-python3 goodmoviefinder.py --calendar apple --calendar google
 ```
 
 ## Calendar
 
-`--calendar` is remembered, including for `--serve`. Pass `--no-calendar` to stop. The plan then skips a showtime that overlaps a timed event on that calendar. Pass the flag twice to use Apple and Google together. The plan board marks busy hours in red. **Add plan to calendar** writes the scheduled films onto the connected calendar, clears that list, and reads the calendar again so those times show as busy. Apple uses the calendar it keeps for new events. Clicking again does not duplicate them. **Refresh calendar** reads the busy times again without re-running the script (needs `--serve`). The page stores only the busy start and end, in Vienna local time. All-day events, events marked free, cancelled events, and events you declined are ignored. A meeting that ends when the film starts does not block it. If a calendar cannot be read, the page is still written and the plan says that source was skipped.
+On the Plan tab, **Add Google Calendar** and **Add Apple Calendar** connect a calendar and remember it. The plan then skips a showtime that overlaps a timed event on a connected calendar. Both can be on together. Click a connected calendar again to stop using it. The plan board marks busy hours in red. **Add plan to calendar** writes the scheduled films onto the connected calendar, clears that list, and reads the calendar again so those times show as busy. Apple uses the calendar it keeps for new events. Clicking again does not duplicate them. **Refresh calendar** reads the busy times again without re-running the script (needs the local server). The page stores only the busy start and end, in Vienna local time. All-day events, events marked free, cancelled events, and events you declined are ignored. A meeting that ends when the film starts does not block it. If a calendar cannot be read, the page is still written and the plan says that source was skipped.
 
 Google Calendar, once:
 
@@ -71,11 +66,11 @@ Google Calendar, once:
 3. Publish the app so the login lasts. The first approval shows an unverified-app warning. That is expected for a private script. Leaving the app in Testing makes Google drop the login after 7 days.
 4. Create an OAuth client of type Desktop. Save the downloaded JSON as `cache/google-client.json`.
 
-The first `--calendar google` run opens a browser to approve access and stores the login in `cache/google-token.json`.
+The first **Add Google Calendar** click opens a browser to approve access and stores the login in `cache/google-token.json`.
 
 Apple Calendar, once:
 
-The first `--calendar apple` run builds a small helper and macOS asks to allow **goodmoviefinder** to read your calendars. Allow it. That prompt is for the helper, not for Python. The script stores times and discards titles. If you already denied access, turn goodmoviefinder on in System Settings → Privacy & Security → Calendars and run the command again.
+The first **Add Apple Calendar** click builds a small helper and macOS asks to allow **goodmoviefinder** to read your calendars. Allow it. That prompt is for the helper, not for Python. The script stores times and discards titles. If you already denied access, turn goodmoviefinder on in System Settings → Privacy & Security → Calendars and click the button again.
 
 Selected calendars on each account are included. A holiday calendar is all-day, so it does not wipe a day of films.
 

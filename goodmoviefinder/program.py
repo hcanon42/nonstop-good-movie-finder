@@ -80,6 +80,28 @@ def attach_program(movie: Movie, film: ProgramFilm) -> None:
     movie.poster_url = film.poster_url
 
 
+def _streaming_posters() -> dict[str, str]:
+    """Posters already saved while looking up where a film streams."""
+    from goodmoviefinder.letterboxd import letterboxd_poster_url
+    from goodmoviefinder.streaming import load_streaming_cache
+
+    loaded = load_streaming_cache()
+    entries = loaded.get("entries") if isinstance(loaded, dict) else None
+    if not isinstance(entries, dict):
+        return {}
+    posters: dict[str, str] = {}
+    for slug, raw in entries.items():
+        if not isinstance(slug, str) or not isinstance(raw, dict):
+            continue
+        details = raw.get("details")
+        if not isinstance(details, dict):
+            continue
+        poster = letterboxd_poster_url(details.get("poster"))
+        if poster:
+            posters[slug] = poster
+    return posters
+
+
 def apply_known_letterboxd_posters(movies: list[Movie], cache: dict) -> None:
     """Use a saved Letterboxd poster when this program film was recognized."""
     import json
@@ -103,6 +125,7 @@ def apply_known_letterboxd_posters(movies: list[Movie], cache: dict) -> None:
                 for slug, url in raw.items()
                 if isinstance(slug, str) and letterboxd_poster_url(url)
             }
+    streaming_posters = _streaming_posters()
     for movie in movies:
         if letterboxd_poster_url(movie.letterboxd_poster_url):
             continue
@@ -114,6 +137,8 @@ def apply_known_letterboxd_posters(movies: list[Movie], cache: dict) -> None:
             feature = features.get(slug)
             if isinstance(feature, dict):
                 poster = letterboxd_poster_url(feature.get("poster"))
+        if poster is None:
+            poster = streaming_posters.get(slug)
         if poster:
             movie.letterboxd_poster_url = poster
 

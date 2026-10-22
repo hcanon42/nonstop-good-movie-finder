@@ -266,6 +266,17 @@ def start_server(state: Any, port: int, *, open_browser: bool = True) -> Threadi
                     return
                 self._send(200, json.dumps({"ok": True, "reload": reload}), "application/json")
                 return
+            if path == "/api/calendar":
+                try:
+                    saved = page.set_calendar(payload)
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    self._send(502, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                self._send(200, json.dumps({"ok": True, **saved}), "application/json")
+                return
             if path == "/api/plan":
                 try:
                     saved = page.save_plan(payload)

@@ -165,6 +165,26 @@
     }
     .account-name:hover,
     .account-name[aria-expanded="true"] { background: var(--surface-raised); color: var(--lb); }
+    .account-letterboxd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      min-height: 2.2rem;
+      padding: 0 0.7rem;
+      border-left: 1px solid var(--line);
+      color: var(--lb);
+      text-decoration: none;
+      transition: background-color var(--dur) var(--ease), color var(--dur) var(--ease);
+    }
+    .account-letterboxd:hover { background: var(--surface-raised); color: var(--text); }
+    .account-letterboxd-mark {
+      width: 0.95rem;
+      height: 0.95rem;
+      background: currentColor;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath fill='black' d='M1.6 1.4h4.1v9.2H1.6zm4.9.4 4 1.2v7.2l-4 1.2V1.8zm1.7 4.6a.7.7 0 1 0 .02-1.4.7.7 0 0 0-.02 1.4z'/%3E%3C/svg%3E") center / contain no-repeat;
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath fill='black' d='M1.6 1.4h4.1v9.2H1.6zm4.9.4 4 1.2v7.2l-4 1.2V1.8zm1.7 4.6a.7.7 0 1 0 .02-1.4.7.7 0 0 0-.02 1.4z'/%3E%3C/svg%3E") center / contain no-repeat;
+    }
     .account-open:hover,
     .account-open[aria-expanded="true"] { border-color: var(--gold); }
     .account-chip .account-open:hover,
@@ -182,6 +202,7 @@
       font-size: 0.8rem;
       font-weight: 700;
       text-transform: uppercase;
+      object-fit: cover;
     }
     .account.is-signed-out .account-avatar { background: var(--surface-raised); color: var(--muted); }
     .account-caret {
@@ -862,29 +883,137 @@
     .chip-new { background: var(--ok-soft); color: var(--ok); }
     .taste-intro {
       margin: 0 0 1.35rem;
-      padding: 1.15rem 1.3rem 1.15rem 1.2rem;
-      background: var(--surface);
+      padding: 1rem 1.1rem 1.05rem;
+      background:
+        linear-gradient(180deg, rgba(232, 184, 74, 0.08), transparent 38%),
+        var(--surface);
       border: 1px solid var(--line);
-      border-left: 3px solid var(--rec);
       border-radius: var(--radius-lg);
     }
+    .taste-head {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 0.2rem;
+      margin-bottom: 0.85rem;
+    }
     .taste-kicker {
-      margin: 0 0 0.35rem;
+      margin: 0;
       font-size: 0.72rem;
       font-weight: 650;
       letter-spacing: 0.08em;
       text-transform: uppercase;
-      color: var(--rec);
+      color: var(--gold);
+    }
+    .taste-scope {
+      margin: 0;
+      color: var(--faint);
+      font-size: 0.78rem;
+      line-height: 1.35;
+    }
+    .taste-groups {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 0.7rem;
+    }
+    .taste-groups.is-single { grid-template-columns: minmax(0, 1fr); }
+    .taste-group {
+      margin: 0;
+      padding: 0.75rem 0.9rem 0.85rem;
+      border-radius: var(--radius-md);
+      background: var(--inset);
+    }
+    .taste-group-loved { box-shadow: inset 2px 0 0 var(--gold); }
+    .taste-group-lower { box-shadow: inset 2px 0 0 var(--warn); }
+    .taste-label {
+      margin: 0 0 0.45rem;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--faint);
+    }
+    .taste-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .taste-list li {
+      font-size: 0.92rem;
+      line-height: 1.35;
+      color: var(--text);
+    }
+    .taste-group-lower .taste-list li { color: var(--muted); }
+    .taste-aside {
+      margin: 0.75rem 0 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.4;
+    }
+    .taste-readout {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+      gap: 0.85rem 1.25rem;
+      margin-top: 0.9rem;
+      padding-top: 0.85rem;
+      border-top: 1px solid var(--line);
+    }
+    .taste-stat-label {
+      margin: 0;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--faint);
+    }
+    .taste-stat-label span {
+      margin-left: 0.45rem;
+      font-weight: 600;
+      letter-spacing: 0;
+      text-transform: none;
+      color: var(--muted);
+    }
+    .taste-stat-value {
+      margin: 0.12rem 0 0;
+      font-size: 1.55rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.1;
+    }
+    .taste-stat-value.is-empty {
+      color: var(--muted);
+      font-size: 1.25rem;
+      font-weight: 600;
+    }
+    .taste-stat-caption {
+      margin: 0.2rem 0 0;
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.35;
+    }
+    .taste-caveat {
+      margin: 0.65rem 0 0;
+      color: var(--faint);
+      font-size: 0.8rem;
     }
     .taste-lead {
       margin: 0;
-      font-size: 1.05rem;
+      font-size: 1.02rem;
       line-height: 1.5;
     }
     .taste-intro .taste-note {
-      margin-top: 0.55rem;
+      margin: 0.85rem 0 0;
+      padding-top: 0.8rem;
+      border-top: 1px solid var(--line);
       color: var(--muted);
-      font-size: 0.92rem;
+      font-size: 0.88rem;
+    }
+    @media (max-width: 720px) {
+      .taste-groups { grid-template-columns: minmax(0, 1fr); }
     }
     .muted { color: var(--muted); }
     .note { color: var(--warn-ink); cursor: help; }

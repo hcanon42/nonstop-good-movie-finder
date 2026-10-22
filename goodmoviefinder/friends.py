@@ -8,15 +8,19 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 from pathlib import Path
 from typing import Any
 
 from goodmoviefinder.html import _rating_style
+from goodmoviefinder.http import fetch
 from goodmoviefinder.letterboxd import (
     LetterboxdRefused,
     fetch_letterboxd_html,
     fetch_letterboxd_profile_slugs,
+    letterboxd_member_url,
+    parse_member_avatar,
 )
 
 FRIEND_CACHE_MAX_AGE = 6 * 60 * 60
@@ -330,12 +334,30 @@ def _clean_watchlist_members(
 
 
 def fetch_friend_watchlist_page(user: str, slug: str, delay: float) -> list[dict[str, object]] | None:
-    """Friends who have this film on their watchlist, from Letterboxd's in-watchlist page."""
+    """Friends on Letterboxd's in-watchlist page.
+
+    Signed-out requests for that page are forbidden, so a 403 or 404 means
+    this source cannot be used.
+    """
     url = _friend_watchlist_url(user, slug)
     try:
-        pages = _fetch_pages(url, delay)
-    except (LetterboxdRefused, RuntimeError):
+        first = fetch(url)
+    except (urllib.error.HTTPError, urllib.error.URLError):
         return None
+    if not _watchlist_page_ok(first):
+        return None
+    pages = [first]
+    current = _next_page(first)
+    seen = {url}
+    while current and current not in seen and len(pages) < _MAX_PAGES:
+        seen.add(current)
+        _pause(delay)
+        try:
+            body = fetch_letterboxd_html(current, delay)
+        except (LetterboxdRefused, RuntimeError):
+            break
+        pages.append(body)
+        current = _next_page(body)
     if not pages or not _watchlist_page_ok(pages[0]):
         return None
     rows: list[dict[str, object]] = []
@@ -364,7 +386,13 @@ def _member_watchlist_slugs(path: Path, username: str, delay: float) -> set[str]
         ):
             return {slug for slug in raw_slugs if isinstance(slug, str)}
     try:
-        slugs = fetch_letterboxd_profile_slugs(username, "watchlist", delay)
+        slugs = fetch_letterboxd_profile_slugs(
+            username,
+            "watchlist",
+            delay,
+            max_pages=120,
+            require_first_page=True,
+        )
     except (LetterboxdRefused, RuntimeError) as exc:
         if isinstance(record, dict) and isinstance(record.get("slugs"), list):
             print(
@@ -416,17 +444,23 @@ def fetch_friend_watchlist(
     watchlists_path: Path,
     *,
     rated_usernames: set[str],
-    public_fallback: bool = False,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], str]:
+    """Friends with this film on a watchlist, and which source answered.
+
+    The source is ``page`` when Letterboxd's in-watchlist page loads, and
+    ``public`` when that page is blocked and each followed member's public
+    watchlist is checked instead.
+    """
     rows = fetch_friend_watchlist_page(user, slug, delay)
     if rows is not None:
-        return _clean_watchlist_members(
-            rows,
-            viewer=user,
-            rated_usernames=rated_usernames,
+        return (
+            _clean_watchlist_members(
+                rows,
+                viewer=user,
+                rated_usernames=rated_usernames,
+            ),
+            "page",
         )
-    if not public_fallback:
-        return []
     found = fetch_friend_watchlist_from_public_lists(
         user,
         slug,
@@ -434,10 +468,13 @@ def fetch_friend_watchlist(
         following_path,
         watchlists_path,
     )
-    return _clean_watchlist_members(
-        found,
-        viewer=user,
-        rated_usernames=rated_usernames,
+    return (
+        _clean_watchlist_members(
+            found,
+            viewer=user,
+            rated_usernames=rated_usernames,
+        ),
+        "public",
     )
 
 
@@ -540,11 +577,63 @@ def ensure_following_list(path: Path, user: str, delay: float) -> list[dict[str,
         return members
 
 
+def cached_member_avatar(path: Path, user: str) -> str | None:
+    """Saved profile photo for the signed-in member, if any."""
+    if not _USER_RE.fullmatch(user):
+        return None
+    with _LOCK:
+        cache = _load_cache(path)
+        record = cache.get(user.casefold())
+        if not isinstance(record, dict):
+            return None
+        raw = record.get("self_avatar")
+        return _avatar(raw) if isinstance(raw, str) else None
+
+
+def ensure_member_avatar(path: Path, user: str, delay: float) -> str | None:
+    """Profile photo from the member page, cached with the following list."""
+    if not _USER_RE.fullmatch(user):
+        return None
+    with _LOCK:
+        cache = _load_cache(path)
+        record = cache.get(user.casefold())
+        if isinstance(record, dict):
+            fetched = record.get("self_avatar_fetched_at", 0)
+            if int(fetched) and time.time() - int(fetched) < FRIEND_CACHE_MAX_AGE:
+                raw = record.get("self_avatar")
+                if isinstance(raw, str):
+                    return _avatar(raw)
+    try:
+        body = fetch_letterboxd_html(letterboxd_member_url(user), delay)
+        avatar = _avatar(parse_member_avatar(body))
+    except (LetterboxdRefused, RuntimeError, urllib.error.URLError) as exc:
+        stale = cached_member_avatar(path, user)
+        if stale is not None:
+            print(
+                f"Profile photo for @{user} failed ({exc}); using the saved photo.",
+                file=sys.stderr,
+            )
+            return stale
+        return None
+    with _LOCK:
+        cache = _load_cache(path)
+        key = user.casefold()
+        record = cache.get(key)
+        if not isinstance(record, dict):
+            record = {"fetched_at": 0, "friends": []}
+        record["self_avatar"] = avatar
+        record["self_avatar_fetched_at"] = int(time.time())
+        cache[key] = record
+        _save_cache(path, cache)
+    return avatar
+
+
 def present_following_list(
     members: list[dict[str, object]],
     *,
     root_user: str,
     active_user: str,
+    root_avatar: str | None = None,
 ) -> dict[str, object]:
     """JSON for the account switcher, with the signed-in member first."""
     root_key = root_user.casefold()
@@ -554,6 +643,12 @@ def present_following_list(
     root_member = by_user.get(root_key)
     if root_member is None:
         root_member = {"username": root_user, "name": root_user, "avatar": None}
+    if root_avatar:
+        root_member = dict(root_member)
+        root_member["avatar"] = _prefer_avatar(
+            root_member.get("avatar") if isinstance(root_member.get("avatar"), str) else None,
+            root_avatar,
+        )
     ordered.append(root_member)
     for item in members:
         key = str(item["username"]).casefold()
@@ -755,12 +850,22 @@ def _cached_friend_panel(
     return friends, watchlist
 
 
+def _watchlist_resolved(record: dict[str, Any]) -> bool:
+    """True when this film's watchlist matches came from a real lookup.
+
+    An empty list saved after the in-watchlist page was forbidden is not resolved.
+    """
+    return record.get("watchlist_via") in {"page", "public"}
+
+
 def _write_friend_panel(
     path: Path,
     user: str,
     slug: str,
     friends: list[dict[str, object]],
     watchlist: list[dict[str, object]],
+    *,
+    watchlist_via: str | None = None,
 ) -> None:
     with _LOCK:
         cache = _load_cache(path)
@@ -768,11 +873,14 @@ def _write_friend_panel(
         if not isinstance(bucket, dict):
             bucket = {}
             cache[user.casefold()] = bucket
-        bucket[slug] = {
+        entry: dict[str, object] = {
             "fetched_at": int(time.time()),
             "friends": friends,
             "watchlist": watchlist,
         }
+        if watchlist_via in {"page", "public"}:
+            entry["watchlist_via"] = watchlist_via
+        bucket[slug] = entry
         _save_cache(path, cache)
 
 
@@ -792,44 +900,48 @@ def ensure_friend_ratings(
         raise ValueError("That film slug is not valid.")
     following_path = following_path or path.parent / "following.json"
     watchlists_path = watchlists_path or path.parent / "friend-watchlists.json"
+    cached_friends: list[dict[str, object]] | None = None
     with _LOCK:
         cache = _load_cache(path)
         users = cache.get(user.casefold())
         record = users.get(slug) if isinstance(users, dict) else None
         if isinstance(record, dict):
             fresh = _cached_friend_panel(record, allow_stale=False)
-            if fresh is not None:
+            if fresh is not None and _watchlist_resolved(record):
                 return fresh
-    friends: list[dict[str, object]] | None = None
-    last_exc: Exception | None = None
-    pause = max(delay, 1.0)
-    for attempt in range(4):
-        try:
-            friends = fetch_friend_ratings(user, slug, delay)
-            break
-        except (LetterboxdRefused, RuntimeError) as exc:
-            last_exc = exc
-            if attempt < 3:
-                time.sleep(pause * (attempt + 2))
-                continue
+            if fresh is not None:
+                cached_friends = fresh[0]
+    friends = cached_friends
     if friends is None:
-        exc = last_exc or RuntimeError(f"Friend ratings for {slug} failed.")
-        with _LOCK:
-            cache = _load_cache(path)
-            users = cache.get(user.casefold())
-            record = users.get(slug) if isinstance(users, dict) else None
-            stale = (
-                _cached_friend_panel(record, allow_stale=True)
-                if isinstance(record, dict)
-                else None
-            )
-        if stale is not None:
-            print(
-                f"Friend ratings for {slug} failed ({exc}); using the saved list.",
-                file=sys.stderr,
-            )
-            return stale
-        raise exc
+        last_exc: Exception | None = None
+        pause = max(delay, 1.0)
+        for attempt in range(4):
+            try:
+                friends = fetch_friend_ratings(user, slug, delay)
+                break
+            except (LetterboxdRefused, RuntimeError) as exc:
+                last_exc = exc
+                if attempt < 3:
+                    time.sleep(pause * (attempt + 2))
+                    continue
+        if friends is None:
+            exc = last_exc or RuntimeError(f"Friend ratings for {slug} failed.")
+            with _LOCK:
+                cache = _load_cache(path)
+                users = cache.get(user.casefold())
+                record = users.get(slug) if isinstance(users, dict) else None
+                stale = (
+                    _cached_friend_panel(record, allow_stale=True)
+                    if isinstance(record, dict)
+                    else None
+                )
+            if stale is not None:
+                print(
+                    f"Friend ratings for {slug} failed ({exc}); using the saved list.",
+                    file=sys.stderr,
+                )
+                return stale
+            raise exc
     with _LOCK:
         cache = _load_cache(path)
         users = cache.get(user.casefold())
@@ -839,28 +951,37 @@ def ensure_friend_ratings(
             if isinstance(record, dict)
             else None
         )
-    _write_friend_panel(
-        path,
-        user,
-        slug,
-        friends,
-        stale_watchlist if stale_watchlist is not None else [],
-    )
+    if cached_friends is None:
+        _write_friend_panel(
+            path,
+            user,
+            slug,
+            friends,
+            stale_watchlist if stale_watchlist is not None else [],
+        )
     rated_keys = {str(friend["username"]).casefold() for friend in friends}
+    watchlist_via: str | None
     try:
-        watchlist = fetch_friend_watchlist(
+        watchlist, watchlist_via = fetch_friend_watchlist(
             user,
             slug,
             delay,
             following_path,
             watchlists_path,
             rated_usernames=rated_keys,
-            public_fallback=False,
         )
     except (LetterboxdRefused, RuntimeError) as exc:
         print(f"Friend watchlist for {slug}: {exc}", file=sys.stderr)
         watchlist = stale_watchlist if stale_watchlist is not None else []
-    _write_friend_panel(path, user, slug, friends, watchlist)
+        watchlist_via = None
+    _write_friend_panel(
+        path,
+        user,
+        slug,
+        friends,
+        watchlist,
+        watchlist_via=watchlist_via,
+    )
     return friends, watchlist
 
 

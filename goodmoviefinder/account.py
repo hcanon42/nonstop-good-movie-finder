@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import re
 
 from goodmoviefinder.config import DEFAULT_KNOWN_LANGUAGES
 from goodmoviefinder.html import (
@@ -207,6 +208,144 @@ def _watchlist_panel(
     return body, len(films), streamable, at_nonstop
 
 
+_RATING_CHECK = re.compile(
+    r"When the rating model predicted you would like a film, you had rated it "
+    r"4 or higher (\d+)% of the time \((\d+) films\)\."
+)
+_MEMBER_CHECK = re.compile(
+    r"When members like you pointed at a film, you had rated it "
+    r"4 or higher (\d+)% of the time \((\d+) films\)\."
+)
+_RATING_UNCHECKED = "The rating model did not make enough held-out predictions to check."
+_MEMBER_UNCHECKED = "The member model did not make enough held-out predictions to check."
+_MEMBER_MISSING = "Similar members were not available."
+_NOT_CONFIDENT = "That is not confident enough to recommend a film."
+_UNDER_BAR = (
+    "That check is under the usual bar. These are still the strongest predictions from your ratings."
+)
+_RATINGS_ONLY = "These picks use your ratings only."
+
+
+def _film_count(raw: str) -> str:
+    count = int(raw)
+    return "1 film" if count == 1 else f"{count} films"
+
+
+def _taste_readout(note: str) -> tuple[list[tuple[str, str, str, str]] | None, list[str]]:
+    """Stat tiles and short caveats. None means the note should stay as prose."""
+    text = note.strip()
+    if not text:
+        return [], []
+    rating = _RATING_CHECK.search(text)
+    member = _MEMBER_CHECK.search(text)
+    known = bool(
+        rating
+        or member
+        or _RATING_UNCHECKED in text
+        or _MEMBER_UNCHECKED in text
+        or _MEMBER_MISSING in text
+    )
+    if not known:
+        return None, []
+    stats: list[tuple[str, str, str, str]] = []
+    if rating:
+        stats.append(
+            (
+                "Your ratings",
+                f"{rating.group(1)}%",
+                "of predictions you rated 4 or higher",
+                _film_count(rating.group(2)),
+            )
+        )
+    elif _RATING_UNCHECKED in text:
+        stats.append(("Your ratings", "—", "Not enough films to check", ""))
+    if member:
+        stats.append(
+            (
+                "Similar members",
+                f"{member.group(1)}%",
+                "of their picks you rated 4 or higher",
+                _film_count(member.group(2)),
+            )
+        )
+    elif _MEMBER_MISSING in text:
+        stats.append(("Similar members", "—", "Not available", ""))
+    elif _MEMBER_UNCHECKED in text:
+        stats.append(("Similar members", "—", "Not enough overlap to check", ""))
+    caveats: list[str] = []
+    if _NOT_CONFIDENT in text:
+        caveats.append("Not confident enough to recommend a film.")
+    elif _UNDER_BAR in text:
+        caveats.append("Under the usual bar. These are still the strongest predictions from your ratings.")
+    if _RATINGS_ONLY in text:
+        caveats.append(_RATINGS_ONLY)
+    return stats, caveats
+
+
+def _taste_group(kind: str, label: str, phrases: list[str]) -> str:
+    items = "".join(f"<li>{html.escape(phrase)}</li>" for phrase in phrases)
+    return (
+        f'<div class="taste-group taste-group-{kind}">'
+        f'<p class="taste-label">{html.escape(label)}</p>'
+        f'<ul class="taste-list">{items}</ul>'
+        "</div>"
+    )
+
+
+def _taste_intro_html(
+    paragraph: str,
+    note: str,
+    loved: list[str],
+    lower: list[str],
+    *,
+    loved_are_themes: bool,
+) -> str:
+    stats, caveats = _taste_readout(note)
+    parts: list[str] = [
+        '<section class="taste-intro" id="taste">',
+        '<header class="taste-head">',
+        '<p class="taste-kicker">Your taste</p>',
+        '<p class="taste-scope">From across Letterboxd, not only what is playing now.</p>',
+        "</header>",
+    ]
+    if loved or lower:
+        groups: list[str] = []
+        if loved:
+            label = "Rated highly" if loved_are_themes else "You tend to rate highly"
+            groups.append(_taste_group("loved", label, loved))
+        if lower:
+            groups.append(_taste_group("lower", "Sits lower", lower))
+        single = " is-single" if len(groups) == 1 else ""
+        parts.append(f'<div class="taste-groups{single}">{"".join(groups)}</div>')
+        if loved:
+            skip = " It skips what sits lower." if lower else ""
+            parts.append(
+                '<p class="taste-aside">A step outside is a nanogenre you have liked only once or twice.'
+                f"{skip}</p>"
+            )
+    elif paragraph:
+        parts.append(f'<p class="taste-lead">{html.escape(paragraph)}</p>')
+    if stats:
+        tiles = []
+        for label, value, caption, count in stats:
+            empty = " is-empty" if value == "—" else ""
+            count_html = f'<span>{html.escape(count)}</span>' if count else ""
+            tiles.append(
+                '<div class="taste-stat">'
+                f'<p class="taste-stat-label">{html.escape(label)}{count_html}</p>'
+                f'<p class="taste-stat-value{empty}">{html.escape(value)}</p>'
+                f'<p class="taste-stat-caption">{html.escape(caption)}</p>'
+                "</div>"
+            )
+        parts.append(f'<div class="taste-readout">{"".join(tiles)}</div>')
+        if caveats:
+            parts.append(f'<p class="taste-caveat">{html.escape(" ".join(caveats))}</p>')
+    elif note.strip():
+        parts.append(f'<p class="taste-note">{html.escape(note.strip())}</p>')
+    parts.append("</section>")
+    return "".join(parts)
+
+
 def format_taste_panel_html(
     *,
     see_first: list[Movie],
@@ -214,16 +353,20 @@ def format_taste_panel_html(
     step_outside: list[Movie],
     paragraph: str,
     note: str,
+    loved: list[str] | None = None,
+    lower: list[str] | None = None,
+    loved_are_themes: bool = False,
 ) -> tuple[str, str]:
     """Recommendations tab body and nav-pill links (without the Jump to label)."""
     known: frozenset[str] = frozenset()
     sections: list[str] = [
-        '<section class="taste-intro" id="taste">'
-        '<p class="taste-kicker">Your taste</p>'
-        f'<p class="taste-lead">{html.escape(paragraph)}</p>'
-        f'<p class="taste-note">{html.escape(note)} '
-        "Films from across Letterboxd, not only what is playing now.</p>"
-        "</section>"
+        _taste_intro_html(
+            paragraph,
+            note,
+            list(loved or []),
+            list(lower or []),
+            loved_are_themes=loved_are_themes,
+        )
     ]
     for section_id, title, sub, movies, row_class in (
         ("see-first", "See this first", "The strongest prediction that clears the bar", see_first, "row-recommend"),
@@ -285,10 +428,14 @@ def format_account_html(
     step_outside: list[Movie],
     paragraph: str,
     note: str,
+    loved: list[str] | None = None,
+    lower: list[str] | None = None,
+    loved_are_themes: bool = False,
     updated_label: str = "",
     known_languages: list[str] | None = None,
     language_options: list[str] | None = None,
     following_user: str | None = None,
+    letterboxd_avatar: str = "",
 ) -> str:
     """The account page. Signed out, both tabs ask for a Letterboxd username."""
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
@@ -314,6 +461,9 @@ def format_account_html(
             step_outside=step_outside,
             paragraph=paragraph,
             note=note,
+            loved=loved,
+            lower=lower,
+            loved_are_themes=loved_are_themes,
         )
         tagline = f"@{letterboxd_user}'s Letterboxd watchlist, and films picked for you."
         stats = [
@@ -364,6 +514,7 @@ def format_account_html(
         viewer={
             "stamp": settings_stamp(letterboxd_user, selected),
             "followingUser": following_user or letterboxd_user,
+            "letterboxdAvatar": letterboxd_avatar,
         },
         scripts=("page.js", "shell.js"),
         styles=("base.css", "account.css"),

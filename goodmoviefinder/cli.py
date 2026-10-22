@@ -91,14 +91,14 @@ from goodmoviefinder.viewer import (
 def _calendar_for_plan(
     sources: list[str],
     movies: list[Movie],
-) -> tuple[list[dict[str, str]], str]:
+) -> tuple[list[dict[str, str]], str, list[str]]:
     ordered = list(dict.fromkeys(sources))
     if not ordered:
-        return [], ""
+        return [], "", []
     window = fetch_window(movies)
     through = latest_screening_date(movies)
     if window is None or through is None:
-        return [], "No screenings to compare with your calendar."
+        return [], "No screenings to compare with your calendar.", []
     start, end = window
     found = []
     ready: list[str] = []
@@ -125,7 +125,7 @@ def _calendar_for_plan(
             f"Calendar: {len(merged)} busy block(s) through {through.isoformat()}.",
             file=sys.stderr,
         )
-    return interval_payload(merged), status_sentence(ready, failed, through)
+    return interval_payload(merged), status_sentence(ready, failed, through), ready
 
 
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -229,6 +229,9 @@ class ProgramPage:
         self.step_outside: list[Movie] = []
         self.taste_paragraph = ""
         self.taste_note: str | None = None
+        self.taste_loved: list[str] = []
+        self.taste_lower: list[str] = []
+        self.taste_loved_are_themes = False
         self.taste_fetched_at: int | None = None
         self._rec_running = False
         self._rec_error: str | None = None
@@ -249,20 +252,43 @@ class ProgramPage:
         }
 
     def following_list(self) -> dict[str, object]:
-        from goodmoviefinder.friends import ensure_following_list, present_following_list
+        from goodmoviefinder.friends import (
+            ensure_following_list,
+            ensure_member_avatar,
+            present_following_list,
+        )
 
         if self.no_profile:
             raise ValueError("Sign in to switch profiles.")
+        following_path = self.cache_path.parent / "following.json"
         members = ensure_following_list(
-            self.cache_path.parent / "following.json",
-            self.following_user,
+            following_path,
+            self.letterboxd_user,
+            self.delay,
+        )
+        root_avatar = ensure_member_avatar(
+            following_path,
+            self.letterboxd_user,
             self.delay,
         )
         return present_following_list(
             members,
-            root_user=self.following_user,
-            active_user=self.letterboxd_user,
+            root_user=self.letterboxd_user,
+            active_user=self.following_user,
+            root_avatar=root_avatar,
         )
+
+    def _letterboxd_avatar_for_page(self) -> str:
+        if self.no_profile:
+            return ""
+        if self.following_user.casefold() != self.letterboxd_user.casefold():
+            return ""
+        from goodmoviefinder.friends import cached_member_avatar
+
+        return cached_member_avatar(
+            self.cache_path.parent / "following.json",
+            self.letterboxd_user,
+        ) or ""
 
     def search_letterboxd(self, query: str) -> dict[str, object]:
         text = query.strip()
@@ -345,6 +371,9 @@ class ProgramPage:
             step_outside=self.step_outside,
             paragraph=self.taste_paragraph,
             note=self.taste_note or "",
+            loved=self.taste_loved,
+            lower=self.taste_lower,
+            loved_are_themes=self.taste_loved_are_themes,
         )
 
     def recommendations_status(self) -> dict[str, object]:
@@ -415,9 +444,13 @@ class ProgramPage:
             step_outside=self.step_outside,
             paragraph=self.taste_paragraph,
             note=self.taste_note or "",
+            loved=self.taste_loved,
+            lower=self.taste_lower,
+            loved_are_themes=self.taste_loved_are_themes,
             updated_label=recommendations_updated_label(self.taste_fetched_at),
             known_languages=self.languages,
             language_options=choices,
+            letterboxd_avatar=self._letterboxd_avatar_for_page(),
         )
         GENERATED_ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
         GENERATED_ACCOUNT.write_text(account, encoding="utf-8")
@@ -446,6 +479,9 @@ class ProgramPage:
             self.step_outside = []
             self.taste_paragraph = ""
             self.taste_note = None
+            self.taste_loved = []
+            self.taste_lower = []
+            self.taste_loved_are_themes = False
             self.taste_fetched_at = None
             return [], [], [], sort_movies(self.results)
         return partition_program_movies(
@@ -476,8 +512,10 @@ class ProgramPage:
             serve_port=self.port,
             busy_intervals=self.busy_intervals,
             calendar_status=self.calendar_status,
+            calendar_sources=self.calendar_sources,
             signed_in=not self.no_profile,
             following_user=self.following_user,
+            letterboxd_avatar=self._letterboxd_avatar_for_page(),
         )
         GENERATED_HTML.parent.mkdir(parents=True, exist_ok=True)
         GENERATED_HTML.write_text(output, encoding="utf-8")
@@ -489,6 +527,9 @@ class ProgramPage:
         self.step_outside = view.step_outside
         self.taste_paragraph = view.paragraph
         self.taste_note = view.note
+        self.taste_loved = list(view.loved)
+        self.taste_lower = list(view.lower)
+        self.taste_loved_are_themes = view.loved_are_themes
         self.taste_fetched_at = fetched_at
 
     def load_cached_recommendations(self) -> bool:
@@ -629,6 +670,7 @@ class ProgramPage:
         save_viewer(
             self.letterboxd_user,
             self.languages,
+            calendars=self.calendar_sources,
             signed_out=self.signed_out,
             following_user=self.following_user,
         )
@@ -653,11 +695,11 @@ class ProgramPage:
 
     def _switch_worker(self, switch: tuple[str, bool, bool], generation: int) -> None:
         progress.adopt(generation)
-        user, load_profile, refresh = switch
+        user, fetch_profile, refresh = switch
         print(f"Switching to @{user}…", file=sys.stderr)
         try:
             with self._lock:
-                self._switch_to(user, load_profile, refresh)
+                self._switch_to(user, fetch_profile, refresh)
                 tracker = progress.get()
                 if tracker is not None:
                     tracker.ready()
@@ -670,8 +712,8 @@ class ProgramPage:
             with self._lock:
                 self._rebuilding = False
 
-    def _switch_to(self, user: str, load_profile: bool, refresh: bool) -> None:
-        if load_profile:
+    def _switch_to(self, user: str, fetch_profile: bool, refresh: bool) -> None:
+        if fetch_profile:
             with progress.step("profile", detail=f"@{user}"):
                 watched, watchlist, films = load_profile(
                     self.cache,
@@ -710,11 +752,21 @@ class ProgramPage:
             self.letterboxd_user = user
             self.no_profile = False
             self.signed_out = False
+            from goodmoviefinder.friends import ensure_member_avatar
+
+            ensure_member_avatar(
+                self.cache_path.parent / "following.json",
+                user,
+                self.delay,
+            )
             self.see_first = []
             self.like_you = []
             self.step_outside = []
             self.taste_paragraph = ""
             self.taste_note = None
+            self.taste_loved = []
+            self.taste_lower = []
+            self.taste_loved_are_themes = False
             self.taste_fetched_at = None
         self.following_user = user
         self._save_viewer()
@@ -742,7 +794,7 @@ class ProgramPage:
             sources = self.calendar_sources or load_calendars()
             if not sources:
                 raise ValueError(
-                    "No calendar is connected. Run with --calendar apple or --calendar google."
+                    "No calendar is connected. Add Google Calendar or Apple Calendar on the Plan tab."
                 )
             sentences: list[str] = []
             problems: list[str] = []
@@ -777,17 +829,39 @@ class ProgramPage:
             sources = self.calendar_sources or load_calendars()
             if not sources:
                 raise ValueError(
-                    "No calendar is connected. Run with --calendar apple or --calendar google."
+                    "No calendar is connected. Add Google Calendar or Apple Calendar on the Plan tab."
                 )
             return self._reload_calendar_locked()
 
+    def set_calendar(self, payload: dict) -> dict[str, object]:
+        source = str(payload.get("source") or "").strip()
+        if source not in ("apple", "google"):
+            raise ValueError("Choose Google Calendar or Apple Calendar.")
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("Choose whether to use that calendar.")
+        label = "Apple Calendar" if source == "apple" else "Google Calendar"
+        with self._lock:
+            sources = [item for item in self.calendar_sources if item != source]
+            if enabled:
+                sources.append(source)
+            intervals, status, ready = _calendar_for_plan(sources, self.results)
+            if enabled and source not in ready:
+                raise CalendarError(status or f"{label} could not be read.")
+            self.calendar_sources = sources
+            self.busy_intervals = intervals
+            self.calendar_status = status
+            self._save_viewer()
+            self.write()
+            return {"intervals": intervals, "status": status, "sources": list(sources)}
+
     def _reload_calendar_locked(self) -> dict[str, object]:
         sources = self.calendar_sources or load_calendars()
-        intervals, status = _calendar_for_plan(sources, self.results)
+        intervals, status, _ready = _calendar_for_plan(sources, self.results)
         self.busy_intervals = intervals
         self.calendar_status = status
         self.write()
-        return {"intervals": intervals, "status": status}
+        return {"intervals": intervals, "status": status, "sources": list(sources)}
 
 
 def _watchlist_titles_current(
@@ -985,19 +1059,6 @@ def main() -> int:
         default=DEFAULT_SERVE_PORT,
         help=f"Port for --serve (default: {DEFAULT_SERVE_PORT})",
     )
-    parser.add_argument(
-        "--calendar",
-        action="append",
-        choices=("apple", "google"),
-        default=None,
-        metavar="{apple,google}",
-        help="Skip plan showtimes that overlap this calendar (repeat to use both)",
-    )
-    parser.add_argument(
-        "--no-calendar",
-        action="store_true",
-        help="Stop using a saved calendar when planning",
-    )
     args = parser.parse_args()
     try:
         letterboxd_user, known_languages, persist_settings = resolve_settings(
@@ -1011,20 +1072,7 @@ def main() -> int:
     no_profile = args.no_letterboxd_profile or signed_out
     following_user = load_following_user(letterboxd_user) if not no_profile else letterboxd_user
 
-    if args.no_calendar:
-        calendar_sources: list[str] = []
-        persist_calendars = True
-    elif args.calendar:
-        calendar_sources = list(dict.fromkeys(args.calendar))
-        persist_calendars = True
-    else:
-        calendar_sources = load_calendars()
-        persist_calendars = False
-        if calendar_sources:
-            print(
-                "Using saved calendar: " + ", ".join(calendar_sources),
-                file=sys.stderr,
-            )
+    calendar_sources = load_calendars()
 
     hub = ServeHub()
     progress.bind(hub.progress)
@@ -1251,26 +1299,22 @@ def main() -> int:
         ) = partition_program_movies(
             results, watched_ratings, watchlist_slugs, loved_credits
         )
+    screening_movies = [
+        *grouped_watchlist,
+        *grouped_recommendations,
+        *grouped_watched,
+        *grouped_program,
+    ]
     if calendar_sources:
         with progress.step("calendar", total=len(calendar_sources)):
-            busy_intervals, calendar_status = _calendar_for_plan(
+            busy_intervals, calendar_status, _ready = _calendar_for_plan(
                 calendar_sources,
-                [
-                    *grouped_watchlist,
-                    *grouped_recommendations,
-                    *grouped_watched,
-                    *grouped_program,
-                ],
+                screening_movies,
             )
     else:
-        busy_intervals, calendar_status = _calendar_for_plan(
+        busy_intervals, calendar_status, _ready = _calendar_for_plan(
             calendar_sources,
-            [
-                *grouped_watchlist,
-                *grouped_recommendations,
-                *grouped_watched,
-                *grouped_program,
-            ],
+            screening_movies,
         )
     page = ProgramPage(
         results,
@@ -1336,11 +1380,10 @@ def main() -> int:
     with page._lock:
         if page._epoch == page_epoch:
             hub.progress.ready()
-    if persist_settings or persist_calendars:
+    if persist_settings:
         save_viewer(
             page.letterboxd_user,
             page.languages,
-            calendar_sources if persist_calendars else None,
             signed_out=signed_out,
             following_user=page.following_user,
         )

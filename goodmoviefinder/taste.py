@@ -112,6 +112,9 @@ class OutsideTag:
 class TasteView:
     paragraph: str = ""
     note: str = ""
+    loved: list[str] = field(default_factory=list)
+    lower: list[str] = field(default_factory=list)
+    loved_are_themes: bool = False
     see_first: list[Movie] = field(default_factory=list)
     like_you: list[Movie] = field(default_factory=list)
     step_outside: list[Movie] = field(default_factory=list)
@@ -464,6 +467,23 @@ def _label_stats(
     high.sort(key=lambda item: (-item[0], -item[1], item[2][1].casefold()))
     low.sort(key=lambda item: (item[0], -item[1], item[2][1].casefold()))
     return [item[2] for item in high], [item[2] for item in low], counts
+
+
+def taste_highlights(
+    watched_ratings: dict[str, float | None],
+    features: dict[str, dict],
+) -> tuple[list[str], list[str], bool]:
+    """Phrases for the taste summary: what rates highly, what sits lower, and whether those are themes."""
+    rated_rows = [
+        (slug, float(rating))
+        for slug, rating in watched_ratings.items()
+        if isinstance(rating, (int, float)) and slug in features
+    ]
+    high, low, _counts = _label_stats(rated_rows, features)
+    bridge = _bridge_mini_themes(rated_rows, features)
+    if bridge:
+        return bridge, [_phrase(key) for key in low[:2]], True
+    return [_phrase(key) for key in high[:3]], [_phrase(key) for key in low[:2]], False
 
 
 def _paragraph(high_phrases: list[str], low_phrases: list[str], *, themes: bool) -> str:
@@ -1008,21 +1028,17 @@ def recommend(
     ]
     user_ratings = dict(rated_rows)
     high, low, _counts = _label_stats(rated_rows, features)
-    bridge = _bridge_mini_themes(rated_rows, features)
-    if bridge:
-        paragraph = _paragraph(bridge, [_phrase(key) for key in low[:2]], themes=True)
-    else:
-        paragraph = _paragraph(
-            [_phrase(key) for key in high[:3]],
-            [_phrase(key) for key in low[:2]],
-            themes=False,
-        )
+    loved, lower, loved_are_themes = taste_highlights(dict(rated_rows), features)
+    paragraph = _paragraph(loved, lower, themes=loved_are_themes)
     try:
         import sklearn.ensemble  # noqa: F401
     except ImportError:
         return TasteView(
             paragraph=paragraph,
             note="Install scikit-learn to score films against your ratings.",
+            loved=loved,
+            lower=lower,
+            loved_are_themes=loved_are_themes,
         )
 
     digest = _hash(user_ratings, features, neighbors, known_languages)
@@ -1080,7 +1096,13 @@ def recommend(
         content_only=content_only,
         use_content=use_content,
     )
-    view = TasteView(paragraph=paragraph, note=note)
+    view = TasteView(
+        paragraph=paragraph,
+        note=note,
+        loved=loved,
+        lower=lower,
+        loved_are_themes=loved_are_themes,
+    )
     if not use_content and not neighbor_ok:
         return view
 

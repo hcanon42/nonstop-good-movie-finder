@@ -22,6 +22,13 @@ def _read(name: str) -> str:
     return (_ASSET_DIR / name).read_text(encoding="utf-8")
 
 
+def _account_avatar_markup(initial: str, avatar_url: str | None) -> str:
+    if avatar_url and avatar_url.startswith("https://"):
+        safe = html.escape(avatar_url, quote=True)
+        return f'<img class="account-avatar" src="{safe}" alt="" aria-hidden="true">'
+    return f'<span class="account-avatar" aria-hidden="true">{initial}</span>'
+
+
 def _profile_form(user: str, signed_in: bool) -> str:
     label = "Switch account" if signed_in else "Letterboxd username"
     button = "Load" if signed_in else "Sign in"
@@ -58,6 +65,9 @@ def account_menu_html(
     signed_in: bool,
     choices: list[str],
     selected: list[str],
+    *,
+    following_user: str | None = None,
+    avatar_url: str | None = None,
 ) -> str:
     selected_keys = {name.casefold() for name in selected}
     boxes = "".join(
@@ -68,9 +78,23 @@ def account_menu_html(
         for name in choices
     )
     safe_user = html.escape(user)
+    active_user = (following_user or user).strip()
+    own_profile = signed_in and active_user.casefold() == user.casefold()
     if signed_in:
-        initial = html.escape(user[:1] or "?")
-        name = f"@{safe_user}"
+        initial = html.escape(active_user[:1] or "?")
+        chip_avatar = _account_avatar_markup(
+            initial,
+            avatar_url if own_profile else None,
+        )
+        name = f"@{html.escape(active_user)}"
+        profile_link = ""
+        if own_profile:
+            profile_link = (
+                f'<a class="account-letterboxd" href="https://letterboxd.com/{html.escape(user, quote=True)}/" '
+                'target="_blank" rel="noopener noreferrer" '
+                f'aria-label="Open @{safe_user} on Letterboxd">'
+                '<span class="account-letterboxd-mark" aria-hidden="true"></span></a>'
+            )
         who = (
             '<p class="menu-who">Signed in as '
             f'<a href="https://letterboxd.com/{html.escape(user, quote=True)}/" '
@@ -87,11 +111,11 @@ def account_menu_html(
             '<button type="button" class="account-open account-settings-open" id="settings-open" '
             'aria-expanded="false" aria-controls="settings-panel" aria-haspopup="dialog" '
             'aria-label="Account and languages">'
-            f'<span class="account-avatar" aria-hidden="true">{initial}</span>'
+            f"{chip_avatar}"
             '<span class="account-caret" aria-hidden="true"></span></button>'
             '<button type="button" class="account-name" id="account-switch-open" '
             'aria-expanded="false" aria-controls="account-switch-panel" aria-haspopup="listbox">'
-            f"{name}</button></div>"
+            f"{name}</button>{profile_link}</div>"
             '<div id="account-switch-panel" class="account-switch-panel" role="listbox" '
             'aria-label="Switch Letterboxd profile" hidden>'
             '<p class="account-switch-status muted" role="status">Loading…</p>'
@@ -176,6 +200,9 @@ def render_page(
         "defaults": list(DEFAULT_KNOWN_LANGUAGES),
     }
     viewer_payload.update(viewer)
+    following = str(viewer.get("followingUser") or user)
+    raw_avatar = viewer.get("letterboxdAvatar")
+    avatar_url = raw_avatar if isinstance(raw_avatar, str) and raw_avatar.startswith("https://") else None
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -193,7 +220,7 @@ def render_page(
         {switch("nonstop", NONSTOP_HREF, "Nonstop Kino")}
         {switch("account", ACCOUNT_HREF, "My Letterboxd")}
       </nav>
-      {account_menu_html(user, signed_in, choices, selected)}
+      {account_menu_html(user, signed_in, choices, selected, following_user=following, avatar_url=avatar_url)}
     </div>
   </header>
   <section class="page-head">

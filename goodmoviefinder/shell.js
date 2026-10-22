@@ -374,7 +374,9 @@
         return;
       }
       status.hidden = true;
-      const active = String(payload.activeUser || viewerConfig.letterboxdUser || "").toLowerCase();
+      const active = String(
+        payload.activeUser || viewerConfig.followingUser || viewerConfig.letterboxdUser || ""
+      ).toLowerCase();
       members.forEach((member) => {
         if (!member || typeof member.username !== "string") return;
         const item = document.createElement("button");
@@ -690,12 +692,55 @@
       }
     }
 
+    function applyAccountAvatar(avatarUrl) {
+      const safe = switchAvatarUrl(avatarUrl);
+      if (!safe) return;
+      const slot = document.querySelector("#settings-open .account-avatar");
+      if (!slot) return;
+      if (slot.tagName === "IMG") {
+        slot.src = safe;
+        return;
+      }
+      const image = document.createElement("img");
+      image.className = "account-avatar";
+      image.src = safe;
+      image.alt = "";
+      slot.replaceWith(image);
+    }
+
+    function prefetchAccountChrome() {
+      if (!viewerConfig.signedIn) return;
+      const active = String(viewerConfig.followingUser || viewerConfig.letterboxdUser || "").toLowerCase();
+      if (viewerConfig.letterboxdAvatar) {
+        applyAccountAvatar(viewerConfig.letterboxdAvatar);
+      }
+      fetch(followingEndpoint())
+        .then(async (response) => {
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) return null;
+          return payload;
+        })
+        .then((payload) => {
+          if (!payload) return;
+          followingPayload = payload;
+          const members = Array.isArray(payload.members) ? payload.members : [];
+          const profile = members.find(
+            (member) => member && String(member.username || "").toLowerCase() === active
+          );
+          if (profile && profile.avatar) applyAccountAvatar(profile.avatar);
+        })
+        .catch(() => {
+          /* avatar is optional */
+        });
+    }
+
     function bootViewer() {
       const saved = readSavedLanguages(viewerConfig.stamp);
       if (saved) applyCheckboxSelection(saved);
       applyLanguageFilter();
       bindSettings();
       bindAccountSwitch();
+      prefetchAccountChrome();
     }
 
     bootViewer();

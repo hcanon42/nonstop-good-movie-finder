@@ -343,6 +343,30 @@
     button.month-day.is-planned-day,
     button.also-day-button.is-planned-day { border-color: var(--gold); }
     .plan-board { margin-top: 1.15rem; }
+    .plan-calendars {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin: 0 0 0.9rem;
+    }
+    .plan-calendar-add {
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.85rem;
+      font-weight: 700;
+      border-radius: 999px;
+      padding: 0.4rem 0.9rem;
+      cursor: pointer;
+    }
+    .plan-calendar-add:hover { border-color: var(--gold); }
+    .plan-calendar-add[aria-pressed="true"] {
+      background: var(--gold);
+      border-color: var(--gold);
+      color: var(--gold-ink);
+    }
+    .plan-calendar-add:disabled { opacity: 0.6; cursor: progress; }
     .plan-calendar-bar {
       display: flex;
       flex-wrap: wrap;

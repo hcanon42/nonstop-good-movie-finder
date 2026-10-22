@@ -548,7 +548,21 @@
       if (status && payload && typeof payload.status === "string") {
         status.textContent = payload.status;
       }
-      if (bar && payload && payload.status) bar.hidden = false;
+      if (bar && payload) {
+        bar.hidden = !payload.status;
+      }
+      if (payload && Array.isArray(payload.sources)) {
+        document.querySelectorAll("[data-calendar]").forEach((button) => {
+          const source = button.getAttribute("data-calendar");
+          const on = payload.sources.includes(source);
+          const name = source === "apple" ? "Apple Calendar" : "Google Calendar";
+          button.setAttribute("aria-pressed", on ? "true" : "false");
+          button.textContent = on ? name : `Add ${name}`;
+          button.title = on
+            ? `Stop using ${name}`
+            : `Skip showtimes that overlap ${name}`;
+        });
+      }
       renderPlan();
     }
 
@@ -761,6 +775,51 @@
       }
     }
 
+    async function toggleCalendar(button) {
+      const source = button.getAttribute("data-calendar");
+      const name = source === "apple" ? "Apple Calendar" : "Google Calendar";
+      const enabled = button.getAttribute("aria-pressed") !== "true";
+      const status = document.getElementById("plan-save-status");
+      const buttons = document.querySelectorAll("[data-calendar]");
+      buttons.forEach((item) => {
+        item.disabled = true;
+      });
+      if (status) {
+        status.hidden = false;
+        status.classList.remove("is-error");
+        status.textContent = enabled ? `Adding ${name}…` : `Removing ${name}…`;
+      }
+      try {
+        const response = await fetch("/api/calendar", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ source, enabled }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const fallback = response.status === 404
+            ? "Restart python3 goodmoviefinder.py, then add the calendar again."
+            : `Could not add ${name}.`;
+          throw new Error(payload.error || fallback);
+        }
+        applyCalendar(payload);
+        if (status) {
+          status.textContent = "";
+          status.hidden = true;
+        }
+      } catch (err) {
+        if (status) {
+          status.hidden = false;
+          status.textContent = err && err.message ? err.message : `Could not add ${name}.`;
+          status.classList.add("is-error");
+        }
+      } finally {
+        buttons.forEach((item) => {
+          item.disabled = false;
+        });
+      }
+    }
+
     async function refreshCalendar() {
       const button = document.getElementById("plan-refresh");
       const status = document.getElementById("plan-save-status");
@@ -816,6 +875,14 @@
     if (planSave) planSave.addEventListener("click", savePlan);
     const planRefresh = document.getElementById("plan-refresh");
     if (planRefresh) planRefresh.addEventListener("click", refreshCalendar);
+    const planCalendars = document.getElementById("plan-calendars");
+    if (planCalendars) {
+      planCalendars.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-calendar]");
+        if (!button || button.disabled) return;
+        toggleCalendar(button);
+      });
+    }
     const planOptions = document.getElementById("plan-options");
     if (planOptions) {
       planOptions.addEventListener("click", (event) => {

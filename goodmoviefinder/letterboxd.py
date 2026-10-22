@@ -161,6 +161,7 @@ def _iter_letterboxd_profile_pages(
     page_attempts: int = 4,
     profile_delay: float | None = None,
     until_complete: bool = False,
+    require_first_page: bool = False,
 ):
     """Yield each profile page. `until_complete` retries a refused page until it loads."""
     page = 1
@@ -193,6 +194,8 @@ def _iter_letterboxd_profile_pages(
 
             attempt += 1
             if not until_complete and attempt >= attempts:
+                if page == 1 and require_first_page:
+                    raise RuntimeError(fetch_error or f"Failed to fetch {url}")
                 if page > 1:
                     print(
                         f"{fetch_error}; using the profile pages fetched so far.",
@@ -241,9 +244,17 @@ def fetch_letterboxd_profile_slugs(
     section: str,
     delay: float,
     max_pages: int = 50,
+    *,
+    require_first_page: bool = False,
 ) -> set[str]:
     slugs: set[str] = set()
-    for html_text in _iter_letterboxd_profile_pages(user, section, delay, max_pages):
+    for html_text in _iter_letterboxd_profile_pages(
+        user,
+        section,
+        delay,
+        max_pages,
+        require_first_page=require_first_page,
+    ):
         slugs |= parse_letterboxd_profile_slugs(html_text)
     return slugs
 
@@ -516,6 +527,21 @@ def parse_profile_film_count(html_text: str) -> int | None:
     if not match:
         return None
     return int(match.group(1).replace(",", ""))
+
+
+_MEMBER_AVATAR_RE = re.compile(
+    r"https://a\.ltrbxd\.com/resized/avatar/upload/[^\"\s]+",
+    re.IGNORECASE,
+)
+
+
+def parse_member_avatar(html_text: str) -> str | None:
+    """Profile photo from a Letterboxd member page."""
+    marker = "js-profile-header"
+    idx = html_text.find(marker)
+    chunk = html_text[idx : idx + 6000] if idx >= 0 else html_text
+    match = _MEMBER_AVATAR_RE.search(chunk)
+    return match.group(0) if match else None
 
 
 def parse_film_rating_members(html_text: str, film_slug: str) -> list[str]:

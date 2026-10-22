@@ -245,9 +245,19 @@ def load_recommendations_cache(
     step_outside = _taste_movies(record.get("step_outside"))
     if see_first is None or like_you is None or step_outside is None:
         return None
+    loved = _string_list(record.get("loved"))
+    lower = _string_list(record.get("lower"))
+    loved_are_themes = bool(record.get("loved_are_themes"))
+    if not loved and not lower:
+        recovered = _recover_taste_highlights(cache, user)
+        if recovered is not None:
+            loved, lower, loved_are_themes = recovered
     view = TasteView(
         paragraph=paragraph,
         note=note,
+        loved=loved,
+        lower=lower,
+        loved_are_themes=loved_are_themes,
         see_first=see_first,
         like_you=like_you,
         step_outside=step_outside,
@@ -278,12 +288,38 @@ def save_recommendations_cache(
         "fetched_at": saved_at,
         "paragraph": view.paragraph,
         "note": view.note,
+        "loved": list(view.loved),
+        "lower": list(view.lower),
+        "loved_are_themes": bool(view.loved_are_themes),
         "see_first": [_taste_movie_payload(movie) for movie in view.see_first],
         "like_you": [_taste_movie_payload(movie) for movie in view.like_you],
         "step_outside": [_taste_movie_payload(movie) for movie in view.step_outside],
     }
     save_cache(cache_path, cache)
     return saved_at
+
+
+def _recover_taste_highlights(
+    cache: dict[str, Any],
+    user: str,
+) -> tuple[list[str], list[str], bool] | None:
+    """Rebuild taste phrases from a saved profile when an older recommendations cache has only prose."""
+    profile = load_profile_cache(cache, user, allow_stale=True)
+    if profile is None:
+        return None
+    watched, _watchlist, _films = profile
+    rated = [slug for slug, rating in watched.items() if isinstance(rating, (int, float))]
+    if not rated:
+        return None
+    features: dict[str, dict[str, Any]] = {}
+    for slug in rated:
+        feature = film_feature_get(cache, slug)
+        if feature is None:
+            return None
+        features[slug] = feature
+    from goodmoviefinder.taste import taste_highlights
+
+    return taste_highlights(watched, features)
 
 
 def recommendations_updated_label(fetched_at: int | None) -> str:
