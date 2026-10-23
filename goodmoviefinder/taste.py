@@ -1585,6 +1585,9 @@ def movie_from_letterboxd(slug: str, feature: dict) -> Movie:
         primary_language_known=bool(language),
         synopsis=feature.get("synopsis") if isinstance(feature.get("synopsis"), str) else None,
         poster_url=feature.get("poster") if isinstance(feature.get("poster"), str) else None,
+        letterboxd_poster_url=feature.get("poster")
+        if isinstance(feature.get("poster"), str)
+        else None,
         letterboxd_backdrop_url=feature.get("backdrop")
         if isinstance(feature.get("backdrop"), str)
         else None,
@@ -1689,6 +1692,7 @@ def build_for_you(
         backdrop = feature.get("backdrop")
         movie.synopsis = synopsis if isinstance(synopsis, str) and synopsis else None
         movie.poster_url = poster if isinstance(poster, str) else None
+        movie.letterboxd_poster_url = poster if isinstance(poster, str) else None
         if isinstance(backdrop, str) and backdrop:
             movie.letterboxd_backdrop_url = backdrop
         movie.details_known = bool(feature.get("card_known"))

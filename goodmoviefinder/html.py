@@ -474,16 +474,11 @@ def _why_recommend_html(movie: Movie) -> str:
     )
 
 
-def _chosen_poster(movie: Movie) -> tuple[str, str] | None:
-    """Vertical Letterboxd poster when we have one, otherwise the wide Nonstop image."""
-    vertical = letterboxd_poster_url(movie.letterboxd_poster_url) or letterboxd_poster_url(
+def _chosen_poster(movie: Movie) -> str | None:
+    """Letterboxd's vertical poster. The Nonstop program still is never shown."""
+    return letterboxd_poster_url(movie.letterboxd_poster_url) or letterboxd_poster_url(
         movie.poster_url
     )
-    if vertical:
-        return vertical, "vertical"
-    if movie.poster_url:
-        return movie.poster_url, "wide"
-    return None
 
 
 def _detail_hero_html(backdrop: str | None, slug: str | None) -> str:
@@ -509,20 +504,16 @@ def _detail_hero_html(backdrop: str | None, slug: str | None) -> str:
 
 
 def _poster_img(movie: Movie, *, row: bool) -> str:
-    chosen = _chosen_poster(movie)
-    if chosen is None:
+    url = _chosen_poster(movie)
+    if not url:
         return ""
-    url, kind = chosen
     src = html.escape(url, quote=True)
-    if row and kind == "wide":
-        return f'<img class="row-poster row-poster-wide" src="{src}" alt="">'
     if row:
         return (
             f'<img class="row-poster" src="{src}" alt="" width="32" height="48">'
         )
     alt = html.escape(film_title(movie), quote=True)
-    css = "poster poster-wide" if kind == "wide" else "poster"
-    return f'<img class="{css}" src="{src}" alt="{alt}">'
+    return f'<img class="poster" src="{src}" alt="{alt}">'
 
 
 def _detail_panel_html(
@@ -1087,13 +1078,7 @@ def _format_html_movie_row(
     sort_director = html.escape(", ".join(m.directors), quote=True)
     sort_genres = html.escape(", ".join(m.genres), quote=True)
     sort_language = html.escape(m.primary_language or "", quote=True)
-    chosen = _chosen_poster(m)
-    # Unfound titles only have the wide Nonstop still. The opened detail keeps
-    # it; the folded row stays a text line.
-    wide_poster = (
-        _poster_img(m, row=True) if chosen and chosen[1] == "wide" and m.letterboxd_url else ""
-    )
-    thumb = _poster_img(m, row=True) if chosen and chosen[1] == "vertical" else ""
+    thumb = _poster_img(m, row=True)
     return (
         f'<tr data-movie-row{extra}{row_hidden}{movie_id_attr}{plan_id_attr} '
         f'data-search="{search_blob}"'
@@ -1108,7 +1093,7 @@ def _format_html_movie_row(
         f'<td class="col-rating">{_rating_badge(m.rating, rating_text)}</td>'
         f"{predicted_cell}"
         f"{user_cell}"
-        f'<td class="col-title"><span class="title-stack">{wide_poster}'
+        f'<td class="col-title"><span class="title-stack">'
         f'<span class="title-line">{thumb}'
         f'<button type="button" class="expand" '
         f'aria-expanded="false" aria-controls="{html.escape(detail_id, quote=True)}">'

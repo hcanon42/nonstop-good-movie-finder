@@ -17,6 +17,7 @@ from goodmoviefinder.cache import (
     backfill_nonstop_details,
     backfill_runtime,
     cache_get,
+    fill_letterboxd_poster,
     cache_put,
     ensure_loved_film_credits,
     load_cache,
@@ -51,11 +52,13 @@ from goodmoviefinder.account import format_account_html, format_taste_panel_html
 from goodmoviefinder.html import format_html
 from goodmoviefinder.http import fetch
 from goodmoviefinder.letterboxd import (
+    LetterboxdRefused,
     apply_manual_letterboxd_match,
     apply_nonstop_metadata,
     fetch_letterboxd_watched_ratings,
     fetch_letterboxd_watchlist,
     letterboxd_autocomplete_films,
+    letterboxd_poster_url,
     normalize_letterboxd_film_slug,
     resolve_letterboxd,
     stored_letterboxd_still_matches,
@@ -606,6 +609,7 @@ class ProgramPage:
     def write(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
         groups = self.write_program()
         self.fill_recommendations()
+        self.write_program()
         self._write_account_page()
         return groups
 
@@ -780,6 +784,7 @@ class ProgramPage:
             self._write_account_page()
             with progress.step("recommendations", detail="Similar members and For you"):
                 self.fill_recommendations(force=True)
+        self.write_program()
         self._write_account_page()
         self._save_viewer()
 
@@ -1149,6 +1154,8 @@ def main() -> int:
             )
 
     results: list[Movie] = []
+    poster_refused = 0
+    poster_lookup_stopped = False
 
     with progress.step("films", total=len(films)):
         for index, film in enumerate(films, start=1):
@@ -1174,6 +1181,29 @@ def main() -> int:
                     # Unfound titles stay in cache with no letterboxd_url; keep trying
                     # to match so "already watched" can use the profile slug.
                     if cached.match_current and cached.letterboxd_url:
+                        if (
+                            not poster_lookup_stopped
+                            and not letterboxd_poster_url(cached.letterboxd_poster_url)
+                            and not cached.poster_checked
+                        ):
+                            print("  Looking up the Letterboxd poster…", file=sys.stderr)
+                            try:
+                                updated = (
+                                    fill_letterboxd_poster(cached, cache, args.delay)
+                                    or updated
+                                )
+                                poster_refused = 0
+                            except LetterboxdRefused as exc:
+                                poster_refused += 1
+                                print(f"  {exc}", file=sys.stderr)
+                                if poster_refused >= 3:
+                                    poster_lookup_stopped = True
+                                    print(
+                                        "Letterboxd refused three times. Stopping poster lookup.",
+                                        file=sys.stderr,
+                                    )
+                            except RuntimeError as exc:
+                                print(f"  {exc}", file=sys.stderr)
                         if updated:
                             cache_put(cache, cached)
                             save_cache(args.cache, cache)
@@ -1376,6 +1406,7 @@ def main() -> int:
                 page.fill_recommendations(force=True)
                 with page._lock:
                     if page._epoch == page_epoch:
+                        page.write_program()
                         page._write_account_page()
     with page._lock:
         if page._epoch == page_epoch:

@@ -52,6 +52,8 @@ class Movie:
     versions: list[str] = field(default_factory=list)
     poster_url: str | None = None
     letterboxd_poster_url: str | None = None
+    # True after a Letterboxd page was read for a poster, including when it has none.
+    poster_checked: bool = False
     letterboxd_backdrop_url: str | None = None
     synopsis: str | None = None
     cinema_sites: dict[str, str] = field(default_factory=dict)

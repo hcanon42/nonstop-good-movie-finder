@@ -387,6 +387,8 @@ def cache_get(cache: dict[str, Any], nonstop_url: str) -> Movie | None:
         duration_known=duration_known,
         note=entry.get("note"),
         letterboxd_poster_url=letterboxd_poster_url(entry.get("letterboxd_poster_url")),
+        poster_checked=bool(entry.get("poster_checked"))
+        or letterboxd_poster_url(entry.get("letterboxd_poster_url")) is not None,
         letterboxd_backdrop_url=letterboxd_backdrop_url(entry.get("letterboxd_backdrop_url")),
         manual_match=bool(entry.get("manual_match")),
         match_current=entry.get("matcher") == MATCHER_VERSION
@@ -409,6 +411,8 @@ def cache_put(cache: dict[str, Any], movie: Movie) -> None:
     poster = letterboxd_poster_url(movie.letterboxd_poster_url)
     if poster:
         entry["letterboxd_poster_url"] = poster
+    if movie.poster_checked or poster:
+        entry["poster_checked"] = True
     backdrop = letterboxd_backdrop_url(movie.letterboxd_backdrop_url)
     if backdrop:
         entry["letterboxd_backdrop_url"] = backdrop
@@ -430,6 +434,33 @@ def cache_put(cache: dict[str, Any], movie: Movie) -> None:
     elif movie.duration_known:
         entry["duration_known"] = True
     cache.setdefault("entries", {})[movie.nonstop_url] = entry
+
+
+def fill_letterboxd_poster(movie: Movie, cache: dict[str, Any], delay: float) -> bool:
+    """Attach Letterboxd's poster. Returns True when the cache entry should be saved."""
+    if letterboxd_poster_url(movie.letterboxd_poster_url) or movie.poster_checked:
+        return False
+    from goodmoviefinder.program import apply_known_letterboxd_posters
+
+    apply_known_letterboxd_posters([movie], cache)
+    if letterboxd_poster_url(movie.letterboxd_poster_url):
+        movie.poster_checked = True
+        return True
+    if not movie.letterboxd_url:
+        movie.poster_checked = True
+        return True
+    body = fetch_letterboxd_html(movie.letterboxd_url, delay)
+    poster = parse_letterboxd_poster(body)
+    movie.poster_checked = True
+    if poster:
+        movie.letterboxd_poster_url = poster
+    backdrop = parse_letterboxd_backdrop(body)
+    if backdrop and not letterboxd_backdrop_url(movie.letterboxd_backdrop_url):
+        movie.letterboxd_backdrop_url = backdrop
+        slug = letterboxd_slug_from_url(movie.letterboxd_url)
+        if slug:
+            remember_backdrop(slug, backdrop)
+    return True
 
 
 def backfill_letterboxd_details(movie: Movie, delay: float) -> bool:
@@ -454,6 +485,7 @@ def backfill_letterboxd_details(movie: Movie, delay: float) -> bool:
         )
         return False
     poster = parse_letterboxd_poster(body)
+    movie.poster_checked = True
     if poster:
         movie.letterboxd_poster_url = poster
     backdrop = parse_letterboxd_backdrop(body)
