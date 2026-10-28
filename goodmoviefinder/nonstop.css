@@ -252,10 +252,29 @@
     .day-times li { margin: 0.1rem 0; }
     .day-film:has(.day-film-title[aria-expanded="true"]) .day-times-line,
     .day-film:has(.day-film-title[aria-expanded="true"]) .day-times { display: none; }
-    .day-film-detail { margin-top: 0.65rem; }
+    .day-film-detail {
+      margin-top: 0.65rem;
+      min-width: 0;
+      max-width: 100%;
+    }
     .day-film-detail .detail {
       position: static;
-      width: auto;
+      left: auto;
+      width: 100%;
+      max-width: 100%;
+    }
+    .day-film-detail .detail-main,
+    .day-film-detail .detail-body,
+    .day-film-detail .detail-columns,
+    .day-film-detail .schedule {
+      min-width: 0;
+      max-width: 100%;
+    }
+    .day-film-detail .detail-columns {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .day-film-detail .showtimes {
+      flex-direction: column;
     }
     .schedule { min-width: 0; }
     .also-showing { margin-top: 1.5rem; }
@@ -395,6 +414,33 @@
     }
     .plan-refresh:hover { border-color: var(--gold); color: var(--text); }
     .plan-refresh:disabled { opacity: 0.6; cursor: progress; }
+    .program-check-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.55rem 0.9rem;
+      flex: 1 1 100%;
+    }
+    .program-check {
+      flex: 0 0 auto;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.82rem;
+      font-weight: 600;
+      border-radius: 999px;
+      padding: 0.32rem 0.75rem;
+      cursor: pointer;
+    }
+    .program-check:hover { border-color: var(--gold); color: var(--text); }
+    .program-check:disabled { opacity: 0.6; cursor: progress; }
+    .program-check-status {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+    .program-check-status.is-error { color: var(--danger, #c44); }
     .plan-picked {
       display: flex;
       flex-wrap: wrap;

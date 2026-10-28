@@ -199,6 +199,9 @@ def start_server(state: Any, port: int, *, open_browser: bool = True) -> Threadi
             if path == "/api/recommendations":
                 self._send(200, json.dumps(page.recommendations_status()), "application/json")
                 return
+            if path == "/api/program":
+                self._send(200, json.dumps(page.program_check_status()), "application/json")
+                return
             if path == "/api/letterboxd-backdrop":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 slug = (query.get("slug") or [""])[0]
@@ -287,6 +290,22 @@ def start_server(state: Any, port: int, *, open_browser: bool = True) -> Threadi
                     self._send(502, json.dumps({"error": str(exc)}), "application/json")
                     return
                 self._send(200, json.dumps({"ok": True, **saved}), "application/json")
+                return
+            if path == "/api/program":
+                try:
+                    payload = page.start_program_check()
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] program check: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": "The Wien program could not be checked."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps({"ok": True, **payload}), "application/json")
                 return
             if path == "/api/recommendations":
                 try:

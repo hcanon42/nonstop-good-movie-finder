@@ -63,12 +63,13 @@ from goodmoviefinder.letterboxd import (
     resolve_letterboxd,
     stored_letterboxd_still_matches,
 )
-from goodmoviefinder.models import Movie, NonstopFilmPage
+from goodmoviefinder.models import Movie, NonstopFilmPage, ProgramFilm
 from goodmoviefinder.nonstop import parse_nonstop_movie_page, parse_program
 from goodmoviefinder.neighbors import ensure_neighbors
 from goodmoviefinder.program import (
     apply_known_letterboxd_posters,
     attach_program,
+    film_title,
     letterboxd_slug_from_url,
     counts_as_viewer_language,
     movie_is_watchable,
@@ -186,6 +187,205 @@ def _remember_runtime(movie: Movie, page: NonstopFilmPage | None) -> None:
         movie.duration_known = True
 
 
+def _mark_new(movie: Movie, new_in_program: bool) -> Movie:
+    if new_in_program:
+        movie.new_in_program = True
+    return movie
+
+
+def _program_change_message(
+    added: list[str],
+    removed: list[str],
+    *,
+    screenings_changed: bool,
+) -> str:
+    """Status line after a Wien program check."""
+
+    def _names(titles: list[str]) -> str:
+        shown = titles[:8]
+        extra = f" and {len(titles) - len(shown)} more" if len(titles) > len(shown) else ""
+        return ", ".join(shown) + extra
+
+    parts: list[str] = []
+    if added:
+        label = "film" if len(added) == 1 else "films"
+        parts.append(f"{len(added)} new {label}: {_names(added)}")
+    if removed:
+        label = "film" if len(removed) == 1 else "films"
+        parts.append(f"Removed {len(removed)} {label}: {_names(removed)}")
+    if not parts:
+        return "Showtimes updated." if screenings_changed else "The Wien program is unchanged."
+    if screenings_changed:
+        parts.append("Showtimes updated")
+    return ". ".join(parts) + "."
+
+
+class _PosterLookup:
+    """Poster fetches for one pass over the program.
+
+    Letterboxd refusing three times in a row stops further poster lookups.
+    """
+
+    def __init__(self) -> None:
+        self.refused = 0
+        self.stopped = False
+
+    def fill(self, movie: Movie, cache: dict, delay: float) -> bool:
+        if (
+            self.stopped
+            or letterboxd_poster_url(movie.letterboxd_poster_url)
+            or movie.poster_checked
+        ):
+            return False
+        print("  Looking up the Letterboxd poster…", file=sys.stderr)
+        try:
+            changed = fill_letterboxd_poster(movie, cache, delay)
+        except LetterboxdRefused as exc:
+            self.refused += 1
+            print(f"  {exc}", file=sys.stderr)
+            if self.refused >= 3:
+                self.stopped = True
+                print(
+                    "Letterboxd refused three times. Stopping poster lookup.",
+                    file=sys.stderr,
+                )
+            return False
+        except RuntimeError as exc:
+            print(f"  {exc}", file=sys.stderr)
+            return False
+        self.refused = 0
+        return changed
+
+
+def lookup_program_film(
+    film: ProgramFilm,
+    cache: dict,
+    cache_path: Path,
+    delay: float,
+    *,
+    no_cache: bool,
+    new_in_program: bool,
+    poster_lookup: _PosterLookup | None = None,
+) -> Movie:
+    """Resolve one program title, reusing a cached Letterboxd match when it still fits."""
+    page: NonstopFilmPage | None = None
+    if not no_cache:
+        cached = cache_get(cache, film.url)
+        if cached is not None:
+            attach_program(cached, film)
+            updated = False
+            if not cached.primary_language_known or not cached.titles_known:
+                print("  Looking up Letterboxd title and language…", file=sys.stderr)
+                updated = backfill_letterboxd_details(cached, delay)
+            if not cached.details_known:
+                print("  Looking up synopsis and cinema websites…", file=sys.stderr)
+                backfill_nonstop_details(cached, delay)
+                updated = updated or cached.details_known
+            if not cached.duration_known:
+                print("  Looking up runtime…", file=sys.stderr)
+                updated = backfill_runtime(cached, delay) or updated
+            # Unfound titles stay in cache with no letterboxd_url; keep trying
+            # to match so "already watched" can use the profile slug.
+            if cached.match_current and cached.letterboxd_url:
+                posters = poster_lookup or _PosterLookup()
+                updated = posters.fill(cached, cache, delay) or updated
+                if updated:
+                    cache_put(cache, cached)
+                    save_cache(cache_path, cache)
+                return _mark_new(cached, new_in_program)
+            print("  Cross-checking director, runtime, and cast…", file=sys.stderr)
+            try:
+                page = parse_nonstop_movie_page(fetch(film.url))
+            except urllib.error.URLError as exc:
+                print(
+                    f"  Nonstop page error: {exc.reason}",
+                    file=sys.stderr,
+                )
+                page = None
+            if page is None:
+                cache_put(cache, cached)
+                save_cache(cache_path, cache)
+                return _mark_new(cached, new_in_program)
+            _remember_runtime(cached, page)
+            if cached.letterboxd_url:
+                print(
+                    "  Checking this Letterboxd link again…",
+                    file=sys.stderr,
+                )
+                still_matches = stored_letterboxd_still_matches(
+                    cached.letterboxd_url,
+                    page.year,
+                    page.director,
+                    page.cast,
+                    page.duration_minutes,
+                    delay,
+                )
+                if still_matches is None:
+                    print(
+                        "  Letterboxd lookup failed; keeping the saved link.",
+                        file=sys.stderr,
+                    )
+                    if cached.duration_minutes is not None:
+                        cache_put(cache, cached)
+                        save_cache(cache_path, cache)
+                    return _mark_new(cached, new_in_program)
+                if still_matches:
+                    print("  Saved Letterboxd link still matches.", file=sys.stderr)
+                    cache_put(cache, cached)
+                    save_cache(cache_path, cache)
+                    return _mark_new(cached, new_in_program)
+                print(
+                    "  Saved Letterboxd link does not match; searching again…",
+                    file=sys.stderr,
+                )
+
+    if page is None:
+        try:
+            page = parse_nonstop_movie_page(fetch(film.url))
+        except urllib.error.URLError as exc:
+            movie = Movie(
+                title=film.title,
+                nonstop_url=film.url,
+                note=f"Nonstop page error: {exc.reason}",
+            )
+            attach_program(movie, film)
+            return _mark_new(movie, new_in_program)
+
+    page_title = page.title
+    release_year = page.year
+    nonstop_director = page.director
+
+    try:
+        movie = resolve_letterboxd(
+            film.title,
+            film.url,
+            page_title,
+            release_year,
+            nonstop_director,
+            delay=delay,
+            nonstop_cast=page.cast,
+            nonstop_duration=page.duration_minutes,
+        )
+    except RuntimeError as exc:
+        print(f"  Letterboxd lookup failed: {exc}", file=sys.stderr)
+        movie = Movie(
+            title=film.title,
+            nonstop_url=film.url,
+            note=str(exc),
+        )
+    attach_program(movie, film)
+    if page is not None:
+        movie.synopsis = page.synopsis
+        movie.cinema_sites = page.cinema_sites
+        movie.details_known = True
+        _remember_runtime(movie, page)
+    apply_nonstop_metadata(movie, release_year, nonstop_director)
+    _mark_new(movie, new_in_program)
+    cache_put(cache, movie)
+    save_cache(cache_path, cache)
+    return movie
+
+
 class ProgramPage:
     """Rendered program, plus enough state to load another Letterboxd profile."""
 
@@ -205,6 +405,8 @@ class ProgramPage:
         calendar_sources: list[str],
         signed_out: bool = False,
         following_user: str | None = None,
+        program_url: str = DEFAULT_PROGRAM_URL,
+        no_cache: bool = False,
     ) -> None:
         self.results = results
         self.cache = cache
@@ -219,6 +421,14 @@ class ProgramPage:
         self.busy_intervals = busy_intervals
         self.calendar_status = calendar_status
         self.calendar_sources = list(calendar_sources)
+        self.program_url = program_url
+        self.no_cache = no_cache
+        self._program_running = False
+        self._program_error: str | None = None
+        self._program_message: str | None = None
+        self._program_detail = ""
+        self._program_reload = False
+        self._program_epoch = 0
         self.watched_ratings: dict[str, float | None] = {}
         self.watchlist_slugs: set[str] = set()
         self.watchlist_films: list[dict[str, object]] = []
@@ -829,6 +1039,123 @@ class ProgramPage:
                 message = f"{message} The calendar could not be refreshed: {exc}"
             return {"message": message, **calendar}
 
+    def program_check_status(self) -> dict[str, object]:
+        with self._lock:
+            if self._program_running:
+                payload: dict[str, object] = {"status": "running"}
+                if self._program_detail:
+                    payload["message"] = self._program_detail
+                return payload
+            payload = {"status": "idle", "ready": True}
+            if self._program_error:
+                payload["error"] = self._program_error
+                self._program_error = None
+            elif self._program_message:
+                payload["message"] = self._program_message
+                payload["reload"] = self._program_reload
+                self._program_message = None
+                self._program_reload = False
+            return payload
+
+    def start_program_check(self) -> dict[str, object]:
+        with self._lock:
+            if self._rebuilding:
+                raise ValueError("Still updating the page. Try again in a moment.")
+            if self._program_running:
+                return {"status": "running"}
+            self._program_running = True
+            self._program_error = None
+            self._program_message = None
+            self._program_detail = "Reading the Wien program…"
+            self._program_reload = False
+            self._program_epoch = self._epoch
+        threading.Thread(target=self._program_check_worker, daemon=True).start()
+        return {"status": "running", "message": "Reading the Wien program…"}
+
+    def _program_check_worker(self) -> None:
+        epoch = self._program_epoch
+        try:
+            with self._lock:
+                program_url = self.program_url
+            print(f"Checking program: {program_url}", file=sys.stderr)
+            try:
+                program_html = fetch(program_url)
+            except urllib.error.URLError as exc:
+                raise RuntimeError(f"Could not reach Nonstop: {exc.reason}") from exc
+            films = parse_program(program_html)
+            if not films:
+                raise RuntimeError("No films found on the Wien program.")
+            current_urls = {film.url for film in films}
+            with self._lock:
+                if epoch != self._epoch:
+                    return
+                known = {movie.nonstop_url for movie in self.results}
+            fresh = [film for film in films if film.url not in known]
+            added: list[str] = []
+            poster_lookup = _PosterLookup()
+            for index, film in enumerate(fresh, start=1):
+                print(f"[new {index}/{len(fresh)}] {film.title}", file=sys.stderr)
+                detail = f"Looking up {index} of {len(fresh)}: {film.title}"
+                with self._lock:
+                    if epoch != self._epoch:
+                        return
+                    self._program_detail = detail
+                    if any(item.nonstop_url == film.url for item in self.results):
+                        continue
+                    movie = lookup_program_film(
+                        film,
+                        self.cache,
+                        self.cache_path,
+                        self.delay,
+                        no_cache=self.no_cache,
+                        new_in_program=True,
+                        poster_lookup=poster_lookup,
+                    )
+                    self.results.append(movie)
+                    added.append(film_title(movie))
+            with self._lock:
+                if epoch != self._epoch:
+                    return
+                removed: list[str] = []
+                kept: list[Movie] = []
+                for movie in self.results:
+                    if movie.nonstop_url in current_urls:
+                        kept.append(movie)
+                    else:
+                        removed.append(film_title(movie))
+                self.results[:] = kept
+                by_url = {movie.nonstop_url: movie for movie in self.results}
+                screenings_changed = False
+                for film in films:
+                    movie = by_url.get(film.url)
+                    if movie is None:
+                        continue
+                    before = (list(movie.versions), list(movie.screenings), movie.poster_url)
+                    attach_program(movie, film)
+                    after = (movie.versions, movie.screenings, movie.poster_url)
+                    if before != after:
+                        screenings_changed = True
+                if not added and not removed and not screenings_changed:
+                    self._program_message = "The Wien program is unchanged."
+                    self._program_reload = False
+                    return
+                self._program_detail = "Updating the page…"
+                self.write_program()
+                self._write_account_page()
+                self._program_message = _program_change_message(
+                    added,
+                    removed,
+                    screenings_changed=screenings_changed,
+                )
+                self._program_reload = True
+        except Exception as exc:
+            print(f"[serve] program check: {exc}", file=sys.stderr)
+            with self._lock:
+                self._program_error = str(exc)
+        finally:
+            with self._lock:
+                self._program_running = False
+
     def refresh_calendar(self) -> dict[str, object]:
         with self._lock:
             sources = self.calendar_sources or load_calendars()
@@ -1154,157 +1481,25 @@ def main() -> int:
             )
 
     results: list[Movie] = []
-    poster_refused = 0
-    poster_lookup_stopped = False
+    poster_lookup = _PosterLookup()
 
     with progress.step("films", total=len(films)):
         for index, film in enumerate(films, start=1):
             print(f"[{index}/{len(films)}] {film.title}", file=sys.stderr)
             progress.tick(current=index, total=len(films), detail=film.title)
-
-            page: NonstopFilmPage | None = None
-            if not args.no_cache:
-                cached = cache_get(cache, film.url)
-                if cached is not None:
-                    attach_program(cached, film)
-                    updated = False
-                    if not cached.primary_language_known or not cached.titles_known:
-                        print("  Looking up Letterboxd title and language…", file=sys.stderr)
-                        updated = backfill_letterboxd_details(cached, args.delay)
-                    if not cached.details_known:
-                        print("  Looking up synopsis and cinema websites…", file=sys.stderr)
-                        backfill_nonstop_details(cached, args.delay)
-                        updated = updated or cached.details_known
-                    if not cached.duration_known:
-                        print("  Looking up runtime…", file=sys.stderr)
-                        updated = backfill_runtime(cached, args.delay) or updated
-                    # Unfound titles stay in cache with no letterboxd_url; keep trying
-                    # to match so "already watched" can use the profile slug.
-                    if cached.match_current and cached.letterboxd_url:
-                        if (
-                            not poster_lookup_stopped
-                            and not letterboxd_poster_url(cached.letterboxd_poster_url)
-                            and not cached.poster_checked
-                        ):
-                            print("  Looking up the Letterboxd poster…", file=sys.stderr)
-                            try:
-                                updated = (
-                                    fill_letterboxd_poster(cached, cache, args.delay)
-                                    or updated
-                                )
-                                poster_refused = 0
-                            except LetterboxdRefused as exc:
-                                poster_refused += 1
-                                print(f"  {exc}", file=sys.stderr)
-                                if poster_refused >= 3:
-                                    poster_lookup_stopped = True
-                                    print(
-                                        "Letterboxd refused three times. Stopping poster lookup.",
-                                        file=sys.stderr,
-                                    )
-                            except RuntimeError as exc:
-                                print(f"  {exc}", file=sys.stderr)
-                        if updated:
-                            cache_put(cache, cached)
-                            save_cache(args.cache, cache)
-                        results.append(cached)
-                        continue
-                    print("  Cross-checking director, runtime, and cast…", file=sys.stderr)
-                    try:
-                        page = parse_nonstop_movie_page(fetch(film.url))
-                    except urllib.error.URLError as exc:
-                        print(
-                            f"  Nonstop page error: {exc.reason}",
-                            file=sys.stderr,
-                        )
-                        page = None
-                    if page is None:
-                        cache_put(cache, cached)
-                        save_cache(args.cache, cache)
-                        results.append(cached)
-                        continue
-                    _remember_runtime(cached, page)
-                    if cached.letterboxd_url:
-                        print(
-                            "  Checking this Letterboxd link again…",
-                            file=sys.stderr,
-                        )
-                        still_matches = stored_letterboxd_still_matches(
-                            cached.letterboxd_url,
-                            page.year,
-                            page.director,
-                            page.cast,
-                            page.duration_minutes,
-                            args.delay,
-                        )
-                        if still_matches is None:
-                            print(
-                                "  Letterboxd lookup failed; keeping the saved link.",
-                                file=sys.stderr,
-                            )
-                            if cached.duration_minutes is not None:
-                                cache_put(cache, cached)
-                                save_cache(args.cache, cache)
-                            results.append(cached)
-                            continue
-                        if still_matches:
-                            print("  Saved Letterboxd link still matches.", file=sys.stderr)
-                            cache_put(cache, cached)
-                            save_cache(args.cache, cache)
-                            results.append(cached)
-                            continue
-                        print(
-                            "  Saved Letterboxd link does not match; searching again…",
-                            file=sys.stderr,
-                        )
-
-            if page is None:
-                try:
-                    page = parse_nonstop_movie_page(fetch(film.url))
-                except urllib.error.URLError as exc:
-                    movie = Movie(
-                        title=film.title,
-                        nonstop_url=film.url,
-                        note=f"Nonstop page error: {exc.reason}",
-                    )
-                    attach_program(movie, film)
-                    results.append(movie)
-                    continue
-
-            page_title = page.title
-            release_year = page.year
-            nonstop_director = page.director
-
-            try:
-                movie = resolve_letterboxd(
-                    film.title,
-                    film.url,
-                    page_title,
-                    release_year,
-                    nonstop_director,
-                    delay=args.delay,
-                    nonstop_cast=page.cast,
-                    nonstop_duration=page.duration_minutes,
+            results.append(
+                lookup_program_film(
+                    film,
+                    cache,
+                    args.cache,
+                    args.delay,
+                    no_cache=args.no_cache,
+                    new_in_program=(
+                        not first_program_cache_build and film.url not in cached_program_urls
+                    ),
+                    poster_lookup=poster_lookup,
                 )
-            except RuntimeError as exc:
-                print(f"  Letterboxd lookup failed: {exc}", file=sys.stderr)
-                movie = Movie(
-                    title=film.title,
-                    nonstop_url=film.url,
-                    note=str(exc),
-                )
-            attach_program(movie, film)
-            if page is not None:
-                movie.synopsis = page.synopsis
-                movie.cinema_sites = page.cinema_sites
-                movie.details_known = True
-                _remember_runtime(movie, page)
-            apply_nonstop_metadata(movie, release_year, nonstop_director)
-            if not first_program_cache_build and film.url not in cached_program_urls:
-                movie.new_in_program = True
-            cache_put(cache, movie)
-            save_cache(args.cache, cache)
-            results.append(movie)
+            )
 
     loved_credits: dict[str, dict] = {}
     if no_profile:
@@ -1360,6 +1555,8 @@ def main() -> int:
         calendar_status=calendar_status,
         calendar_sources=calendar_sources,
         following_user=following_user,
+        program_url=args.program_url,
+        no_cache=args.no_cache,
     )
     page.watched_ratings = watched_ratings
     page.watchlist_slugs = watchlist_slugs

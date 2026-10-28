@@ -215,8 +215,34 @@
       slot.replaceChildren(clone);
       slot.hidden = false;
       button.setAttribute("aria-expanded", "true");
+      const band = film.closest("[id^='day-']");
+      const iso = band && band.id.startsWith("day-") ? band.id.slice(4) : "";
+      if (iso) showClickedDayOnly(clone, iso);
       loadBackdrop(clone);
       loadFriends(slot);
+    }
+
+    function showDayLabel(iso) {
+      const day = new Date(iso + "T12:00:00");
+      if (Number.isNaN(day.getTime())) return "";
+      const weeks = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+      const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      const index = (day.getDay() + 6) % 7;
+      return weeks[index] + " " + String(day.getDate()).padStart(2, "0") + " " + months[day.getMonth()];
+    }
+
+    function showClickedDayOnly(root, iso) {
+      const days = [...root.querySelectorAll(".showtime-day")];
+      const label = showDayLabel(iso);
+      const chosen = days.filter((day) => {
+        const dated = day.getAttribute("data-date");
+        if (dated) return dated === iso;
+        return (day.querySelector("h3")?.textContent || "").trim() === label;
+      });
+      if (!chosen.length) return;
+      days.forEach((day) => {
+        day.hidden = !chosen.includes(day);
+      });
     }
 
     function toggleFilmDetail(button) {
@@ -1128,6 +1154,95 @@
 
     const tasteRefresh = document.getElementById("taste-refresh");
     if (tasteRefresh) tasteRefresh.addEventListener("click", refreshRecommendations);
+
+    let programPollTimer = null;
+    let programReloading = false;
+
+    function stopProgramPoll() {
+      if (programPollTimer) {
+        clearTimeout(programPollTimer);
+        programPollTimer = null;
+      }
+    }
+
+    async function pollProgramCheck(statusEl, button) {
+      programPollTimer = null;
+      try {
+        const response = await fetch(matchApi("/api/program"), { cache: "no-store" });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload.error || "Could not check the Wien program.");
+        }
+        if (payload.status === "running") {
+          if (statusEl && payload.message) statusEl.textContent = payload.message;
+          programPollTimer = setTimeout(() => pollProgramCheck(statusEl, button), 1500);
+          return;
+        }
+        if (payload.reload) {
+          programReloading = true;
+          if (statusEl) {
+            statusEl.textContent = (payload.message || "Program updated.") + " Reloading…";
+          }
+          window.location.reload();
+          return;
+        }
+        if (statusEl) {
+          statusEl.hidden = false;
+          statusEl.classList.toggle("is-error", Boolean(payload.error));
+          statusEl.textContent = payload.error || payload.message || "The Wien program is unchanged.";
+        }
+      } catch (err) {
+        if (statusEl) {
+          statusEl.hidden = false;
+          statusEl.classList.add("is-error");
+          statusEl.textContent = err && err.message ? err.message : "Could not check the Wien program.";
+        }
+      } finally {
+        if (!programPollTimer && !programReloading && button) button.disabled = false;
+      }
+    }
+
+    async function checkForNewFilms() {
+      const button = document.getElementById("program-check");
+      const statusEl = document.getElementById("program-check-status");
+      if (!button || button.disabled) return;
+      stopProgramPoll();
+      button.disabled = true;
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.classList.remove("is-error");
+        statusEl.textContent = "Reading the Wien program…";
+      }
+      try {
+        const response = await fetch(matchApi("/api/program"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const fallback = response.status === 404 || response.status === 503
+            ? "Start python3 goodmoviefinder.py --serve, then check for new films."
+            : "Could not check the Wien program.";
+          throw new Error(payload.error || fallback);
+        }
+        if (statusEl && payload.message) statusEl.textContent = payload.message;
+        programPollTimer = setTimeout(() => pollProgramCheck(statusEl, button), 800);
+      } catch (err) {
+        if (statusEl) {
+          statusEl.hidden = false;
+          statusEl.classList.add("is-error");
+          const offline = err && err.message && /failed to fetch|networkerror|load failed/i.test(err.message);
+          statusEl.textContent = offline
+            ? "Start python3 goodmoviefinder.py --serve, then check for new films."
+            : (err && err.message ? err.message : "Could not check the Wien program.");
+        }
+        button.disabled = false;
+      }
+    }
+
+    const programCheck = document.getElementById("program-check");
+    if (programCheck) programCheck.addEventListener("click", checkForNewFilms);
 
     function matchApi(path) {
       const node = document.getElementById("viewer-config");

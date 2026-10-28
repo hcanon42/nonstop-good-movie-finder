@@ -300,8 +300,9 @@ def _showtimes_list_html(
         heading = html.escape(format_screening_date(day.isoformat()))
         visible = any(_screening_followable(movie, screening, known) for screening in screenings)
         hidden = "" if visible else " hidden"
+        iso = day.isoformat()
         blocks.append(
-            f'<div class="showtime-day"{hidden}><h3>{heading}</h3>'
+            f'<div class="showtime-day" data-date="{iso}"{hidden}><h3>{heading}</h3>'
             f"<ul>{_day_screening_items_html(movie, screenings, known)}</ul></div>"
         )
     return f'<div class="showtimes">{"".join(blocks)}</div>'
@@ -967,7 +968,7 @@ def _new_program_chip_html(movie: Movie) -> str:
     if not movie.new_in_program:
         return ""
     return (
-        '<span class="chip chip-new" title="New in the program since your last run">'
+        '<span class="chip chip-new" title="New in the Wien program since this page was last built">'
         "New</span> "
     )
 
@@ -1300,7 +1301,7 @@ def format_html(
             section(
                 "just-arrived",
                 "Just arrived",
-                f"On {user_label}'s watchlist and new in the program since the last run",
+                f"On {user_label}'s watchlist and new in the Wien program since this page was last built",
                 just_arrived,
                 known,
                 row_class="row-just-arrived",
@@ -1502,6 +1503,12 @@ def format_html(
         )
     )
     tools_html = (
+        '      <div class="program-check-bar">\n'
+        '        <button type="button" id="program-check" class="program-check" '
+        'title="Read the Wien program again. Add films that arrived and drop films that left.">'
+        "Check for new films</button>\n"
+        '        <p class="program-check-status" id="program-check-status" role="status" hidden></p>\n'
+        "      </div>\n"
         '      <div class="search-field" data-tools="list calendar">\n'
         '        <input type="search" id="search" placeholder="Filter by title, director, genre…" '
         'autocomplete="off" aria-describedby="search-count">\n'
