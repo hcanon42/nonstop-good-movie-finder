@@ -174,6 +174,19 @@ def parse_synopsis(html_text: str) -> str | None:
     return best or None
 
 
+def parse_page_venues(html_text: str) -> frozenset[str]:
+    """Venue slugs listed on a film page, whether or not they link to a website."""
+    venues: set[str] = set()
+    for article in PROGRAM_ARTICLE_RE.findall(html_text):
+        venue_match = re.search(r'data-venue="([^"]*)"', article)
+        if not venue_match:
+            continue
+        venue = venue_match.group(1).strip()
+        if venue:
+            venues.add(venue)
+    return frozenset(venues)
+
+
 def parse_cinema_sites(html_text: str) -> dict[str, str]:
     sites: dict[str, str] = {}
     for article in PROGRAM_ARTICLE_RE.findall(html_text):
@@ -247,6 +260,7 @@ def parse_nonstop_movie_page(html_text: str) -> NonstopFilmPage:
         director=_meta_class_value(html_text, "director"),
         synopsis=parse_synopsis(html_text),
         cinema_sites=parse_cinema_sites(html_text),
+        venues=parse_page_venues(html_text),
         cast=_parse_nonstop_cast(html_text),
         duration_minutes=_parse_nonstop_duration(html_text),
     )

@@ -30,6 +30,8 @@ class NonstopFilmPage:
     director: str | None
     synopsis: str | None
     cinema_sites: dict[str, str]
+    # Venue slugs present on the film page when cinema websites were last read.
+    venues: frozenset[str] = field(default_factory=frozenset)
     cast: list[str] = field(default_factory=list)
     duration_minutes: int | None = None
 
@@ -57,6 +59,9 @@ class Movie:
     letterboxd_backdrop_url: str | None = None
     synopsis: str | None = None
     cinema_sites: dict[str, str] = field(default_factory=dict)
+    # Venue slugs seen on the Nonstop film page, including ones with no website.
+    cinema_venues: list[str] = field(default_factory=list)
+    cinema_venues_known: bool = False
     details_known: bool = False
     duration_minutes: int | None = None
     duration_known: bool = False

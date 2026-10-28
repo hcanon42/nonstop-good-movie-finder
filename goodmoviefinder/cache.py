@@ -29,7 +29,7 @@ from goodmoviefinder.letterboxd import (
     parse_original_title,
     parse_primary_language,
 )
-from goodmoviefinder.models import Movie
+from goodmoviefinder.models import Movie, NonstopFilmPage
 from goodmoviefinder.nonstop import parse_nonstop_movie_page
 from goodmoviefinder.program import LOVED_RATING, letterboxd_slug_from_url
 
@@ -361,6 +361,19 @@ def cache_get(cache: dict[str, Any], nonstop_url: str) -> Movie | None:
     )
     details_known = "synopsis" in entry and "cinema_sites" in entry
     cinema_sites = entry.get("cinema_sites") if details_known else {}
+    raw_venues = entry.get("cinema_venues")
+    cinema_venues_known = isinstance(raw_venues, list)
+    cinema_venues = (
+        sorted(
+            {
+                venue.strip()
+                for venue in raw_venues
+                if isinstance(venue, str) and venue.strip()
+            }
+        )
+        if cinema_venues_known
+        else []
+    )
     raw_duration = entry.get("duration_minutes")
     duration_minutes = (
         raw_duration if isinstance(raw_duration, int) and raw_duration > 0 else None
@@ -382,6 +395,8 @@ def cache_get(cache: dict[str, Any], nonstop_url: str) -> Movie | None:
         primary_language_known=language_known,
         synopsis=entry.get("synopsis") if details_known else None,
         cinema_sites=dict(cinema_sites or {}),
+        cinema_venues=cinema_venues,
+        cinema_venues_known=cinema_venues_known,
         details_known=details_known,
         duration_minutes=duration_minutes,
         duration_known=duration_known,
@@ -428,6 +443,8 @@ def cache_put(cache: dict[str, Any], movie: Movie) -> None:
     if movie.details_known:
         entry["synopsis"] = movie.synopsis
         entry["cinema_sites"] = movie.cinema_sites
+        if movie.cinema_venues_known:
+            entry["cinema_venues"] = list(movie.cinema_venues)
     if isinstance(movie.duration_minutes, int) and movie.duration_minutes > 0:
         entry["duration_minutes"] = movie.duration_minutes
         entry["duration_known"] = True
@@ -508,6 +525,56 @@ def backfill_letterboxd_details(movie: Movie, delay: float) -> bool:
     return True
 
 
+def cinema_sites_stale(movie: Movie) -> bool:
+    """True when a current screening is at a cinema we have not resolved yet."""
+    if not movie.details_known:
+        return False
+    known = set(movie.cinema_venues) if movie.cinema_venues_known else set(movie.cinema_sites)
+    return any(
+        screening.venue_slug and screening.venue_slug not in known
+        for screening in movie.screenings
+    )
+
+
+def apply_cinema_sites(movie: Movie, page: NonstopFilmPage) -> bool:
+    """Merge cinema websites from a film page. Returns True when the cache should be saved."""
+    before_sites = dict(movie.cinema_sites)
+    before_venues = list(movie.cinema_venues) if movie.cinema_venues_known else None
+    sites = {
+        slug: url
+        for slug, url in movie.cinema_sites.items()
+        if slug not in page.venues
+    }
+    sites.update(page.cinema_sites)
+    movie.cinema_sites = sites
+    movie.cinema_venues = sorted(page.venues)
+    movie.cinema_venues_known = True
+    return sites != before_sites or before_venues != movie.cinema_venues
+
+
+def refresh_cinema_sites(movie: Movie, delay: float) -> bool:
+    """Re-read cinema websites when the program lists a cinema that is not saved yet."""
+    if not cinema_sites_stale(movie):
+        return False
+    print("  Updating cinema websites…", file=sys.stderr)
+    try:
+        body = fetch(movie.nonstop_url)
+    except urllib.error.URLError as exc:
+        print(
+            f"  Cinema websites failed ({exc.reason}); keeping saved links.",
+            file=sys.stderr,
+        )
+        return False
+    page = parse_nonstop_movie_page(body)
+    if not page.venues:
+        print("  Cinema websites missing from the film page; keeping saved links.", file=sys.stderr)
+        time.sleep(delay)
+        return False
+    changed = apply_cinema_sites(movie, page)
+    time.sleep(delay)
+    return changed
+
+
 def backfill_nonstop_details(movie: Movie, delay: float) -> None:
     """Fill synopsis and cinema websites for a cached film."""
     if movie.details_known:
@@ -522,7 +589,7 @@ def backfill_nonstop_details(movie: Movie, delay: float) -> None:
         return
     page = parse_nonstop_movie_page(body)
     movie.synopsis = page.synopsis
-    movie.cinema_sites = page.cinema_sites
+    apply_cinema_sites(movie, page)
     movie.details_known = True
     if isinstance(page.duration_minutes, int) and page.duration_minutes > 0:
         movie.duration_minutes = page.duration_minutes

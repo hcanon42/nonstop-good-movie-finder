@@ -13,12 +13,15 @@ from pathlib import Path
 
 from goodmoviefinder.apple_calendar import fetch_apple_busy, save_apple_events
 from goodmoviefinder.cache import (
+    apply_cinema_sites,
     backfill_letterboxd_details,
     backfill_nonstop_details,
     backfill_runtime,
     cache_get,
+    cinema_sites_stale,
     fill_letterboxd_poster,
     cache_put,
+    refresh_cinema_sites,
     ensure_loved_film_credits,
     load_cache,
     load_profile_cache,
@@ -198,6 +201,7 @@ def _program_change_message(
     removed: list[str],
     *,
     screenings_changed: bool,
+    links_changed: bool = False,
 ) -> str:
     """Status line after a Wien program check."""
 
@@ -214,9 +218,13 @@ def _program_change_message(
         label = "film" if len(removed) == 1 else "films"
         parts.append(f"Removed {len(removed)} {label}: {_names(removed)}")
     if not parts:
+        if links_changed and not screenings_changed:
+            return "Cinema links updated."
         return "Showtimes updated." if screenings_changed else "The Wien program is unchanged."
     if screenings_changed:
         parts.append("Showtimes updated")
+    elif links_changed:
+        parts.append("Cinema links updated")
     return ". ".join(parts) + "."
 
 
@@ -281,6 +289,8 @@ def lookup_program_film(
                 print("  Looking up synopsis and cinema websites…", file=sys.stderr)
                 backfill_nonstop_details(cached, delay)
                 updated = updated or cached.details_known
+            elif cinema_sites_stale(cached):
+                updated = refresh_cinema_sites(cached, delay) or updated
             if not cached.duration_known:
                 print("  Looking up runtime…", file=sys.stderr)
                 updated = backfill_runtime(cached, delay) or updated
@@ -325,7 +335,7 @@ def lookup_program_film(
                         "  Letterboxd lookup failed; keeping the saved link.",
                         file=sys.stderr,
                     )
-                    if cached.duration_minutes is not None:
+                    if updated or cached.duration_minutes is not None:
                         cache_put(cache, cached)
                         save_cache(cache_path, cache)
                     return _mark_new(cached, new_in_program)
@@ -376,7 +386,7 @@ def lookup_program_film(
     attach_program(movie, film)
     if page is not None:
         movie.synopsis = page.synopsis
-        movie.cinema_sites = page.cinema_sites
+        apply_cinema_sites(movie, page)
         movie.details_known = True
         _remember_runtime(movie, page)
     apply_nonstop_metadata(movie, release_year, nonstop_director)
@@ -1126,6 +1136,7 @@ class ProgramPage:
                 self.results[:] = kept
                 by_url = {movie.nonstop_url: movie for movie in self.results}
                 screenings_changed = False
+                pending: list[Movie] = []
                 for film in films:
                     movie = by_url.get(film.url)
                     if movie is None:
@@ -1135,7 +1146,37 @@ class ProgramPage:
                     after = (movie.versions, movie.screenings, movie.poster_url)
                     if before != after:
                         screenings_changed = True
-                if not added and not removed and not screenings_changed:
+                    if cinema_sites_stale(movie):
+                        pending.append(movie)
+                if not added and not removed and not screenings_changed and not pending:
+                    self._program_message = "The Wien program is unchanged."
+                    self._program_reload = False
+                    return
+                if pending:
+                    self._program_detail = "Updating cinema websites…"
+            links_changed = False
+            sites_saved = False
+            for movie in pending:
+                with self._lock:
+                    if epoch != self._epoch:
+                        if sites_saved:
+                            save_cache(self.cache_path, self.cache)
+                        return
+                before_sites = dict(movie.cinema_sites)
+                if not refresh_cinema_sites(movie, self.delay):
+                    continue
+                if movie.cinema_sites != before_sites:
+                    links_changed = True
+                with self._lock:
+                    cache_put(self.cache, movie)
+                sites_saved = True
+            if sites_saved:
+                with self._lock:
+                    save_cache(self.cache_path, self.cache)
+            with self._lock:
+                if epoch != self._epoch:
+                    return
+                if not added and not removed and not screenings_changed and not links_changed:
                     self._program_message = "The Wien program is unchanged."
                     self._program_reload = False
                     return
@@ -1146,6 +1187,7 @@ class ProgramPage:
                     added,
                     removed,
                     screenings_changed=screenings_changed,
+                    links_changed=links_changed,
                 )
                 self._program_reload = True
         except Exception as exc:
