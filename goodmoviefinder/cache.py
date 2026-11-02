@@ -1,4 +1,10 @@
-"""JSON cache for Letterboxd matches and the viewer profile."""
+"""JSON cache for Letterboxd matches, the viewer profile, and film features.
+
+``ratings.json`` holds program matches, the profile, and recommendations.
+Film features live in ``film-features.json`` beside it. A program lookup
+rewrites the ratings file often; features change only while they are being
+fetched, so they are not written on every match.
+"""
 
 from __future__ import annotations
 
@@ -329,21 +335,87 @@ def recommendations_updated_label(fetched_at: int | None) -> str:
     return f"Last built {when}"
 
 
-def load_cache(path: Path) -> dict[str, Any]:
+# Set on the in-memory cache when a film feature changes. Never written to disk.
+_FEATURES_DIRTY = "_film_features_dirty"
+
+
+def film_features_path(cache_path: Path) -> Path:
+    return cache_path.with_name("film-features.json")
+
+
+def note_film_features_changed(cache: dict[str, Any]) -> None:
+    """Remember that ``film_features`` should be written on the next save."""
+    cache[_FEATURES_DIRTY] = True
+
+
+def _read_json_object(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
-        return {"version": CACHE_VERSION, "entries": {}}
+        return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return {"version": CACHE_VERSION, "entries": {}}
-    if data.get("version") != CACHE_VERSION:
-        return {"version": CACHE_VERSION, "entries": {}}
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_json(path: Path, payload: object) -> None:
+    """Replace a JSON file without leaving a half-written document."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _ratings_payload(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in data.items()
+        if key not in ("film_features", _FEATURES_DIRTY)
+    }
+
+
+def load_cache(path: Path) -> dict[str, Any]:
+    raw = _read_json_object(path)
+    if raw is None or raw.get("version") != CACHE_VERSION:
+        data: dict[str, Any] = {"version": CACHE_VERSION, "entries": {}}
+        legacy = None
+    else:
+        data = raw
+        legacy = data.pop("film_features", None)
+    sidecar = _read_json_object(film_features_path(path))
+    if sidecar is not None:
+        data["film_features"] = sidecar
+        # Drop a copy left in ratings.json by an older version of the cache.
+        if legacy is not None:
+            _write_json(path, _ratings_payload(data))
+    elif isinstance(legacy, dict):
+        data["film_features"] = legacy
+        _write_json(film_features_path(path), legacy)
+        _write_json(path, _ratings_payload(data))
+    else:
+        data["film_features"] = {}
     return data
 
 
+def save_film_features(cache_path: Path, cache: dict[str, Any]) -> None:
+    """Write film features only. Used when a backdrop changes and ratings do not."""
+    features = cache.get("film_features")
+    if not isinstance(features, dict):
+        return
+    _write_json(film_features_path(cache_path), features)
+    cache.pop(_FEATURES_DIRTY, None)
+
+
 def save_cache(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    dirty = bool(data.get(_FEATURES_DIRTY))
+    features = data.get("film_features")
+    if dirty and isinstance(features, dict):
+        _write_json(film_features_path(path), features)
+    data.pop(_FEATURES_DIRTY, None)
+    _write_json(path, _ratings_payload(data))
 
 
 def cache_get(cache: dict[str, Any], nonstop_url: str) -> Movie | None:
@@ -895,8 +967,7 @@ def remember_backdrop(
     mapping = dict(load_backdrops(cache_path))
     mapping[slug] = letterboxd_backdrop_url(url)
     path = backdrop_path(cache_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_json(path, mapping)
     global _BACKDROP_MAP, _BACKDROP_MTIME
     _BACKDROP_MAP = mapping
     try:
@@ -950,6 +1021,7 @@ def _film_feature_put(cache: dict[str, Any], slug: str, feature: dict[str, Any])
         "card_known": bool(feature.get("card_known")),
         "fetched": True,
     }
+    note_film_features_changed(cache)
     stored_backdrop = letterboxd_backdrop_url(cache["film_features"][slug].get("backdrop"))
     if stored_backdrop and backdrop_for_slug(slug) != stored_backdrop:
         remember_backdrop(slug, stored_backdrop)
@@ -1069,6 +1141,7 @@ def ensure_nanogenres(
             raw["nanogenres"] = [name for name, _nano in pairs]
             raw["nanogenre_slugs"] = {name: nano for name, nano in pairs}
             raw["nanogenres_known"] = True
+            note_film_features_changed(cache)
             found += 1
         if index % 25 == 0 or index == len(missing):
             print(
@@ -1125,6 +1198,7 @@ def ensure_film_cards(
             raw["backdrop"] = backdrop
             remember_backdrop(slug, backdrop)
         raw["card_known"] = True
+        note_film_features_changed(cache)
         label = raw.get("title") or slug
         print(f"  [{index}/{len(missing)}] {label}", file=sys.stderr)
         tick(current=index, total=len(missing), detail=str(label))

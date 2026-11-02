@@ -13,7 +13,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from goodmoviefinder.html import _rating_style
+from goodmoviefinder.rating_style import rating_style
 from goodmoviefinder.http import fetch
 from goodmoviefinder.letterboxd import (
     LetterboxdRefused,
@@ -1018,7 +1018,7 @@ def present_friend_ratings(
                 "profile": f"https://letterboxd.com/{urllib.parse.quote(username, safe='')}/",
                 "rating": score,
                 "ratingText": None if score is None else f"{score:.1f}",
-                "ratingStyle": _rating_style(score),
+                "ratingStyle": rating_style(score),
                 "comment": friend.get("comment"),
             }
         )

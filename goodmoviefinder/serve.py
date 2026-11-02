@@ -13,6 +13,7 @@ from typing import Any
 
 from goodmoviefinder.config import GENERATED_HTML
 from goodmoviefinder.progress import format_progress_html
+from goodmoviefinder.session import ProgramPage
 
 
 class ServeHub:
@@ -22,15 +23,15 @@ class ServeHub:
         from goodmoviefinder.progress import BuildProgress
 
         self.progress = BuildProgress()
-        self._page: Any = None
+        self._page: ProgramPage | None = None
         self._lock = threading.Lock()
 
-    def attach(self, page: Any) -> None:
+    def attach(self, page: ProgramPage) -> None:
         with self._lock:
             self._page = page
 
     @property
-    def page(self) -> Any:
+    def page(self) -> ProgramPage | None:
         with self._lock:
             return self._page
 
@@ -40,7 +41,7 @@ class ServeHub:
         return page.html_path if page is not None else GENERATED_HTML
 
 
-def start_server(state: Any, port: int, *, open_browser: bool = True) -> ThreadingHTTPServer | None:
+def start_server(state: Any, port: int, *, open_browser: bool = False) -> ThreadingHTTPServer | None:
     html_path = GENERATED_HTML
     hub = state if isinstance(state, ServeHub) else None
 

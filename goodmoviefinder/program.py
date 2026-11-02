@@ -18,21 +18,6 @@ VERSION_ORDER = ("OV", "OmdU", "OmeU", "DF")
 # Letterboxd label for dialogue-free films; any Nonstop version is fine.
 NO_SPOKEN_LANGUAGE_KEY = "no spoken language"
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_MONTHS = (
-    "",
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-)
 _MONTHS_SHORT = (
     "",
     "Jan",
@@ -385,34 +370,3 @@ def split_program_groups(movies: list[Movie]) -> tuple[list[Movie], list[Movie],
         else:
             unfound.append(movie)
     return sort_movies(rated), sort_movies(unrated), sort_movies(unfound)
-
-
-def _format_year(m: Movie) -> str:
-    return str(m.year) if m.year is not None else "—"
-
-
-# Keep table cells short; hover still shows the full credit.
-_DISPLAY_DIRECTOR_LIMIT = 2
-
-
-def _format_names(names: list[str], *, limit: int | None = None) -> str:
-    cleaned = [name.strip() for name in names if isinstance(name, str) and name.strip()]
-    if not cleaned:
-        return "—"
-    if limit is not None and len(cleaned) > limit:
-        return ", ".join(cleaned[:limit]) + ", …"
-    return ", ".join(cleaned)
-
-
-def _format_directors(m: Movie, *, limit: int | None = None) -> str:
-    return _format_names(m.directors, limit=limit)
-
-
-def _format_genres(m: Movie) -> str:
-    return ", ".join(m.genres) if m.genres else "—"
-
-
-def _format_user_rating(rating: float | None) -> str:
-    if rating is None:
-        return "—"
-    return f"{rating:.1f}"

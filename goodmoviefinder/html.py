@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import calendar
 import html
-import json
 import re
 from datetime import date
 from pathlib import Path
@@ -16,16 +15,10 @@ from goodmoviefinder.config import (
 )
 from goodmoviefinder.cache import backdrop_lookup
 from goodmoviefinder.letterboxd import letterboxd_backdrop_url, letterboxd_poster_url
-from goodmoviefinder.layout import render_page
+from goodmoviefinder.layout import json_for_html, render_page
 from goodmoviefinder.models import Movie, Screening
 from goodmoviefinder.program import (
-    _MONTHS,
     LOVED_RATING,
-    _DISPLAY_DIRECTOR_LIMIT,
-    _format_directors,
-    _format_genres,
-    _format_user_rating,
-    _format_year,
     acceptable_versions,
     counts_as_viewer_language,
     primary_language_constrains_versions,
@@ -41,6 +34,7 @@ from goodmoviefinder.program import (
     split_program_groups,
     venue_label,
 )
+from goodmoviefinder.rating_style import rating_style
 from goodmoviefinder.viewer import (
     canonical_languages,
     language_choices,
@@ -50,55 +44,51 @@ from goodmoviefinder.viewer import (
 
 _ASSET_DIR = Path(__file__).resolve().parent
 
-# Text and badge colors blend between these scores. Stops past 4.2 and below
-# 2.6 keep the ends of the Letterboxd scale from collapsing to one shade.
-_RATING_COLOR_STOPS: tuple[tuple[float, tuple[int, int, int], tuple[int, int, int, float]], ...] = (
-    (0.5, (220, 96, 86), (176, 58, 48, 0.28)),
-    (2.6, (232, 138, 122), (196, 92, 74, 0.22)),
-    (3.0, (232, 200, 90), (201, 162, 39, 0.20)),
-    (3.4, (212, 222, 122), (168, 184, 74, 0.20)),
-    (3.8, (159, 216, 106), (106, 171, 74, 0.22)),
-    (4.2, (111, 212, 168), (61, 154, 110, 0.25)),
-    (5.0, (126, 232, 214), (72, 186, 168, 0.32)),
+_MONTHS = (
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 )
 
-
-def _lerp(start: float, end: float, t: float) -> float:
-    return start + (end - start) * t
-
-
-def _rating_colors(
-    rating: float,
-) -> tuple[tuple[int, int, int], tuple[int, int, int, float]]:
-    stops = _RATING_COLOR_STOPS
-    if rating <= stops[0][0]:
-        return stops[0][1], stops[0][2]
-    if rating >= stops[-1][0]:
-        return stops[-1][1], stops[-1][2]
-    for index in range(len(stops) - 1):
-        low_rating, low_text, low_bg = stops[index]
-        high_rating, high_text, high_bg = stops[index + 1]
-        if low_rating <= rating <= high_rating:
-            t = (rating - low_rating) / (high_rating - low_rating)
-            text = tuple(round(_lerp(a, b, t)) for a, b in zip(low_text, high_text))
-            background = (
-                round(_lerp(low_bg[0], high_bg[0], t)),
-                round(_lerp(low_bg[1], high_bg[1], t)),
-                round(_lerp(low_bg[2], high_bg[2], t)),
-                _lerp(low_bg[3], high_bg[3], t),
-            )
-            return text, background
-    return stops[-1][1], stops[-1][2]
+# Keep table cells short; hover still shows the full credit.
+_DISPLAY_DIRECTOR_LIMIT = 2
 
 
-def _rating_style(rating: float | None) -> str:
+def _format_names(names: list[str], *, limit: int | None = None) -> str:
+    cleaned = [name.strip() for name in names if isinstance(name, str) and name.strip()]
+    if not cleaned:
+        return "—"
+    if limit is not None and len(cleaned) > limit:
+        return ", ".join(cleaned[:limit]) + ", …"
+    return ", ".join(cleaned)
+
+
+def _format_year(movie: Movie) -> str:
+    return str(movie.year) if movie.year is not None else "—"
+
+
+def _format_directors(movie: Movie, *, limit: int | None = None) -> str:
+    return _format_names(movie.directors, limit=limit)
+
+
+def _format_genres(movie: Movie) -> str:
+    return ", ".join(movie.genres) if movie.genres else "—"
+
+
+def _format_user_rating(rating: float | None) -> str:
     if rating is None:
-        return ""
-    (red, green, blue), (bg_red, bg_green, bg_blue, bg_alpha) = _rating_colors(rating)
-    return (
-        f"color: rgb({red},{green},{blue}); "
-        f"background: rgba({bg_red},{bg_green},{bg_blue},{bg_alpha:.3f});"
-    )
+        return "—"
+    return f"{rating:.1f}"
 
 
 def _plan_title(movie: Movie) -> str:
@@ -119,10 +109,6 @@ def _plan_add_button(movie: Movie) -> str:
         f'<span class="visually-hidden">Add to plan</span>'
         f"</button>"
     )
-
-
-def _json_for_html(payload: object) -> str:
-    return json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c")
 
 
 def _screening_followable(movie: Movie, screening: Screening, known: frozenset[str]) -> bool:
@@ -161,7 +147,7 @@ def _plan_catalog_json(movies: list[Movie]) -> str:
                 "screenings": screenings,
             }
         )
-    return _json_for_html(catalog)
+    return json_for_html(catalog)
 
 
 def _rating_badge(rating: float | None, text: str, extra_class: str = "", title: str = "") -> str:
@@ -174,7 +160,7 @@ def _rating_badge(rating: float | None, text: str, extra_class: str = "", title:
         )
         if part
     )
-    style = _rating_style(rating)
+    style = rating_style(rating)
     style_attr = f' style="{style}"' if style else ""
     title_attr = f' title="{html.escape(title, quote=True)}"' if title else ""
     return f'<span class="{classes}"{style_attr}{title_attr}>{text}</span>'
@@ -248,7 +234,7 @@ def _calendar_day_cell(
     if not screenings:
         return f'<span class="cal-day">{day.day}</span>'
     follow = [screening for screening in screenings if _screening_followable(movie, screening, known)]
-    payload = _json_for_html(
+    payload = json_for_html(
         [
             {
                 "v": screening.language,
@@ -1433,10 +1419,7 @@ def format_html(
         just_arrived=just_arrived,
     )
     catalog_json = _plan_catalog_json([*watchlist, *recommendations, *watched, *program])
-    busy_json = json.dumps(
-        {"intervals": busy_intervals or []},
-        ensure_ascii=False,
-    ).replace("<", "\\u003c")
+    busy_json = json_for_html({"intervals": busy_intervals or []})
     connected = set(calendar_sources or [])
     calendar_buttons = []
     for source, label in (("google", "Google Calendar"), ("apple", "Apple Calendar")):
