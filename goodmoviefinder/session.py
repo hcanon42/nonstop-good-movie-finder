@@ -104,7 +104,7 @@ def calendar_for_plan(
                 intervals = fetch_apple_busy(start, end)
             else:
                 intervals = fetch_google_busy(start, end)
-        except CalendarError as exc:
+        except (CalendarError, OSError) as exc:
             print(f"{label}: {exc}", file=sys.stderr)
             failed.append(source)
             continue

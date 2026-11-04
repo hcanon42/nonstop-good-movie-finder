@@ -52,6 +52,7 @@ _PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 
 def fetch_apple_busy(start: datetime, end: datetime) -> list[BusyInterval]:
     """Timed events that mark you occupied, between start and end."""
+    _require_macos()
     payload = _run_helper(
         {
             "start": start.timestamp(),
@@ -69,6 +70,7 @@ def fetch_apple_busy(start: datetime, end: datetime) -> list[BusyInterval]:
 
 def save_apple_events(events: list[dict[str, object]]) -> tuple[int, int, str]:
     """Add films to the calendar Apple uses for new events."""
+    _require_macos()
     if not events:
         raise CalendarError("There are no films to add.")
     starts = [event["start"] for event in events if isinstance(event.get("start"), datetime)]
@@ -119,6 +121,8 @@ def _run_helper(request: dict[str, object]) -> dict:
             check=False,
             timeout=180,
         )
+    except FileNotFoundError as exc:
+        raise CalendarError("Apple Calendar is only available on macOS.") from exc
     except subprocess.TimeoutExpired as exc:
         raise CalendarError("Timed out waiting for Calendar access.") from exc
     if not _RESULT.is_file():
@@ -160,7 +164,13 @@ def _parse_datetime(value: str) -> datetime:
     return parsed
 
 
+def _require_macos() -> None:
+    if sys.platform != "darwin":
+        raise CalendarError("Apple Calendar is only available on macOS.")
+
+
 def _ensure_helper() -> Path:
+    _require_macos()
     executable = _APP / "Contents" / "MacOS" / "CalendarBusy"
     if executable.is_file() and executable.stat().st_mtime >= _SOURCE.stat().st_mtime:
         return _APP
@@ -170,11 +180,17 @@ def _ensure_helper() -> Path:
     macos.mkdir(parents=True, exist_ok=True)
     (_APP / "Contents" / "Info.plist").write_text(_PLIST, encoding="utf-8")
     print("Building the calendar helper…", file=sys.stderr)
-    compiled = subprocess.run(
-        ["swiftc", "-O", "-framework", "EventKit", "-o", str(executable), str(_SOURCE)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        compiled = subprocess.run(
+            ["swiftc", "-O", "-framework", "EventKit", "-o", str(executable), str(_SOURCE)],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise CalendarError(
+            "Could not build the calendar helper. Install the Xcode command line "
+            "tools with `xcode-select --install` and run the command again."
+        ) from exc
     if compiled.returncode != 0:
         detail = (compiled.stderr or compiled.stdout or "").strip()
         raise CalendarError(
