@@ -5,10 +5,32 @@ from __future__ import annotations
 import http.cookiejar
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
 from goodmoviefinder.config import USER_AGENT
+
+
+def _letterboxd_host(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower().rstrip(".")
+    return (
+        host == "letterboxd.com"
+        or host.endswith(".letterboxd.com")
+        or host == "ltrbxd.com"
+        or host.endswith(".ltrbxd.com")
+    )
+
+
+def _refuse_letterboxd(url: str) -> None:
+    """VM mode never opens a Letterboxd connection, including the image CDN."""
+    if not _letterboxd_host(url):
+        return
+    from goodmoviefinder.letterboxd import LetterboxdOffline, vm_mode
+
+    if vm_mode():
+        raise LetterboxdOffline(f"VM mode does not call Letterboxd ({url})")
+
 
 def _request_headers() -> dict[str, str]:
     return {
@@ -33,6 +55,7 @@ def fetch(
     opener: urllib.request.OpenerDirector | None = None,
     extra_headers: dict[str, str] | None = None,
 ) -> str:
+    _refuse_letterboxd(url)
     headers = _request_headers()
     if extra_headers:
         headers.update(extra_headers)
@@ -60,6 +83,7 @@ def fetch(
 
 
 def fetch_status(url: str, timeout: float = 45.0) -> tuple[int, str, str]:
+    _refuse_letterboxd(url)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     last_error: Exception | None = None
     for attempt in range(3):

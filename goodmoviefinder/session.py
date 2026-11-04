@@ -227,6 +227,7 @@ class ProgramPage:
         following_user: str | None = None,
         program_url: str = DEFAULT_PROGRAM_URL,
         no_cache: bool = False,
+        vm: bool = False,
     ) -> None:
         self.results = results
         self.cache = cache
@@ -243,6 +244,7 @@ class ProgramPage:
         self.calendar_sources = list(calendar_sources)
         self.program_url = program_url
         self.no_cache = no_cache
+        self.vm = vm
         self._program_running = False
         self._program_error: str | None = None
         self._program_message: str | None = None
@@ -324,6 +326,8 @@ class ProgramPage:
         ) or ""
 
     def search_letterboxd(self, query: str) -> dict[str, object]:
+        if self.vm:
+            raise ValueError("Letterboxd search is off in VM mode.")
         text = query.strip()
         if not text:
             raise ValueError("Type a title to search Letterboxd.")
@@ -349,8 +353,11 @@ class ProgramPage:
         with self._lock:
             known, url = backdrop_lookup(normalized)
             delay = self.delay
+            offline = self.vm
         if known:
             return {"url": url}
+        if offline:
+            return {"url": None}
         body = fetch_letterboxd_html(letterboxd_film_page_url(normalized), delay)
         url = parse_letterboxd_backdrop(body)
         with self._lock:
@@ -364,6 +371,8 @@ class ProgramPage:
         return {"url": url}
 
     def apply_match(self, payload: dict) -> dict[str, object]:
+        if self.vm:
+            raise ValueError("Letterboxd search is off in VM mode.")
         with self._lock:
             raw_url = payload.get("nonstopUrl")
             raw_slug = payload.get("slug")
@@ -572,6 +581,8 @@ class ProgramPage:
 
     def start_recommendations_refresh(self) -> dict[str, object]:
         with self._lock:
+            if self.vm:
+                raise ValueError("Recommendations stay on the saved list in VM mode.")
             if self.no_profile:
                 raise ValueError("Sign in to refresh recommendations.")
             if self._rec_running or self._rebuilding:
@@ -630,6 +641,7 @@ class ProgramPage:
             known_languages=self.languages,
             language_options=choices,
             letterboxd_avatar=self._letterboxd_avatar_for_page(),
+            vm=self.vm,
         )
         GENERATED_ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
         GENERATED_ACCOUNT.write_text(account, encoding="utf-8")
@@ -695,6 +707,7 @@ class ProgramPage:
             signed_in=not self.no_profile,
             following_user=self.following_user,
             letterboxd_avatar=self._letterboxd_avatar_for_page(),
+            vm=self.vm,
         )
         GENERATED_HTML.parent.mkdir(parents=True, exist_ok=True)
         GENERATED_HTML.write_text(output, encoding="utf-8")
@@ -729,6 +742,10 @@ class ProgramPage:
         with self._lock:
             epoch = self._epoch
             if self.no_profile:
+                return
+            if self.vm:
+                self.ignore_recommendation_cache = False
+                self.load_cached_recommendations()
                 return
             if not force and self.load_cached_recommendations():
                 return

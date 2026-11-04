@@ -21,6 +21,7 @@ from goodmoviefinder.progress import tick
 from goodmoviefinder.letterboxd import (
     LetterboxdRefused,
     fetch_letterboxd_film_credit,
+    vm_mode,
     fetch_letterboxd_html,
     letterboxd_backdrop_url,
     letterboxd_film_nanogenres_url,
@@ -771,6 +772,13 @@ def ensure_loved_film_credits(
         else:
             credits[slug] = credit
 
+    if missing and vm_mode():
+        print(
+            f"VM mode: {len(missing)} loved "
+            f"{'film has' if len(missing) == 1 else 'films have'} no saved director.",
+            file=sys.stderr,
+        )
+        missing = []
     if missing:
         print(
             f"Looking up directors for {len(missing)} films rated {LOVED_RATING:.1f} or higher…",

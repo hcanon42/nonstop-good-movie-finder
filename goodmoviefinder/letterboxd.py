@@ -164,6 +164,8 @@ def _iter_letterboxd_profile_pages(
     require_first_page: bool = False,
 ):
     """Yield each profile page. `until_complete` retries a refused page until it loads."""
+    if vm_mode():
+        raise LetterboxdOffline("VM mode does not call Letterboxd.")
     page = 1
     opener = make_cookie_opener()
     pause = max(profile_delay if profile_delay is not None else delay, 1.0)
@@ -344,6 +346,23 @@ class LetterboxdRefused(RuntimeError):
     """Letterboxd answered 403, 429, or 503 after retries."""
 
 
+class LetterboxdOffline(Exception):
+    """VM mode refused a Letterboxd request before any connection was opened."""
+
+
+_VM_MODE = False
+
+
+def set_vm_mode(enabled: bool) -> None:
+    """When on, Letterboxd fetches raise LetterboxdOffline instead of connecting."""
+    global _VM_MODE
+    _VM_MODE = bool(enabled)
+
+
+def vm_mode() -> bool:
+    return _VM_MODE
+
+
 _LETTERBOXD_GAP_LOCK = threading.Lock()
 _LAST_LETTERBOXD_FETCH = 0.0
 
@@ -368,6 +387,8 @@ def fetch_letterboxd_html(
     extra_headers: dict[str, str] | None = None,
 ) -> str:
     """Fetch one Letterboxd page. Repeated refusals raise LetterboxdRefused."""
+    if vm_mode():
+        raise LetterboxdOffline(f"VM mode does not call Letterboxd ({url})")
     pause = max(delay, 1.0)
     last: urllib.error.HTTPError | None = None
     for attempt in range(4):
@@ -582,6 +603,8 @@ def letterboxd_member_url(user: str) -> str:
 
 def fetch_letterboxd_film_credit(slug: str) -> dict[str, object]:
     """Directors for one Letterboxd film. An unknown slug has no directors."""
+    if vm_mode():
+        raise LetterboxdOffline("VM mode does not call Letterboxd.")
     url = (
         "https://letterboxd.com/film/"
         + urllib.parse.quote(slug, safe="-_")
@@ -657,6 +680,8 @@ def letterboxd_autocomplete_films(
     query = query.strip()
     if not query:
         return []
+    if vm_mode():
+        raise LetterboxdOffline("VM mode does not call Letterboxd.")
     url = (
         "https://letterboxd.com/s/autocompletefilm?q="
         + urllib.parse.quote(query)

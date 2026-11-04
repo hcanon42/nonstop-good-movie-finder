@@ -14,7 +14,7 @@ from goodmoviefinder.config import (
     DEFAULT_SERVE_PORT,
 )
 from goodmoviefinder.cache import backdrop_lookup
-from goodmoviefinder.letterboxd import letterboxd_backdrop_url, letterboxd_poster_url
+from goodmoviefinder.letterboxd import letterboxd_backdrop_url, letterboxd_poster_url, vm_mode
 from goodmoviefinder.layout import json_for_html, render_page
 from goodmoviefinder.models import Movie, Screening
 from goodmoviefinder.program import (
@@ -540,7 +540,8 @@ def _detail_panel_html(
         friends = ""
     # The pencil only saves a match for a Nonstop title. Recommendation films
     # are already Letterboxd pages, so the control cannot do anything there.
-    if _on_nonstop(movie):
+    # VM mode has no Letterboxd search, so the control is left out.
+    if _on_nonstop(movie) and not vm_mode():
         if movie.letterboxd_url:
             match_label = "Wrong Letterboxd page"
             match_kind = "fix"
@@ -1274,6 +1275,7 @@ def format_html(
     signed_in: bool = True,
     following_user: str | None = None,
     letterboxd_avatar: str = "",
+    vm: bool = False,
 ) -> str:
     """The Nonstop Kino page: List, Calendar and Plan tabs."""
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
@@ -1585,6 +1587,7 @@ def format_html(
             "stamp": settings_stamp(letterboxd_user, selected),
             "followingUser": following_user or letterboxd_user,
             "letterboxdAvatar": letterboxd_avatar,
+            "vm": vm,
         },
         scripts=("page.js", "shell.js", "plan.js"),
         styles=("base.css", "nonstop.css"),

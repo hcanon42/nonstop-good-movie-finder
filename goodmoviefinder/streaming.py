@@ -19,6 +19,7 @@ from goodmoviefinder.letterboxd import (
     letterboxd_backdrop_url,
     letterboxd_poster_url,
     parse_letterboxd_film_card,
+    vm_mode,
 )
 from goodmoviefinder.progress import tick
 from goodmoviefinder.title_lookup import english_title_from_german_wikipedia
@@ -435,7 +436,7 @@ def _letterboxd_details(
     cached = _clean_details(stored.get("details") if isinstance(stored, dict) else None)
     if cached is not None and not refresh:
         return cached
-    if not slug:
+    if vm_mode() or not slug:
         return cached
     try:
         details = fetch_letterboxd_film_card(slug)

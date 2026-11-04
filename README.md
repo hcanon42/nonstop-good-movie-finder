@@ -53,6 +53,9 @@ python3 goodmoviefinder.py --serve
 
 # Disable watched/watchlist filtering
 python3 goodmoviefinder.py --no-letterboxd-profile
+
+# Use the saved Letterboxd cache and never call Letterboxd
+python3 goodmoviefinder.py --vm
 ```
 
 ## Calendar

@@ -30,6 +30,7 @@ from goodmoviefinder.letterboxd import (
     letterboxd_poster_url,
     resolve_letterboxd,
     stored_letterboxd_still_matches,
+    vm_mode,
 )
 from goodmoviefinder.models import Movie, NonstopFilmPage, ProgramFilm
 from goodmoviefinder.nonstop import parse_nonstop_movie_page
@@ -88,6 +89,38 @@ class PosterLookup:
         return changed
 
 
+def _lookup_program_film_vm(
+    film: ProgramFilm,
+    cache: dict,
+    cache_path: Path,
+    delay: float,
+    *,
+    new_in_program: bool,
+) -> Movie:
+    """Keep a saved match. Fill Nonstop details only, and do not search Letterboxd."""
+    cached = cache_get(cache, film.url)
+    if cached is None:
+        movie = Movie(
+            title=film.title,
+            nonstop_url=film.url,
+            note="No saved Letterboxd match.",
+        )
+        attach_program(movie, film)
+        return _mark_new(movie, new_in_program)
+    attach_program(cached, film)
+    updated = False
+    if not cached.details_known:
+        print("  Looking up synopsis and cinema websites…", file=sys.stderr)
+        backfill_nonstop_details(cached, delay)
+        updated = cached.details_known
+    elif cinema_sites_stale(cached):
+        updated = refresh_cinema_sites(cached, delay) or updated
+    if updated:
+        cache_put(cache, cached)
+        save_cache(cache_path, cache)
+    return _mark_new(cached, new_in_program)
+
+
 def lookup_program_film(
     film: ProgramFilm,
     cache: dict,
@@ -99,6 +132,14 @@ def lookup_program_film(
     poster_lookup: PosterLookup | None = None,
 ) -> Movie:
     """Resolve one program title, reusing a cached Letterboxd match when it still fits."""
+    if vm_mode():
+        return _lookup_program_film_vm(
+            film,
+            cache,
+            cache_path,
+            delay,
+            new_in_program=new_in_program,
+        )
     page: NonstopFilmPage | None = None
     if not no_cache:
         cached = cache_get(cache, film.url)

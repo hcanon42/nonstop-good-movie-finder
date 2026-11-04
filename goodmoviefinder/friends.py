@@ -21,6 +21,7 @@ from goodmoviefinder.letterboxd import (
     fetch_letterboxd_profile_slugs,
     letterboxd_member_url,
     parse_member_avatar,
+    vm_mode,
 )
 
 FRIEND_CACHE_MAX_AGE = 6 * 60 * 60
@@ -539,6 +540,15 @@ def ensure_following_list(path: Path, user: str, delay: float) -> list[dict[str,
     """Letterboxd members this user follows, reused for six hours."""
     if not _USER_RE.fullmatch(user):
         raise ValueError("That Letterboxd username is not valid.")
+    if vm_mode():
+        with _LOCK:
+            cache = _load_cache(path)
+            record = cache.get(user.casefold())
+            if isinstance(record, dict):
+                stale = _cached_friends(record, allow_stale=True)
+                if stale is not None:
+                    return stale
+        return []
     with _LOCK:
         cache = _load_cache(path)
         record = cache.get(user.casefold())
@@ -594,6 +604,8 @@ def ensure_member_avatar(path: Path, user: str, delay: float) -> str | None:
     """Profile photo from the member page, cached with the following list."""
     if not _USER_RE.fullmatch(user):
         return None
+    if vm_mode():
+        return cached_member_avatar(path, user)
     with _LOCK:
         cache = _load_cache(path)
         record = cache.get(user.casefold())
@@ -900,6 +912,16 @@ def ensure_friend_ratings(
         raise ValueError("That film slug is not valid.")
     following_path = following_path or path.parent / "following.json"
     watchlists_path = watchlists_path or path.parent / "friend-watchlists.json"
+    if vm_mode():
+        with _LOCK:
+            cache = _load_cache(path)
+            users = cache.get(user.casefold())
+            record = users.get(slug) if isinstance(users, dict) else None
+            if isinstance(record, dict):
+                stored = _cached_friend_panel(record, allow_stale=True)
+                if stored is not None:
+                    return stored
+        return [], []
     cached_friends: list[dict[str, object]] | None = None
     with _LOCK:
         cache = _load_cache(path)

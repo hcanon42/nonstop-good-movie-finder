@@ -436,6 +436,7 @@ def format_account_html(
     language_options: list[str] | None = None,
     following_user: str | None = None,
     letterboxd_avatar: str = "",
+    vm: bool = False,
 ) -> str:
     """The account page. Signed out, each tab asks for a Letterboxd username."""
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
@@ -482,6 +483,12 @@ def format_account_html(
             f"<strong>{streamable}</strong> streaming in Austria",
             f"<strong>{at_nonstop}</strong> playing at Nonstop",
         ]
+        refresh_button = ""
+        if not vm:
+            refresh_button = (
+                '        <button type="button" id="taste-refresh" class="taste-refresh">'
+                "Refresh recommendations</button>\n"
+            )
         tools_html = (
             '      <div class="search-field" data-tools="watchlist recommendations for-friends">\n'
             '        <input type="search" id="search" placeholder="Filter your watchlist by title…" '
@@ -491,8 +498,7 @@ def format_account_html(
             'aria-label="Clear search">&times;</button>\n'
             "      </div>\n"
             '      <div class="taste-refresh-bar" data-tools="recommendations">\n'
-            '        <button type="button" id="taste-refresh" class="taste-refresh">'
-            "Refresh recommendations</button>\n"
+            f"{refresh_button}"
             f'        <span class="taste-updated" id="taste-updated"'
             f'{" hidden" if not updated_label else ""}>'
             f"{html.escape(updated_label)}</span>\n"
@@ -532,6 +538,7 @@ def format_account_html(
             "stamp": settings_stamp(letterboxd_user, selected),
             "followingUser": following_user or letterboxd_user,
             "letterboxdAvatar": letterboxd_avatar,
+            "vm": vm,
         },
         scripts=("page.js", "shell.js"),
         styles=("base.css", "account.css"),

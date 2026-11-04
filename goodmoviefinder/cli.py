@@ -121,7 +121,38 @@ def main() -> int:
         default=DEFAULT_SERVE_PORT,
         help=f"Port for --serve (default: {DEFAULT_SERVE_PORT})",
     )
+    parser.add_argument(
+        "--vm",
+        action="store_true",
+        help="Use the saved Letterboxd cache and never call Letterboxd",
+    )
     args = parser.parse_args()
+    if args.vm:
+        from goodmoviefinder.letterboxd import set_vm_mode
+
+        set_vm_mode(True)
+        ignored = []
+        if args.no_cache:
+            ignored.append("--no-cache")
+            args.no_cache = False
+        if args.refresh_profile:
+            ignored.append("--refresh-profile")
+            args.refresh_profile = False
+        if args.refresh_streaming:
+            ignored.append("--refresh-streaming")
+            args.refresh_streaming = False
+        if ignored:
+            print(
+                "VM mode keeps the saved Letterboxd data; ignoring "
+                + ", ".join(ignored)
+                + ".",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "VM mode: using saved Letterboxd data and not calling Letterboxd.",
+                file=sys.stderr,
+            )
     try:
         letterboxd_user, known_languages, persist_settings = resolve_settings(
             args.letterboxd_user, args.languages
@@ -287,6 +318,7 @@ def main() -> int:
         following_user=following_user,
         program_url=args.program_url,
         no_cache=args.no_cache,
+        vm=args.vm,
     )
     page.watched_ratings = watched_ratings
     page.watchlist_slugs = watchlist_slugs

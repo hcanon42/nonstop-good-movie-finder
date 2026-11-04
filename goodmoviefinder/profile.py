@@ -18,6 +18,7 @@ from goodmoviefinder.cache import (
 from goodmoviefinder.letterboxd import (
     fetch_letterboxd_watched_ratings,
     fetch_letterboxd_watchlist,
+    vm_mode,
 )
 from goodmoviefinder import progress
 
@@ -40,6 +41,25 @@ def load_profile(
     refresh: bool,
     no_cache: bool,
 ) -> tuple[dict[str, float | None], set[str], list[dict[str, object]]]:
+    if vm_mode():
+        profile = load_profile_cache(cache, user, allow_stale=True)
+        if profile is None:
+            print(f"VM mode: no saved profile for @{user}.", file=sys.stderr)
+            return {}, set(), []
+        watched_ratings, watchlist_slugs, watchlist_films = profile
+        print(
+            f"VM mode: using saved profile: {len(watched_ratings)} watched, "
+            f"{len(watchlist_slugs)} on watchlist.",
+            file=sys.stderr,
+        )
+        progress.tick(
+            detail=(
+                f"Saved profile: {len(watched_ratings)} watched, "
+                f"{len(watchlist_slugs)} on watchlist"
+            )
+        )
+        return watched_ratings, watchlist_slugs, watchlist_films or []
+
     profile = None
     if not refresh and not no_cache:
         profile = load_profile_cache(cache, user)

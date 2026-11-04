@@ -1701,8 +1701,31 @@
       }
     }
 
+    function pageIsVm() {
+      const node = document.getElementById("viewer-config");
+      try {
+        const parsed = JSON.parse((node && node.textContent) || "{}");
+        return !!(parsed && parsed.vm);
+      } catch (err) {
+        return false;
+      }
+    }
+
+    if (pageIsVm()) {
+      document.querySelectorAll(".match-repair").forEach((root) => {
+        const form = root.querySelector(".match-form");
+        const toggle = root.querySelector(".match-toggle");
+        if (form) form.remove();
+        if (toggle) toggle.remove();
+      });
+      const tasteRefreshButton = document.getElementById("taste-refresh");
+      if (tasteRefreshButton) tasteRefreshButton.hidden = true;
+    }
+
     const tasteRefresh = document.getElementById("taste-refresh");
-    if (tasteRefresh) tasteRefresh.addEventListener("click", refreshRecommendations);
+    if (tasteRefresh && !pageIsVm()) {
+      tasteRefresh.addEventListener("click", refreshRecommendations);
+    }
 
     let programPollTimer = null;
     let programReloading = false;
@@ -1858,6 +1881,7 @@
     }
 
     async function searchLetterboxdMatch(root) {
+      if (pageIsVm()) return;
       const input = root.querySelector(".match-query");
       const query = input && input.value ? input.value.trim() : "";
       if (!query) {
@@ -1898,6 +1922,7 @@
     }
 
     async function applyLetterboxdMatch(root, slug) {
+      if (pageIsVm()) return;
       const url = root.getAttribute("data-match-url");
       if (!url || !slug) return;
       setMatchStatus(root, "Saving this Letterboxd page…", false);
@@ -1932,6 +1957,7 @@
     }
 
     document.addEventListener("click", (event) => {
+      if (pageIsVm() && event.target.closest(".match-repair")) return;
       const toggle = event.target.closest(".match-toggle");
       if (toggle) {
         event.preventDefault();
@@ -1959,6 +1985,13 @@
 
     document.addEventListener("submit", (event) => {
       const form = event.target.closest(".match-form");
+      if (pageIsVm()) {
+        if (form) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
       if (!form) return;
       event.preventDefault();
       event.stopPropagation();
