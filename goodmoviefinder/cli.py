@@ -31,6 +31,7 @@ from goodmoviefinder.program import movie_is_watchable, partition_program_movies
 from goodmoviefinder import progress
 from goodmoviefinder.serve import ServeHub, start_server, wait_server
 from goodmoviefinder.session import ProgramPage, calendar_for_plan
+from goodmoviefinder.streaming import resolve_watchlist_streaming
 from goodmoviefinder.viewer import (
     language_keys,
     load_calendars,

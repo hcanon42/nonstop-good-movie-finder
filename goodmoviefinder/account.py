@@ -1,4 +1,4 @@
-"""The My Letterboxd page: watchlist with streaming, and recommendations."""
+"""The My Letterboxd page: watchlist, recommendations, and films for friends."""
 
 from __future__ import annotations
 
@@ -437,14 +437,16 @@ def format_account_html(
     following_user: str | None = None,
     letterboxd_avatar: str = "",
 ) -> str:
-    """The account page. Signed out, both tabs ask for a Letterboxd username."""
+    """The account page. Signed out, each tab asks for a Letterboxd username."""
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
     choices = list(language_options or selected)
     selected = canonical_languages(selected, choices)
     stats: list[str] = []
+    friends_label = "For friends"
     if not signed_in:
         watchlist_panel = sign_in_card()
         taste_panel = sign_in_card()
+        friends_panel = sign_in_card()
         watch_label, taste_label = "Watchlist", "Recommendations"
         tagline = "Sign in with a Letterboxd username to see your watchlist and recommendations."
         tools_html = ""
@@ -465,14 +467,23 @@ def format_account_html(
             lower=lower,
             loved_are_themes=loved_are_themes,
         )
-        tagline = f"@{letterboxd_user}'s Letterboxd watchlist, and films picked for you."
+        tagline = (
+            f"@{letterboxd_user}'s Letterboxd watchlist, films picked for you, "
+            "and films for friends."
+        )
+        friends_panel = (
+            '<p class="gift-board-status muted" id="gift-board-status" role="status">'
+            "Loading the lists…</p>\n"
+            '    <div id="gift-board"></div>\n'
+            '    <p class="empty-hint" id="gift-empty" hidden>No films match.</p>'
+        )
         stats = [
             f"<strong>{count}</strong> on your watchlist",
             f"<strong>{streamable}</strong> streaming in Austria",
             f"<strong>{at_nonstop}</strong> playing at Nonstop",
         ]
         tools_html = (
-            '      <div class="search-field" data-tools="watchlist recommendations">\n'
+            '      <div class="search-field" data-tools="watchlist recommendations for-friends">\n'
             '        <input type="search" id="search" placeholder="Filter your watchlist by title…" '
             'autocomplete="off" aria-describedby="search-count">\n'
             '        <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>\n'
@@ -495,16 +506,22 @@ def format_account_html(
         '    <div id="watchlist-view" role="tabpanel" aria-labelledby="tab-watchlist">\n'
         f"{watchlist_panel}\n    </div>\n"
         '    <div id="recommendations-view" role="tabpanel" aria-labelledby="tab-recommendations" hidden>\n'
-        f"{taste_panel}\n    </div>"
+        f"{taste_panel}\n    </div>\n"
+        '    <div id="for-friends-view" role="tabpanel" aria-labelledby="tab-for-friends" hidden>\n'
+        f"{friends_panel}\n    </div>"
     )
     return render_page(
         page="account",
-        title="My Letterboxd — watchlist and recommendations",
+        title="My Letterboxd — watchlist, recommendations, and friends",
         heading="My Letterboxd",
         tagline=tagline,
         stats=stats,
         hint_html="",
-        tabs=[("watchlist", watch_label), ("recommendations", taste_label)],
+        tabs=[
+            ("watchlist", watch_label),
+            ("recommendations", taste_label),
+            ("for-friends", friends_label),
+        ],
         tools_html=tools_html,
         panels_html=panels_html,
         user=letterboxd_user,

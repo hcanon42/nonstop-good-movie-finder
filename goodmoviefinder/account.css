@@ -92,3 +92,98 @@
     .stream-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; margin: 0 0 0.9rem; }
     .stream-summary .stream-intro { margin: 0; flex: 1 1 18rem; }
     tr.row-watchlist td:first-child { box-shadow: inset 3px 0 0 var(--lb); }
+    .gift-board-status { margin: 0 0 0.9rem; }
+    .gift-board-status.is-error { color: var(--warn-ink); }
+    .gift-block { margin: 0 0 1.8rem; }
+    .gift-block-title {
+      margin: 0 0 0.85rem;
+      font-size: 1.15rem;
+    }
+    .gift-person { margin: 0 0 1.15rem; }
+    .gift-person-head {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      margin: 0 0 0.55rem;
+      font-size: 1rem;
+    }
+    .gift-person-head .friend-avatar { width: 32px; height: 32px; }
+    .gift-person-name {
+      color: var(--text);
+      font-weight: 600;
+      text-decoration: none;
+    }
+    .gift-person-name:hover { color: var(--lb); }
+    .gift-cards {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+    }
+    .gift-card {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
+      padding: 0.75rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--surface);
+    }
+    .gift-card-poster {
+      width: 48px;
+      height: 72px;
+      object-fit: cover;
+      border-radius: 4px;
+      background: var(--surface-raised);
+      flex: 0 0 auto;
+    }
+    .gift-card-body { flex: 1; min-width: 0; }
+    .gift-card-title-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 0.4rem 0.65rem;
+      margin: 0;
+    }
+    .gift-card-title {
+      color: var(--text);
+      font-weight: 600;
+      text-decoration: none;
+    }
+    .gift-card-title:hover { color: var(--lb); }
+    .gift-card-year { color: var(--muted); font-size: 0.85rem; }
+    .gift-card-note {
+      margin: 0.35rem 0 0;
+      white-space: pre-wrap;
+      line-height: 1.45;
+    }
+    .gift-card-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.45rem 0.7rem;
+      margin-top: 0.45rem;
+    }
+    .gift-watched {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+    .gift-remove {
+      flex: 0 0 auto;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.78rem;
+      font-weight: 600;
+      border-radius: 999px;
+      padding: 0.28rem 0.65rem;
+      cursor: pointer;
+    }
+    .gift-remove:hover { border-color: var(--gold); color: var(--text); }
+    .gift-remove:disabled { opacity: 0.6; cursor: progress; }

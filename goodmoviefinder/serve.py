@@ -170,6 +170,26 @@ def start_server(state: Any, port: int, *, open_browser: bool = False) -> Thread
                     return
                 self._send(200, json.dumps(payload), "application/json")
                 return
+            if path == "/api/gifts":
+                try:
+                    payload = page.gifts()
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except RuntimeError as exc:
+                    print(f"[serve] gifts: {exc}", file=sys.stderr)
+                    self._send(502, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] gifts: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": "Letterboxd could not be reached."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps(payload), "application/json")
+                return
             if path == "/api/following":
                 try:
                     payload = page.following_list()
@@ -307,6 +327,46 @@ def start_server(state: Any, port: int, *, open_browser: bool = False) -> Thread
                     )
                     return
                 self._send(200, json.dumps({"ok": True, **payload}), "application/json")
+                return
+            if path == "/api/gifts/remove":
+                try:
+                    saved = page.remove_gift(payload)
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except RuntimeError as exc:
+                    print(f"[serve] gifts: {exc}", file=sys.stderr)
+                    self._send(502, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] gifts: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": "Letterboxd could not be reached."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps({"ok": True, **saved}), "application/json")
+                return
+            if path == "/api/gifts":
+                try:
+                    saved = page.save_gift(payload)
+                except ValueError as exc:
+                    self._send(400, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except RuntimeError as exc:
+                    print(f"[serve] gifts: {exc}", file=sys.stderr)
+                    self._send(502, json.dumps({"error": str(exc)}), "application/json")
+                    return
+                except Exception as exc:
+                    print(f"[serve] gifts: {exc}", file=sys.stderr)
+                    self._send(
+                        502,
+                        json.dumps({"error": "Letterboxd could not be reached."}),
+                        "application/json",
+                    )
+                    return
+                self._send(200, json.dumps({"ok": True, **saved}), "application/json")
                 return
             if path == "/api/recommendations":
                 try:

@@ -14,6 +14,10 @@
     function isCalendar() { return activeTab === "calendar"; }
     function isPlan() { return activeTab === "plan"; }
     function isWatchlist() { return activeTab === "watchlist"; }
+    function currentTab() {
+      const selected = document.querySelector('[role="tab"][aria-selected="true"]');
+      return selected ? selected.getAttribute("data-tab") || "" : "";
+    }
 
     function syncSectionLinks() {
       document.querySelectorAll(".nav-pills a[href^='#']").forEach((link) => {
@@ -123,10 +127,30 @@
         const expanded = row.querySelector(".expand")?.getAttribute("aria-expanded") === "true";
         detail.hidden = hide || !expanded;
       });
+      document.querySelectorAll("[data-gift-card]").forEach((card) => {
+        const blob = card.getAttribute("data-search") || "";
+        card.hidden = searching && !blob.includes(q);
+      });
+      document.querySelectorAll("[data-gift-person]").forEach((person) => {
+        const cards = [...person.querySelectorAll("[data-gift-card]")];
+        person.hidden = cards.length > 0 && cards.every((card) => card.hidden);
+      });
+      document.querySelectorAll("[data-gift-block]").forEach((block) => {
+        const people = [...block.querySelectorAll("[data-gift-person]")];
+        block.hidden = people.length > 0 && people.every((person) => person.hidden);
+      });
       const listMatches = visibleCount("[data-movie-row]");
       const dayMatches = visibleCount(".day-film");
       const streamMatches = visibleCount("[data-stream-row]");
-      const activeMatches = isCalendar() ? dayMatches : isWatchlist() ? streamMatches : listMatches;
+      const giftMatches = visibleCount("[data-gift-card]");
+      const onFriends = currentTab() === "for-friends";
+      const activeMatches = onFriends
+        ? giftMatches
+        : isCalendar()
+          ? dayMatches
+          : isWatchlist()
+            ? streamMatches
+            : listMatches;
       if (searchField) searchField.classList.toggle("is-active", searching);
       if (searchCount) {
         searchCount.hidden = !searching;
@@ -149,6 +173,12 @@
         const show = (searching || watchlistFilter !== "all") && streamMatches === 0;
         streamEmpty.hidden = !show;
         if (show) streamEmpty.textContent = "No watchlist films match.";
+      }
+      const giftEmpty = document.getElementById("gift-empty");
+      if (giftEmpty) {
+        const show = searching && onFriends && giftMatches === 0 && document.querySelector("[data-gift-card]");
+        giftEmpty.hidden = !show;
+        if (show) giftEmpty.textContent = "No films match.";
       }
     }
 
@@ -839,6 +869,7 @@
             legacyList.hidden = false;
           }
           panel.dataset.friendState = "ready";
+          renderGiftPicker(panel, slug, { friends, watchlist });
           return;
         }
         if (status) status.hidden = true;
@@ -856,7 +887,525 @@
             "None of your Letterboxd friends have rated this or have it on their watchlist.";
         }
         panel.dataset.friendState = "ready";
+        renderGiftPicker(panel, slug, { friends, watchlist });
       });
+      latestFriendPayloads.set(slug, { friends, watchlist });
+    }
+
+    let giftsPayload = null;
+    let giftsLoad = null;
+    let followingForGifts = null;
+    let followingForGiftsLoad = null;
+    const latestFriendPayloads = new Map();
+
+    function signedInUsername() {
+      try {
+        const node = document.getElementById("viewer-config");
+        const parsed = JSON.parse((node && node.textContent) || "{}");
+        return String((parsed && parsed.letterboxdUser) || "");
+      } catch (err) {
+        return "";
+      }
+    }
+
+    function giftSection(panel) {
+      return panel ? panel.querySelector('[data-friend-section="gift"]') : null;
+    }
+
+    function filmFacts(panel) {
+      const detail = panel.closest(".detail");
+      const poster = detail ? detail.querySelector(".poster") : null;
+      const link = detail ? detail.querySelector(".link-lb") : null;
+      const title = ((poster && poster.alt) || (link && link.textContent) || "").trim();
+      let year = null;
+      const fact = detail ? detail.querySelector(".detail-facts span") : null;
+      if (fact && /^\d{4}$/.test(fact.textContent.trim())) year = Number(fact.textContent.trim());
+      const src = poster ? poster.getAttribute("src") || "" : "";
+      return {
+        title,
+        year,
+        poster: allowedUrl(src, ["https://a.ltrbxd.com/resized/"]),
+      };
+    }
+
+    function excludedUsernames(payload) {
+      const skip = new Set();
+      const self = signedInUsername().toLowerCase();
+      if (self) skip.add(self);
+      (payload.friends || []).forEach((friend) => {
+        if (friend && typeof friend.rating === "number") {
+          skip.add(String(friend.username || "").toLowerCase());
+        }
+      });
+      (payload.watchlist || []).forEach((friend) => {
+        if (friend) skip.add(String(friend.username || "").toLowerCase());
+      });
+      return skip;
+    }
+
+    function giftedUsernames(slug) {
+      const names = new Set();
+      const outgoing = giftsPayload && Array.isArray(giftsPayload.outgoing) ? giftsPayload.outgoing : [];
+      outgoing.forEach((group) => {
+        const films = Array.isArray(group.films) ? group.films : [];
+        if (films.some((film) => film && film.slug === slug)) {
+          names.add(String(group.username || "").toLowerCase());
+        }
+      });
+      return names;
+    }
+
+    function refreshGiftSurfaces() {
+      if (giftsPayload) renderGiftBoard(giftsPayload);
+      latestFriendPayloads.forEach((payload, slug) => {
+        friendPanels(slug).forEach((panel) => renderGiftPicker(panel, slug, payload));
+      });
+    }
+
+    function takeGifts(payload) {
+      giftsPayload = {
+        outgoing: Array.isArray(payload.outgoing) ? payload.outgoing : [],
+        incoming: Array.isArray(payload.incoming) ? payload.incoming : [],
+      };
+      refreshGiftSurfaces();
+      return giftsPayload;
+    }
+
+    function ensureGifts() {
+      if (giftsPayload) return Promise.resolve(giftsPayload);
+      if (!giftsLoad) {
+        giftsLoad = fetch("/api/gifts")
+          .then(async (response) => {
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              const message = data && typeof data.error === "string" && data.error.trim()
+                ? data.error.trim()
+                : "Those lists could not be loaded.";
+              throw new Error(message);
+            }
+            giftsLoad = null;
+            return takeGifts(data);
+          })
+          .catch((err) => {
+            giftsLoad = null;
+            throw err;
+          });
+      }
+      return giftsLoad;
+    }
+
+    function ensureFollowingForGifts() {
+      if (followingForGifts) return Promise.resolve(followingForGifts);
+      if (!followingForGiftsLoad) {
+        followingForGiftsLoad = fetch("/api/following")
+          .then(async (response) => {
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              const message = data && typeof data.error === "string" && data.error.trim()
+                ? data.error.trim()
+                : "Could not load friends.";
+              throw new Error(message);
+            }
+            followingForGifts = data;
+            followingForGiftsLoad = null;
+            return data;
+          })
+          .catch((err) => {
+            followingForGiftsLoad = null;
+            throw err;
+          });
+      }
+      return followingForGiftsLoad;
+    }
+
+    function postGifts(path, body) {
+      return fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).then(async (response) => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const message = data && typeof data.error === "string" && data.error.trim()
+            ? data.error.trim()
+            : "That list could not be saved.";
+          throw new Error(message);
+        }
+        return takeGifts(data);
+      });
+    }
+
+    function paintGiftFaces(section, slug, payload, following) {
+      const list = section.querySelector(".gift-faces");
+      const empty = section.querySelector(".friend-empty");
+      const noteLabel = section.querySelector(".gift-note-label");
+      const status = section.querySelector(".gift-status");
+      if (status) {
+        status.hidden = true;
+        status.textContent = "";
+        status.classList.remove("is-error");
+      }
+      const skip = excludedUsernames(payload);
+      const gifted = giftedUsernames(slug);
+      const members = following && Array.isArray(following.members) ? following.members : [];
+      const seen = new Set();
+      const eligible = [];
+      members.forEach((member) => {
+        const username = String((member && member.username) || "");
+        const key = username.toLowerCase();
+        if (!username || seen.has(key) || skip.has(key)) return;
+        seen.add(key);
+        eligible.push(member);
+      });
+      if (list) list.replaceChildren();
+      eligible.forEach((member) => {
+        const username = String(member.username);
+        const name = typeof member.name === "string" && member.name.trim()
+          ? member.name.trim()
+          : username;
+        const onList = gifted.has(username.toLowerCase());
+        const item = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = onList ? "gift-face is-gifted" : "gift-face";
+        button.setAttribute("data-username", username);
+        button.setAttribute("aria-pressed", onList ? "true" : "false");
+        button.setAttribute(
+          "aria-label",
+          onList ? "On " + name + "'s list. Remove." : "Add for " + name
+        );
+        const avatarUrl = allowedUrl(member.avatar, [
+          "https://a.ltrbxd.com/",
+          "https://s.ltrbxd.com/",
+          "https://secure.gravatar.com/",
+        ]);
+        if (avatarUrl) {
+          const image = document.createElement("img");
+          image.className = "friend-avatar";
+          image.src = avatarUrl;
+          image.alt = "";
+          image.width = 36;
+          image.height = 36;
+          button.appendChild(image);
+        } else {
+          const fallback = document.createElement("span");
+          fallback.className = "gift-face-fallback";
+          fallback.setAttribute("aria-hidden", "true");
+          fallback.textContent = (name.charAt(0) || "?").toUpperCase();
+          button.appendChild(fallback);
+        }
+        const label = document.createElement("span");
+        label.className = "gift-face-name";
+        label.textContent = name;
+        button.appendChild(label);
+        item.appendChild(button);
+        if (list) list.appendChild(item);
+      });
+      const hasFaces = eligible.length > 0;
+      if (list) list.hidden = !hasFaces;
+      if (noteLabel) noteLabel.hidden = !hasFaces;
+      if (empty) empty.hidden = hasFaces;
+    }
+
+    function renderGiftPicker(panel, slug, payload) {
+      const section = giftSection(panel);
+      if (!section) return;
+      const status = section.querySelector(".gift-status");
+      const noteLabel = section.querySelector(".gift-note-label");
+      section.hidden = false;
+      if (section.dataset.giftReady !== "1" && status && !status.classList.contains("is-error")) {
+        status.hidden = false;
+        status.textContent = "Loading friends…";
+      }
+      const generation = String(Date.now()) + Math.random();
+      section.dataset.giftGeneration = generation;
+      Promise.all([ensureFollowingForGifts(), ensureGifts()])
+        .then(([following]) => {
+          if (!panel.isConnected || section.dataset.giftGeneration !== generation) return;
+          paintGiftFaces(section, slug, payload, following);
+          section.dataset.giftReady = "1";
+        })
+        .catch((err) => {
+          if (!panel.isConnected || section.dataset.giftGeneration !== generation) return;
+          if (status) {
+            status.hidden = false;
+            status.classList.add("is-error");
+            status.textContent = err && err.message ? err.message : "Could not load friends.";
+          }
+          if (noteLabel) noteLabel.hidden = true;
+        });
+    }
+
+    function showGiftStatus(status, message) {
+      if (!status) return;
+      status.hidden = false;
+      status.classList.add("is-error");
+      status.textContent = message;
+    }
+
+    function toggleGift(button) {
+      const section = button.closest('[data-friend-section="gift"]');
+      const panel = button.closest("[data-friend-slug]");
+      if (!section || !panel || button.disabled) return;
+      const slug = panel.getAttribute("data-friend-slug") || "";
+      const to = button.getAttribute("data-username") || "";
+      const status = section.querySelector(".gift-status");
+      const onList = button.getAttribute("aria-pressed") === "true";
+      if (!onList) {
+        const facts = filmFacts(panel);
+        if (!facts.title) {
+          showGiftStatus(status, "That film needs a title.");
+          return;
+        }
+        button.disabled = true;
+        const noteField = section.querySelector(".gift-note");
+        const body = {
+          to,
+          slug,
+          title: facts.title,
+          note: noteField ? noteField.value : "",
+          poster: facts.poster,
+        };
+        if (facts.year) body.year = facts.year;
+        postGifts("/api/gifts", body)
+          .then(() => {
+            if (noteField) noteField.value = "";
+          })
+          .catch((err) => {
+            showGiftStatus(status, err && err.message ? err.message : "That list could not be saved.");
+          })
+          .finally(() => {
+            button.disabled = false;
+          });
+        return;
+      }
+      button.disabled = true;
+      postGifts("/api/gifts/remove", { to, slug })
+        .catch((err) => {
+          showGiftStatus(status, err && err.message ? err.message : "That film could not be removed.");
+        })
+        .finally(() => {
+          button.disabled = false;
+        });
+    }
+
+    function removeGiftCard(button) {
+      if (button.disabled) return;
+      const to = button.getAttribute("data-to") || "";
+      const slug = button.getAttribute("data-slug") || "";
+      button.disabled = true;
+      postGifts("/api/gifts/remove", { to, slug }).catch((err) => {
+        button.disabled = false;
+        const status = document.getElementById("gift-board-status");
+        showGiftStatus(status, err && err.message ? err.message : "That film could not be removed.");
+      });
+    }
+
+    function ratingBadge(scoreText, styleText) {
+      if (typeof scoreText !== "string" || !/^\d(?:\.\d)?$/.test(scoreText)) return null;
+      const badge = document.createElement("span");
+      badge.className = "rating-badge";
+      badge.textContent = scoreText;
+      if (
+        typeof styleText === "string"
+        && /^color: rgb\(\d{1,3},\d{1,3},\d{1,3}\); background: rgba\(\d{1,3},\d{1,3},\d{1,3},[\d.]+\);$/.test(styleText)
+      ) {
+        badge.style.cssText = styleText;
+      }
+      return badge;
+    }
+
+    function appendGiftCard(list, film, group, voice) {
+      if (!film || typeof film.title !== "string") return;
+      const item = document.createElement("li");
+      item.className = "gift-card";
+      item.setAttribute("data-gift-card", "");
+      const note = typeof film.note === "string" ? film.note : "";
+      const friendName = typeof group.name === "string" && group.name.trim()
+        ? group.name.trim()
+        : String(group.username || "");
+      item.setAttribute("data-search", (film.title + " " + note + " " + friendName).toLowerCase());
+      const posterUrl = allowedUrl(film.poster, ["https://a.ltrbxd.com/resized/"]);
+      if (posterUrl) {
+        const image = document.createElement("img");
+        image.className = "gift-card-poster";
+        image.src = posterUrl;
+        image.alt = "";
+        item.appendChild(image);
+      }
+      const body = document.createElement("div");
+      body.className = "gift-card-body";
+      const titleRow = document.createElement("p");
+      titleRow.className = "gift-card-title-row";
+      const filmUrl = allowedUrl(film.filmUrl, ["https://letterboxd.com/film/"]);
+      const title = document.createElement(filmUrl ? "a" : "span");
+      title.className = "gift-card-title";
+      title.textContent = film.title;
+      if (filmUrl) {
+        title.href = filmUrl;
+        title.target = "_blank";
+        title.rel = "noopener noreferrer";
+      }
+      titleRow.appendChild(title);
+      if (typeof film.year === "number") {
+        const year = document.createElement("span");
+        year.className = "gift-card-year";
+        year.textContent = String(film.year);
+        titleRow.appendChild(year);
+      }
+      body.appendChild(titleRow);
+      if (note.trim()) {
+        const line = document.createElement("p");
+        line.className = "gift-card-note";
+        line.textContent = note.trim();
+        body.appendChild(line);
+      }
+      const meta = document.createElement("div");
+      meta.className = "gift-card-meta";
+      if (film.watched) {
+        const watched = document.createElement("span");
+        watched.className = "gift-watched";
+        const badge = ratingBadge(film.watchedRatingText, film.watchedRatingStyle);
+        watched.textContent = voice === "you"
+          ? (badge ? "You rated it" : "You watched it")
+          : (badge ? "They rated it" : "They watched it");
+        if (badge) watched.appendChild(badge);
+        meta.appendChild(watched);
+      }
+      if (typeof film.nonstopLabel === "string" && film.nonstopLabel.trim()) {
+        const link = document.createElement("a");
+        link.className = "nonstop-badge";
+        link.href = "program-ranked.html#list";
+        link.textContent = "Nonstop · " + film.nonstopLabel.trim();
+        meta.appendChild(link);
+      }
+      const offers = Array.isArray(film.offers) ? film.offers : [];
+      if (offers.length) {
+        const row = document.createElement("div");
+        row.className = "stream-offers";
+        offers.forEach((offer) => {
+          if (!offer || typeof offer.name !== "string" || typeof offer.url !== "string") return;
+          const url = allowedUrl(offer.url, ["https://"]);
+          if (!url) return;
+          const anchor = document.createElement("a");
+          const icon = allowedUrl(offer.icon, ["https://images.justwatch.com/"]);
+          const kind = typeof offer.kind === "string" && offer.kind ? offer.kind : "";
+          const label = kind ? offer.name + ", " + kind : offer.name;
+          anchor.href = url;
+          anchor.target = "_blank";
+          anchor.rel = "noopener noreferrer";
+          anchor.title = label;
+          anchor.setAttribute("aria-label", label);
+          if (icon) {
+            anchor.className = "stream-offer";
+            const image = document.createElement("img");
+            image.src = icon;
+            image.alt = "";
+            anchor.appendChild(image);
+          } else {
+            anchor.className = "stream-offer stream-offer-text";
+            anchor.textContent = offer.name;
+          }
+          row.appendChild(anchor);
+        });
+        if (row.childElementCount) meta.appendChild(row);
+      }
+      if (meta.childElementCount) body.appendChild(meta);
+      item.appendChild(body);
+      if (voice === "they") {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "gift-remove";
+        remove.textContent = "Remove";
+        remove.setAttribute("data-to", String(group.username || ""));
+        remove.setAttribute("data-slug", String(film.slug || ""));
+        remove.setAttribute("aria-label", "Remove " + film.title + " from " + friendName + "'s list");
+        item.appendChild(remove);
+      }
+      list.appendChild(item);
+    }
+
+    function giftBlock(title, groups, voice) {
+      const block = document.createElement("section");
+      block.className = "gift-block";
+      block.setAttribute("data-gift-block", voice === "they" ? "outgoing" : "incoming");
+      const heading = document.createElement("h2");
+      heading.className = "gift-block-title";
+      heading.textContent = title;
+      block.appendChild(heading);
+      groups.forEach((group) => {
+        if (!group) return;
+        const person = document.createElement("section");
+        person.className = "gift-person";
+        person.setAttribute("data-gift-person", "");
+        const head = document.createElement("h3");
+        head.className = "gift-person-head";
+        const name = typeof group.name === "string" && group.name.trim()
+          ? group.name.trim()
+          : String(group.username || "");
+        const avatarUrl = allowedUrl(group.avatar, [
+          "https://a.ltrbxd.com/",
+          "https://s.ltrbxd.com/",
+          "https://secure.gravatar.com/",
+        ]);
+        if (avatarUrl) {
+          const image = document.createElement("img");
+          image.className = "friend-avatar";
+          image.src = avatarUrl;
+          image.alt = "";
+          image.width = 32;
+          image.height = 32;
+          head.appendChild(image);
+        }
+        const profile = allowedUrl(group.profile, ["https://letterboxd.com/"]);
+        const label = document.createElement(profile ? "a" : "span");
+        label.className = "gift-person-name";
+        label.textContent = name;
+        if (profile) {
+          label.href = profile;
+          label.target = "_blank";
+          label.rel = "noopener noreferrer";
+        }
+        head.appendChild(label);
+        person.appendChild(head);
+        const cards = document.createElement("ul");
+        cards.className = "gift-cards";
+        (Array.isArray(group.films) ? group.films : []).forEach((film) => {
+          appendGiftCard(cards, film, group, voice);
+        });
+        person.appendChild(cards);
+        block.appendChild(person);
+      });
+      return block;
+    }
+
+    function renderGiftBoard(payload) {
+      const board = document.getElementById("gift-board");
+      const loading = document.getElementById("gift-board-status");
+      if (!board) return;
+      if (loading) {
+        loading.hidden = true;
+        loading.textContent = "";
+        loading.classList.remove("is-error");
+      }
+      board.replaceChildren();
+      const incoming = Array.isArray(payload.incoming) ? payload.incoming : [];
+      const outgoing = Array.isArray(payload.outgoing) ? payload.outgoing : [];
+      if (!incoming.length && !outgoing.length) {
+        const empty = document.createElement("p");
+        empty.className = "stream-note";
+        empty.textContent = "No films yet. Open a film and add it for someone you follow.";
+        board.appendChild(empty);
+        applySearch();
+        return;
+      }
+      if (incoming.length) {
+        board.appendChild(giftBlock("Your friends think you'd love", incoming, "you"));
+      }
+      if (outgoing.length) {
+        board.appendChild(giftBlock("For your friends", outgoing, "they"));
+      }
+      applySearch();
     }
 
     function markFriendError(slug, message) {
@@ -1416,6 +1965,29 @@
       const root = matchRoot(form);
       if (root) searchLetterboxdMatch(root);
     });
+
+    document.addEventListener("click", (event) => {
+      const face = event.target.closest(".gift-face");
+      if (face) {
+        event.preventDefault();
+        toggleGift(face);
+        return;
+      }
+      const remove = event.target.closest(".gift-remove");
+      if (!remove) return;
+      event.preventDefault();
+      removeGiftCard(remove);
+    });
+
+    if (document.getElementById("gift-board") && viewerIsSignedIn()) {
+      ensureGifts().catch((err) => {
+        const status = document.getElementById("gift-board-status");
+        showGiftStatus(
+          status,
+          err && err.message ? err.message : "Those lists could not be loaded."
+        );
+      });
+    }
 
     const startFriendPrefetch = () => prefetchFriendRatings();
     if (typeof requestIdleCallback === "function") {

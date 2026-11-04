@@ -21,6 +21,7 @@ from goodmoviefinder.cache import (
     cache_put,
     cinema_sites_stale,
     ensure_loved_film_credits,
+    load_profile_cache,
     load_recommendations_cache,
     note_film_features_changed,
     recommendations_updated_label,
@@ -61,6 +62,7 @@ from goodmoviefinder.program import (
     attach_program,
     counts_as_viewer_language,
     film_title,
+    format_screening_date,
     letterboxd_slug_from_url,
     partition_program_movies,
     sort_movies,
@@ -396,6 +398,150 @@ class ProgramPage:
             self.delay,
         )
         return present_friend_ratings(friends, watchlist)
+
+    def _gift_paths(self) -> tuple[Path, Path, Path]:
+        root = self.cache_path.parent
+        return root / "friend-gifts.json", root / "following.json", root / "friends.json"
+
+    def _gift_people(self) -> dict[str, dict[str, object]]:
+        from goodmoviefinder.friends import ensure_following_list
+        from goodmoviefinder.gifts import saved_people
+
+        _gifts_path, following_path, _friends_path = self._gift_paths()
+        people = saved_people(following_path)
+        try:
+            members = ensure_following_list(following_path, self.letterboxd_user, self.delay)
+        except (OSError, RuntimeError, ValueError):
+            members = []
+        for member in members:
+            username = member.get("username")
+            if not isinstance(username, str) or not username:
+                continue
+            name = member.get("name")
+            avatar = member.get("avatar")
+            people[username.casefold()] = {
+                "username": username,
+                "name": name if isinstance(name, str) and name.strip() else username,
+                "avatar": avatar if isinstance(avatar, str) else None,
+            }
+        return people
+
+    def _watched_for_gift(self, username: str) -> dict[str, float | None] | None:
+        """Watched films for this member when that profile is already stored."""
+        if username.casefold() == self.letterboxd_user.casefold():
+            return self.watched_ratings
+        profiles = self.cache.get("profile")
+        if not isinstance(profiles, dict):
+            return None
+        key = next(
+            (
+                stored
+                for stored in profiles
+                if isinstance(stored, str) and stored.casefold() == username.casefold()
+            ),
+            None,
+        )
+        if key is None:
+            return None
+        loaded = load_profile_cache(self.cache, key, allow_stale=True)
+        if loaded is None:
+            return None
+        return loaded[0]
+
+    def _gift_offers(self, slug: str) -> list[dict[str, object]]:
+        if not self.stream_films:
+            return []
+        film = next(
+            (item for item in self.stream_films if str(item.get("slug") or "") == slug),
+            None,
+        )
+        if film is None:
+            return []
+        raw = film.get("offers")
+        if not isinstance(raw, list):
+            return []
+        offers: list[dict[str, object]] = []
+        for offer in raw:
+            if not isinstance(offer, dict):
+                continue
+            name = offer.get("name")
+            url = offer.get("url")
+            if not isinstance(name, str) or not name:
+                continue
+            if not isinstance(url, str) or not url.startswith("https://"):
+                continue
+            item: dict[str, object] = {"name": name, "url": url}
+            kind = offer.get("kind")
+            if isinstance(kind, str) and kind:
+                item["kind"] = kind
+            icon = offer.get("icon")
+            if isinstance(icon, str) and icon.startswith("https://images.justwatch.com/"):
+                item["icon"] = icon
+            offers.append(item)
+        return offers
+
+    def _present_gifts(self, gifts: list[dict[str, object]]) -> dict[str, object]:
+        from goodmoviefinder.gifts import present_gifts
+
+        if self.no_profile:
+            raise ValueError("Sign in to see friend ratings.")
+        people = self._gift_people()
+        labels = {
+            slug: format_screening_date(day) for slug, day in self._nonstop_next().items()
+        }
+        names: set[str] = {self.letterboxd_user}
+        for gift in gifts:
+            names.add(str(gift["from"]))
+            names.add(str(gift["to"]))
+        watched: dict[str, dict[str, float | None]] = {}
+        for name in names:
+            ratings = self._watched_for_gift(name)
+            if ratings is not None:
+                watched[name.casefold()] = ratings
+        offers: dict[str, list[dict[str, object]]] = {}
+        for gift in gifts:
+            slug = str(gift["slug"])
+            if slug not in offers:
+                offers[slug] = self._gift_offers(slug)
+        return present_gifts(
+            gifts,
+            user=self.letterboxd_user,
+            people=people,
+            nonstop_labels=labels,
+            watched_by_user=watched,
+            offers_by_slug=offers,
+        )
+
+    def gifts(self) -> dict[str, object]:
+        from goodmoviefinder.gifts import load_gifts
+
+        gifts_path, _following_path, _friends_path = self._gift_paths()
+        return self._present_gifts(load_gifts(gifts_path))
+
+    def save_gift(self, payload: dict) -> dict[str, object]:
+        from goodmoviefinder.gifts import save_gift
+
+        if self.no_profile:
+            raise ValueError("Sign in to see friend ratings.")
+        gifts_path, following_path, friends_path = self._gift_paths()
+        gifts = save_gift(
+            gifts_path,
+            giver=self.letterboxd_user,
+            payload=payload,
+            delay=self.delay,
+            following_path=following_path,
+            friends_path=friends_path,
+        )
+        return self._present_gifts(gifts)
+
+    def remove_gift(self, payload: dict) -> dict[str, object]:
+        from goodmoviefinder.gifts import remove_gift
+
+        if self.no_profile:
+            raise ValueError("Sign in to see friend ratings.")
+        gifts_path, _following_path, _friends_path = self._gift_paths()
+        gifts = remove_gift(gifts_path, giver=self.letterboxd_user, payload=payload)
+        return self._present_gifts(gifts)
 
     def _taste_panel_parts(self) -> tuple[str, str]:
         return format_taste_panel_html(

@@ -32,9 +32,11 @@
         if (input) {
           input.placeholder = view === "watchlist"
             ? "Filter your watchlist by title…"
-            : view === "recommendations"
-              ? "Filter by title, director, theme…"
-              : "Filter by title, director, genre…";
+            : view === "for-friends"
+              ? "Filter films for friends by title…"
+              : view === "recommendations"
+                ? "Filter by title, director, theme…"
+                : "Filter by title, director, genre…";
         }
       }
       try {

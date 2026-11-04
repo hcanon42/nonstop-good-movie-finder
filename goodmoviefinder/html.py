@@ -202,6 +202,18 @@ def _friend_ratings_html(slug: str | None) -> str:
         f'<ul class="friend-list friend-list-compact" hidden></ul>'
         f'<p class="friend-empty muted" hidden>None of your Letterboxd friends have this on their watchlist.</p>'
         f"</div>"
+        f'<div class="friend-group" data-friend-section="gift" hidden>'
+        f'<h4 class="friend-group-label">For a friend</h4>'
+        f'<label class="gift-note-label">A line for them'
+        f'<input type="text" class="gift-note" maxlength="240" '
+        f'placeholder="One line, just for them" autocomplete="off">'
+        f"</label>"
+        f'<p class="gift-status muted" role="status" hidden></p>'
+        f'<ul class="gift-faces"></ul>'
+        f'<p class="friend-empty muted" hidden>'
+        f"Everyone you follow has already rated this or has it on their watchlist."
+        f"</p>"
+        f"</div>"
         f"</section>"
     )
 
