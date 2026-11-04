@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+import secrets
 import sys
 import threading
 import urllib.error
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -123,6 +125,106 @@ def calendar_for_plan(
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _TIME_RE = re.compile(r"\d{2}:\d{2}")
 
+# Personal fields. A request binds one ViewerSession; these names on
+# ProgramPage read and write that session. The film list stays shared.
+_SESSION_FIELDS = frozenset(
+    {
+        "letterboxd_user",
+        "following_user",
+        "languages",
+        "no_profile",
+        "signed_out",
+        "watched_ratings",
+        "watchlist_slugs",
+        "watchlist_films",
+        "stream_films",
+        "loved_credits",
+        "see_first",
+        "like_you",
+        "step_outside",
+        "taste_paragraph",
+        "taste_note",
+        "taste_loved",
+        "taste_lower",
+        "taste_loved_are_themes",
+        "taste_fetched_at",
+        "program_html",
+        "account_html",
+        "dirty",
+        "_rebuilding",
+        "_rec_running",
+        "_rec_error",
+        "_rec_epoch",
+        "switch_epoch",
+    }
+)
+
+
+@dataclass
+class ViewerSession:
+    """One browser's Letterboxd account and the pages rendered for it."""
+
+    token: str
+    letterboxd_user: str
+    following_user: str
+    languages: list[str]
+    no_profile: bool
+    signed_out: bool
+    watched_ratings: dict[str, float | None] = field(default_factory=dict)
+    watchlist_slugs: set[str] = field(default_factory=set)
+    watchlist_films: list[dict[str, object]] = field(default_factory=list)
+    stream_films: list[dict[str, object]] | None = None
+    loved_credits: dict[str, dict] = field(default_factory=dict)
+    see_first: list[Movie] = field(default_factory=list)
+    like_you: list[Movie] = field(default_factory=list)
+    step_outside: list[Movie] = field(default_factory=list)
+    taste_paragraph: str = ""
+    taste_note: str | None = None
+    taste_loved: list[str] = field(default_factory=list)
+    taste_lower: list[str] = field(default_factory=list)
+    taste_loved_are_themes: bool = False
+    taste_fetched_at: int | None = None
+    program_html: str = ""
+    account_html: str = ""
+    dirty: bool = True
+    _rebuilding: bool = False
+    _rec_running: bool = False
+    _rec_error: str | None = None
+    _rec_epoch: int = 0
+    switch_epoch: int = 0
+
+    def clone(self, token: str) -> ViewerSession:
+        """A new browser starts from this account, then changes on its own."""
+        return ViewerSession(
+            token=token,
+            letterboxd_user=self.letterboxd_user,
+            following_user=self.following_user,
+            languages=list(self.languages),
+            no_profile=self.no_profile,
+            signed_out=self.signed_out,
+            watched_ratings=dict(self.watched_ratings),
+            watchlist_slugs=set(self.watchlist_slugs),
+            watchlist_films=[dict(item) for item in self.watchlist_films],
+            stream_films=(
+                None
+                if self.stream_films is None
+                else [dict(item) for item in self.stream_films]
+            ),
+            loved_credits={key: dict(value) for key, value in self.loved_credits.items()},
+            see_first=list(self.see_first),
+            like_you=list(self.like_you),
+            step_outside=list(self.step_outside),
+            taste_paragraph=self.taste_paragraph,
+            taste_note=self.taste_note,
+            taste_loved=list(self.taste_loved),
+            taste_lower=list(self.taste_lower),
+            taste_loved_are_themes=self.taste_loved_are_themes,
+            taste_fetched_at=self.taste_fetched_at,
+            program_html=self.program_html,
+            account_html=self.account_html,
+            dirty=self.dirty or not self.program_html or not self.account_html,
+        )
+
 
 def _plan_event(raw: object) -> dict[str, object]:
     if not isinstance(raw, dict):
@@ -233,11 +335,6 @@ class ProgramPage:
         self.cache = cache
         self.cache_path = cache_path
         self.delay = delay
-        self.letterboxd_user = user
-        self.following_user = following_user or user
-        self.languages = list(languages)
-        self.no_profile = no_profile
-        self.signed_out = signed_out
         self.port = port
         self.busy_intervals = busy_intervals
         self.calendar_status = calendar_status
@@ -251,29 +348,77 @@ class ProgramPage:
         self._program_detail = ""
         self._program_reload = False
         self._program_epoch = 0
-        self.watched_ratings: dict[str, float | None] = {}
-        self.watchlist_slugs: set[str] = set()
-        self.watchlist_films: list[dict[str, object]] = []
-        self.stream_films: list[dict[str, object]] | None = None
         self.refresh_streaming = False
-        self.loved_credits: dict[str, dict] = {}
         self.refresh_neighbors = False
         self.ignore_recommendation_cache = False
-        self.see_first: list[Movie] = []
-        self.like_you: list[Movie] = []
-        self.step_outside: list[Movie] = []
-        self.taste_paragraph = ""
-        self.taste_note: str | None = None
-        self.taste_loved: list[str] = []
-        self.taste_lower: list[str] = []
-        self.taste_loved_are_themes = False
-        self.taste_fetched_at: int | None = None
-        self._rec_running = False
-        self._rec_error: str | None = None
-        self._rec_epoch = 0
         self._epoch = 0
-        self._rebuilding = False
         self._lock = threading.RLock()
+        self._bound = threading.local()
+        self._sessions: dict[str, ViewerSession] = {}
+        self._startup = ViewerSession(
+            token="",
+            letterboxd_user=user,
+            following_user=following_user or user,
+            languages=list(languages),
+            no_profile=no_profile,
+            signed_out=signed_out,
+        )
+
+    def __getattribute__(self, name: str) -> object:
+        if name in _SESSION_FIELDS:
+            return getattr(object.__getattribute__(self, "_view")(), name)
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in _SESSION_FIELDS:
+            setattr(object.__getattribute__(self, "_view")(), name, value)
+            return
+        object.__setattr__(self, name, value)
+
+    def _view(self) -> ViewerSession:
+        """The browser bound to this thread, or the startup account."""
+        bound = object.__getattribute__(self, "_bound")
+        session = getattr(bound, "session", None)
+        if session is not None:
+            return session
+        return object.__getattribute__(self, "_startup")
+
+    def bind(self, session: ViewerSession) -> None:
+        object.__getattribute__(self, "_bound").session = session
+
+    def unbind(self) -> None:
+        bound = getattr(object.__getattribute__(self, "_bound"), "session", None)
+        if bound is not None:
+            object.__getattribute__(self, "_bound").session = None
+
+    def open_session(self, token: str | None) -> tuple[ViewerSession, bool]:
+        """Return the browser's session, creating one from the startup account."""
+        with self._lock:
+            if token:
+                found = self._sessions.get(token)
+                if found is not None:
+                    return found, False
+            fresh = secrets.token_urlsafe(18)
+            while fresh in self._sessions:
+                fresh = secrets.token_urlsafe(18)
+            session = self._startup.clone(fresh)
+            self._sessions[fresh] = session
+            return session, True
+
+    def _mark_sessions_dirty(self) -> None:
+        """The shared film list changed. Each browser re-renders on its next load."""
+        self._startup.dirty = True
+        for session in self._sessions.values():
+            session.dirty = True
+
+    def rendered_html(self, *, account: bool) -> str:
+        """HTML for the bound browser, rebuilt when its copy is stale."""
+        with self._lock:
+            session = self._view()
+            if session.dirty or not session.program_html or not session.account_html:
+                self.write_program()
+                self._write_account_page()
+            return session.account_html if account else session.program_html
 
     @property
     def html_path(self) -> Path:
@@ -390,6 +535,7 @@ class ProgramPage:
             apply_manual_letterboxd_match(movie, slug, self.delay)
             cache_put(self.cache, movie)
             save_cache(self.cache_path, self.cache)
+            self._mark_sessions_dirty()
             self.write_program()
             self._write_account_page()
             return {"reload": True}
@@ -588,16 +734,22 @@ class ProgramPage:
             if self._rec_running or self._rebuilding:
                 return {"status": "running"}
             self._rec_running = True
-            self._rec_epoch = self._epoch
-        threading.Thread(target=self._recommendations_refresh_worker, daemon=True).start()
+            self._rec_epoch = self.switch_epoch
+            session = self._view()
+        threading.Thread(
+            target=self._recommendations_refresh_worker,
+            args=(session,),
+            daemon=True,
+        ).start()
         return {"status": "running"}
 
-    def _recommendations_refresh_worker(self) -> None:
-        epoch = self._rec_epoch
+    def _recommendations_refresh_worker(self, session: ViewerSession) -> None:
+        self.bind(session)
+        epoch = session._rec_epoch
         try:
             self.fill_recommendations(force=True, refresh_profile=True)
             with self._lock:
-                if epoch != self._epoch:
+                if epoch != session.switch_epoch:
                     return
                 self.loved_credits = ensure_loved_film_credits(
                     self.cache,
@@ -610,12 +762,17 @@ class ProgramPage:
         except Exception as exc:
             print(f"[serve] recommendations refresh: {exc}", file=sys.stderr)
             with self._lock:
-                self._rec_error = str(exc)
+                session._rec_error = str(exc)
         finally:
             with self._lock:
-                self._rec_running = False
+                session._rec_running = False
+            self.unbind()
 
     def _write_account_page(self) -> None:
+        with self._lock:
+            self._write_account_holding_lock()
+
+    def _write_account_holding_lock(self) -> None:
         found = [
             movie.primary_language
             for movie in self.results
@@ -643,8 +800,7 @@ class ProgramPage:
             letterboxd_avatar=self._letterboxd_avatar_for_page(),
             vm=self.vm,
         )
-        GENERATED_ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
-        GENERATED_ACCOUNT.write_text(account, encoding="utf-8")
+        self._store_page(account=account)
 
     def _nonstop_next(self) -> dict[str, str]:
         """Letterboxd slug -> date of the next Nonstop screening."""
@@ -684,6 +840,10 @@ class ProgramPage:
 
     def write_program(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
         """Write the Nonstop page. Letterboxd recommendations are filled in separately."""
+        with self._lock:
+            return self._write_program_holding_lock()
+
+    def _write_program_holding_lock(self) -> tuple[list[Movie], list[Movie], list[Movie], list[Movie]]:
         apply_known_letterboxd_posters(self.results, self.cache)
         watchlist, recommendations, watched, program = self._program_groups()
         found = [
@@ -709,9 +869,27 @@ class ProgramPage:
             letterboxd_avatar=self._letterboxd_avatar_for_page(),
             vm=self.vm,
         )
-        GENERATED_HTML.parent.mkdir(parents=True, exist_ok=True)
-        GENERATED_HTML.write_text(output, encoding="utf-8")
+        self._store_page(program=output)
         return watchlist, recommendations, watched, program
+
+    def _store_page(self, *, program: str | None = None, account: str | None = None) -> None:
+        """Keep this browser's HTML. The startup account also updates the files on disk."""
+        session = self._view()
+        if program is not None:
+            session.program_html = program
+        if account is not None:
+            session.account_html = account
+        if session.program_html and session.account_html:
+            session.dirty = False
+        startup = object.__getattribute__(self, "_startup")
+        if session is not startup:
+            return
+        if program is not None:
+            GENERATED_HTML.parent.mkdir(parents=True, exist_ok=True)
+            GENERATED_HTML.write_text(program, encoding="utf-8")
+        if account is not None:
+            GENERATED_ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
+            GENERATED_ACCOUNT.write_text(account, encoding="utf-8")
 
     def _apply_taste(self, view: TasteView, fetched_at: int | None) -> None:
         self.see_first = view.see_first
@@ -740,7 +918,7 @@ class ProgramPage:
 
     def fill_recommendations(self, *, force: bool = False, refresh_profile: bool = False) -> None:
         with self._lock:
-            epoch = self._epoch
+            epoch = self.switch_epoch
             if self.no_profile:
                 return
             if self.vm:
@@ -790,7 +968,7 @@ class ProgramPage:
         )
         fetched_at = save_recommendations_cache(cache, cache_path, user, taste)
         with self._lock:
-            if epoch != self._epoch or self.no_profile:
+            if epoch != self.switch_epoch or self.no_profile:
                 return
             if refresh_profile:
                 self.watched_ratings = watched
@@ -844,70 +1022,36 @@ class ProgramPage:
                     reload = True
                 else:
                     self.following_user = user
-            if switch is not None and progress.get() is not None:
-                # Hand the browser the building page while this account reloads.
-                self._epoch += 1
-                self._rebuilding = True
-                generation = self._begin_switch_progress(load_profile=switch[1])
-                threading.Thread(
-                    target=self._switch_worker,
-                    args=(switch, generation),
-                    daemon=True,
-                ).start()
-                return True
-            if switch is not None:
-                self._epoch += 1
-                self._switch_to(*switch)
-            elif reload:
-                self.write()
-            self._save_viewer()
-            return reload
-
-    def _save_viewer(self) -> None:
-        save_viewer(
-            self.letterboxd_user,
-            self.languages,
-            calendars=self.calendar_sources,
-            signed_out=self.signed_out,
-            following_user=self.following_user,
-        )
-
-    def _begin_switch_progress(self, *, load_profile: bool) -> int:
+            if switch is None and not reload:
+                return False
+            self._rebuilding = True
+            self.switch_epoch += 1
+        # A switch belongs to this browser. It must not restart the shared
+        # build screen or rewrite the account stored for new visitors.
         tracker = progress.get()
-        assert tracker is not None
-        done = {
-            "program": "Already loaded",
-            "films": "Already matched",
-        }
-        skipped: dict[str, str] = {}
-        if self.calendar_sources:
-            done["calendar"] = "Already loaded"
-        else:
-            skipped["calendar"] = "No calendar connected"
-        if not load_profile:
-            skipped["profile"] = "Already loaded"
-            skipped["credits"] = "Already loaded"
-            skipped["streaming"] = "Already loaded"
-        return tracker.restart(done=done, skipped=skipped)
-
-    def _switch_worker(self, switch: tuple[str, bool, bool], generation: int) -> None:
-        progress.adopt(generation)
-        user, fetch_profile, refresh = switch
-        print(f"Switching to @{user}…", file=sys.stderr)
+        progress.bind(None)
         try:
-            with self._lock:
-                self._switch_to(user, fetch_profile, refresh)
-                tracker = progress.get()
-                if tracker is not None:
-                    tracker.ready()
-        except Exception as exc:
-            print(f"[serve] account switch: {exc}", file=sys.stderr)
-            tracker = progress.get()
-            if tracker is not None and tracker.phase != "error":
-                tracker.fail(str(exc))
+            if switch is not None:
+                print(f"Switching to @{switch[0]}…", file=sys.stderr)
+                self._switch_to(*switch)
+            else:
+                self.write()
         finally:
+            progress.bind(tracker)
             with self._lock:
                 self._rebuilding = False
+        return True
+
+    def _save_viewer(self) -> None:
+        """Save the machine calendars. The Letterboxd account stays the startup one."""
+        startup = object.__getattribute__(self, "_startup")
+        save_viewer(
+            startup.letterboxd_user,
+            list(startup.languages),
+            calendars=self.calendar_sources,
+            signed_out=startup.signed_out,
+            following_user=startup.following_user,
+        )
 
     def _switch_to(self, user: str, fetch_profile: bool, refresh: bool) -> None:
         if fetch_profile:
@@ -966,7 +1110,6 @@ class ProgramPage:
             self.taste_loved_are_themes = False
             self.taste_fetched_at = None
         self.following_user = user
-        self._save_viewer()
         with progress.step("pages", detail="Writing the Nonstop program"):
             self.write_program()
         if self.no_profile:
@@ -979,7 +1122,6 @@ class ProgramPage:
                 self.fill_recommendations(force=True)
         self.write_program()
         self._write_account_page()
-        self._save_viewer()
 
     def save_plan(self, payload: dict) -> dict[str, object]:
         with self._lock:
@@ -1154,8 +1296,7 @@ class ProgramPage:
                     self._program_reload = False
                     return
                 self._program_detail = "Updating the page…"
-                self.write_program()
-                self._write_account_page()
+                self._mark_sessions_dirty()
                 self._program_message = _program_change_message(
                     added,
                     removed,
@@ -1199,6 +1340,7 @@ class ProgramPage:
             self.busy_intervals = intervals
             self.calendar_status = status
             self._save_viewer()
+            self._mark_sessions_dirty()
             self.write_program()
             return {"intervals": intervals, "status": status, "sources": list(sources)}
 
@@ -1207,5 +1349,6 @@ class ProgramPage:
         intervals, status, _ready = calendar_for_plan(sources, self.results)
         self.busy_intervals = intervals
         self.calendar_status = status
+        self._mark_sessions_dirty()
         self.write_program()
         return {"intervals": intervals, "status": status, "sources": list(sources)}

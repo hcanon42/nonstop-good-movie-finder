@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import http.cookies
 import json
+import re
 import sys
 import threading
 import time
@@ -14,6 +16,22 @@ from typing import Any
 from goodmoviefinder.config import GENERATED_HTML
 from goodmoviefinder.progress import format_progress_html
 from goodmoviefinder.session import ProgramPage
+
+_VISITOR_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,80}$")
+
+
+def _cookie_token(header: str | None) -> str | None:
+    if not header:
+        return None
+    jar = http.cookies.SimpleCookie()
+    try:
+        jar.load(header)
+    except http.cookies.CookieError:
+        return None
+    morsel = jar.get("gmf")
+    if morsel is None or not _VISITOR_TOKEN.fullmatch(morsel.value):
+        return None
+    return morsel.value
 
 
 class ServeHub:
@@ -50,10 +68,33 @@ def start_server(state: Any, port: int, *, open_browser: bool = False) -> Thread
             print(f"[serve] {self.address_string()} {fmt % args}", file=sys.stderr)
 
         def handle(self) -> None:
+            self._pending_cookie: str | None = None
             try:
                 super().handle()
             except (ConnectionResetError, BrokenPipeError, TimeoutError):
                 return
+            finally:
+                page = self._page()
+                if isinstance(page, ProgramPage):
+                    page.unbind()
+
+        def _attach_session(self) -> None:
+            page = self._page()
+            if not isinstance(page, ProgramPage) or self._building():
+                return
+            session, created = page.open_session(_cookie_token(self.headers.get("Cookie")))
+            page.bind(session)
+            if created:
+                self._pending_cookie = session.token
+
+        def _send_cookie(self) -> None:
+            token = self._pending_cookie
+            if not token:
+                return
+            self.send_header(
+                "Set-Cookie",
+                f"gmf={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000",
+            )
 
         def _send(self, code: int, body: bytes | str, content_type: str) -> None:
             data = body if isinstance(body, bytes) else body.encode("utf-8")
@@ -62,6 +103,7 @@ def start_server(state: Any, port: int, *, open_browser: bool = False) -> Thread
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Access-Control-Allow-Origin", "*")
+            self._send_cookie()
             self.end_headers()
             self.wfile.write(data)
 
@@ -119,22 +161,28 @@ def start_server(state: Any, port: int, *, open_browser: bool = False) -> Thread
             if self._show_progress(path):
                 self._send(200, format_progress_html(), "text/html; charset=utf-8")
                 return
+            self._attach_session()
             page = self._page()
             if path == "/for-you":
                 self.send_response(302)
                 self.send_header("Location", "/account.html#recommendations")
                 self.send_header("Content-Length", "0")
+                self._send_cookie()
                 self.end_headers()
                 return
-            pages = {
-                "/": html_path,
-                "/index.html": html_path,
-                "/program-ranked.html": html_path,
-                "/account": html_path.parent / "account.html",
-                "/account.html": html_path.parent / "account.html",
-            }
-            page_path = pages.get(path)
-            if page_path is not None:
+            account_paths = {"/account", "/account.html"}
+            program_paths = {"/", "/index.html", "/program-ranked.html"}
+            if path in account_paths or path in program_paths:
+                if isinstance(page, ProgramPage):
+                    try:
+                        body = page.rendered_html(account=path in account_paths)
+                    except Exception as exc:
+                        print(f"[serve] page: {exc}", file=sys.stderr)
+                        self._send(500, "This page could not be built.", "text/plain; charset=utf-8")
+                        return
+                    self._send(200, body, "text/html; charset=utf-8")
+                    return
+                page_path = html_path if path in program_paths else html_path.parent / "account.html"
                 try:
                     body = page_path.read_text(encoding="utf-8")
                 except OSError:
@@ -263,13 +311,14 @@ def start_server(state: Any, port: int, *, open_browser: bool = False) -> Thread
 
         def do_POST(self) -> None:
             path = urllib.parse.urlparse(self.path).path
-            payload = self._read_json()
-            if payload is None:
-                return
             if path == "/api/progress/dismiss":
                 if hub is not None:
                     hub.progress.resume()
                 self._send(200, json.dumps({"ok": True}), "application/json")
+                return
+            self._attach_session()
+            payload = self._read_json()
+            if payload is None:
                 return
             page = self._page()
             if page is None:
