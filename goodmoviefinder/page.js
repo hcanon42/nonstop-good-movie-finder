@@ -9,7 +9,21 @@
     let scrolledSection = null;
 
     let activeTab = null;
-    let watchlistFilter = "all";
+
+    function pressedWatchlistFilter() {
+      const pressed = document.querySelector('[data-wl-filter][aria-pressed="true"]');
+      return pressed ? (pressed.getAttribute("data-wl-filter") || "all") : "all";
+    }
+
+    function selectedPlatform() {
+      const select = document.getElementById("wl-platform");
+      return select ? select.value : "";
+    }
+
+    function onSelectedPlatform(row, platform) {
+      if (!platform) return true;
+      return (row.getAttribute("data-platforms") || "").split("\u001f").includes(platform);
+    }
 
     function isCalendar() { return activeTab === "calendar"; }
     function isPlan() { return activeTab === "plan"; }
@@ -66,6 +80,8 @@
     function applySearch() {
       const q = search.value.trim().toLowerCase();
       const searching = q.length > 0;
+      const watchlistFilter = pressedWatchlistFilter();
+      const platformFilter = selectedPlatform();
       document.querySelectorAll("[data-movie-row]").forEach((row) => {
         const blob = row.getAttribute("data-search") || "";
         const hide = row.getAttribute("data-lang-hide") === "1" || (searching && !blob.includes(q));
@@ -76,9 +92,23 @@
         detail.hidden = hide || !expanded;
       });
       document.querySelectorAll(".program-section").forEach((section) => {
-        const hasMatch = searching && [...section.querySelectorAll("[data-movie-row]")].some((row) => !row.hidden);
-        section.classList.toggle("is-search-open", hasMatch);
+        const rows = [...section.querySelectorAll("[data-movie-row]")];
+        const visible = rows.filter((row) => !row.hidden);
+        const langShown = rows.filter((row) => row.getAttribute("data-lang-hide") !== "1");
+        const count = searching ? visible.length : langShown.length;
+        section.hidden = count === 0;
+        section.classList.toggle("is-search-open", searching && visible.length > 0);
+        const countEl = section.querySelector("[data-section-count]");
+        if (countEl) {
+          countEl.textContent = count + " " + (count === 1 ? "film" : "films");
+        }
+        const link = document.querySelector('.nav-pills a[data-nav="' + section.id + '"]');
+        if (link) link.hidden = section.hidden;
         syncSection(section);
+      });
+      document.querySelectorAll(".section-group").forEach((group) => {
+        const sections = [...group.querySelectorAll(".program-section")];
+        if (sections.length) group.hidden = sections.every((section) => section.hidden);
       });
       document.querySelectorAll("details.section-group").forEach((group) => {
         const hasMatch = searching && [...group.querySelectorAll("[data-movie-row]")].some((row) => !row.hidden);
@@ -120,7 +150,8 @@
         const blob = row.getAttribute("data-search") || "";
         const hide = (searching && !blob.includes(q))
           || (watchlistFilter === "stream" && row.getAttribute("data-streamable") !== "1")
-          || (watchlistFilter === "nonstop" && row.getAttribute("data-nonstop") !== "1");
+          || (watchlistFilter === "nonstop" && row.getAttribute("data-nonstop") !== "1")
+          || !onSelectedPlatform(row, platformFilter);
         row.hidden = hide;
         const detail = row.nextElementSibling;
         if (!detail || !detail.hasAttribute("data-stream-detail")) return;
@@ -170,7 +201,7 @@
       }
       const streamEmpty = document.getElementById("stream-empty");
       if (streamEmpty) {
-        const show = (searching || watchlistFilter !== "all") && streamMatches === 0;
+        const show = (searching || watchlistFilter !== "all" || platformFilter !== "") && streamMatches === 0;
         streamEmpty.hidden = !show;
         if (show) streamEmpty.textContent = "No watchlist films match.";
       }
@@ -212,8 +243,16 @@
       const countEl = button.querySelector(".month-day-count");
       const titleEl = button.querySelector(".month-day-title");
       const originalTitle = button.getAttribute("data-title") || "";
+      const title = bestVisibleTitle(films) || originalTitle;
       if (countEl) countEl.textContent = String(visible.length);
-      if (titleEl) titleEl.textContent = bestVisibleTitle(films) || originalTitle;
+      if (titleEl) titleEl.textContent = title;
+      const dateLabel = button.getAttribute("data-date-label") || "";
+      if (dateLabel) {
+        const filmWord = visible.length === 1 ? "film" : "films";
+        let label = dateLabel + ", " + visible.length + " " + filmWord;
+        if (title) label += ", " + title;
+        button.setAttribute("aria-label", label);
+      }
       const empty = films.length > 0 && visible.length === 0;
       button.classList.toggle("is-filtered-out", empty);
       button.disabled = empty;
@@ -355,21 +394,30 @@
 
     document.querySelectorAll(".nav-pills a[href^='#']").forEach((link) => {
       link.addEventListener("click", (event) => {
-        const id = link.getAttribute("href").slice(1);
-        if (isCalendar()) {
-          event.preventDefault();
-          sectionFilter = sectionFilter === id ? null : id;
-          syncSectionLinks();
-          applySearch();
-          return;
-        }
         event.preventDefault();
+        const id = link.getAttribute("href").slice(1);
         const section = document.getElementById(id);
         if (!section) return;
         const group = section.closest("details.section-group");
         if (group) group.open = true;
         if (section.classList.contains("program-section")) setFolded(section, false);
         section.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    });
+
+    function pressSectionFilter(id) {
+      sectionFilter = id || null;
+      document.querySelectorAll("[data-section-filter]").forEach((button) => {
+        const value = button.getAttribute("data-section-filter") || "";
+        const pressed = sectionFilter ? value === sectionFilter : value === "";
+        button.setAttribute("aria-pressed", pressed ? "true" : "false");
+      });
+    }
+
+    document.querySelectorAll("[data-section-filter]").forEach((button) => {
+      button.addEventListener("click", () => {
+        pressSectionFilter(button.getAttribute("data-section-filter") || "");
+        applySearch();
       });
     });
 
@@ -1143,6 +1191,49 @@
       status.textContent = message;
     }
 
+    let friendsListFailed = false;
+
+    function syncFriendsSearch() {
+      const field = document.querySelector(".search-field");
+      if (!field) return;
+      const hide = friendsListFailed && activeTab === "for-friends";
+      field.classList.toggle("is-friends-failed", hide);
+    }
+
+    function showFriendsListFailure(message) {
+      friendsListFailed = true;
+      const status = document.getElementById("gift-board-status");
+      if (!status) {
+        syncFriendsSearch();
+        return;
+      }
+      status.hidden = false;
+      status.classList.add("is-error");
+      status.replaceChildren();
+      status.append(document.createTextNode((message || "Those lists could not be loaded.") + " "));
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "btn friend-retry";
+      retry.textContent = "Retry";
+      retry.addEventListener("click", () => {
+        friendsListFailed = false;
+        status.classList.remove("is-error");
+        status.textContent = "Loading the lists…";
+        syncFriendsSearch();
+        giftsPayload = null;
+        giftsLoad = null;
+        ensureGifts().then((payload) => {
+          friendsListFailed = false;
+          syncFriendsSearch();
+          renderGiftBoard(payload);
+        }).catch((err) => {
+          showFriendsListFailure(err && err.message ? err.message : "Those lists could not be loaded.");
+        });
+      });
+      status.append(retry);
+      syncFriendsSearch();
+    }
+
     function toggleGift(button) {
       const section = button.closest('[data-friend-section="gift"]');
       const panel = button.closest("[data-friend-slug]");
@@ -1421,7 +1512,20 @@
         const status = panel.querySelector(".friend-status");
         if (status) {
           status.hidden = false;
-          status.textContent = text;
+          status.replaceChildren();
+          status.append(document.createTextNode(text + " "));
+          const retry = document.createElement("button");
+          retry.type = "button";
+          retry.className = "btn friend-retry";
+          retry.textContent = "Retry";
+          retry.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            delete panel.dataset.friendState;
+            status.textContent = "Loading friend ratings and watchlists…";
+            startFriendLoad(slug, true);
+          });
+          status.append(retry);
         }
         panel.querySelectorAll(".friend-list").forEach((list) => {
           list.hidden = true;
@@ -1763,6 +1867,13 @@
           statusEl.classList.toggle("is-error", Boolean(payload.error));
           statusEl.textContent = payload.error || payload.message || "The Wien program is unchanged.";
         }
+        if (payload.readLabel) {
+          const built = document.getElementById("program-check-built");
+          if (built) {
+            built.hidden = false;
+            built.textContent = payload.readLabel;
+          }
+        }
       } catch (err) {
         if (statusEl) {
           statusEl.hidden = false;
@@ -2014,9 +2125,7 @@
 
     if (document.getElementById("gift-board") && viewerIsSignedIn()) {
       ensureGifts().catch((err) => {
-        const status = document.getElementById("gift-board-status");
-        showGiftStatus(
-          status,
+        showFriendsListFailure(
           err && err.message ? err.message : "Those lists could not be loaded."
         );
       });

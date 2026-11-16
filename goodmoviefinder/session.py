@@ -12,6 +12,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 import urllib.error
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -348,6 +349,7 @@ class ProgramPage:
         self._program_detail = ""
         self._program_reload = False
         self._program_epoch = 0
+        self.program_read_at = int(time.time())
         self.refresh_streaming = False
         self.refresh_neighbors = False
         self.ignore_recommendation_cache = False
@@ -799,8 +801,29 @@ class ProgramPage:
             language_options=choices,
             letterboxd_avatar=self._letterboxd_avatar_for_page(),
             vm=self.vm,
+            program_read_label=recommendations_updated_label(self.program_read_at),
+            recommendation_streams=self._recommendation_streams(),
         )
         self._store_page(account=account)
+
+    def _recommendation_streams(self) -> list[dict[str, object]]:
+        """Austrian services for recommendation films, from the same cache as the watchlist."""
+        films: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for movie in (*self.see_first, *self.like_you, *self.step_outside):
+            slug = letterboxd_slug_from_url(movie.letterboxd_url) if movie.letterboxd_url else None
+            if not slug or slug in seen:
+                continue
+            seen.add(slug)
+            films.append({"slug": slug, "title": film_title(movie), "year": movie.year})
+        if not films or self.no_profile:
+            return []
+        return resolve_watchlist_streaming(
+            films,
+            self.delay,
+            refresh=False,
+            network=not self.vm,
+        )
 
     def _nonstop_next(self) -> dict[str, str]:
         """Letterboxd slug -> date of the next Nonstop screening."""
@@ -868,6 +891,7 @@ class ProgramPage:
             following_user=self.following_user,
             letterboxd_avatar=self._letterboxd_avatar_for_page(),
             vm=self.vm,
+            program_read_label=recommendations_updated_label(self.program_read_at),
         )
         self._store_page(program=output)
         return watchlist, recommendations, watched, program
@@ -1178,6 +1202,7 @@ class ProgramPage:
             elif self._program_message:
                 payload["message"] = self._program_message
                 payload["reload"] = self._program_reload
+                payload["readLabel"] = recommendations_updated_label(self.program_read_at)
                 self._program_message = None
                 self._program_reload = False
             return payload
@@ -1210,6 +1235,8 @@ class ProgramPage:
             films = parse_program(program_html)
             if not films:
                 raise RuntimeError("No films found on the Wien program.")
+            with self._lock:
+                self.program_read_at = int(time.time())
             current_urls = {film.url for film in films}
             with self._lock:
                 if epoch != self._epoch:

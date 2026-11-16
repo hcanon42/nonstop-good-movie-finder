@@ -60,6 +60,23 @@ def sign_in_card(user: str = "") -> str:
     )
 
 
+def _program_check_html(program_read_label: str) -> str:
+    built = (
+        f'<p class="program-check-built" id="program-check-built">{html.escape(program_read_label)}</p>'
+        if program_read_label
+        else '<p class="program-check-built" id="program-check-built" hidden></p>'
+    )
+    return (
+        '<div class="menu-section menu-program">'
+        '<button type="button" id="program-check" class="btn" '
+        'title="Read the Wien program again. Add films that arrived and drop films that left.">'
+        "Check for new films</button>"
+        f"{built}"
+        '<p class="program-check-status" id="program-check-status" role="status" hidden></p>'
+        "</div>"
+    )
+
+
 def account_menu_html(
     user: str,
     signed_in: bool,
@@ -68,14 +85,17 @@ def account_menu_html(
     *,
     following_user: str | None = None,
     avatar_url: str | None = None,
+    program_read_label: str = "",
 ) -> str:
     selected_keys = {name.casefold() for name in selected}
+    ordered = [name for name in choices if name.casefold() in selected_keys]
+    ordered.extend(name for name in choices if name.casefold() not in selected_keys)
     boxes = "".join(
         '<label class="lang-option">'
         f'<input type="checkbox" name="language" value="{html.escape(name, quote=True)}"'
         f'{" checked" if name.casefold() in selected_keys else ""}>'
         f"<span>{html.escape(name)}</span></label>"
-        for name in choices
+        for name in ordered
     )
     safe_user = html.escape(user)
     active_user = (following_user or user).strip()
@@ -101,8 +121,9 @@ def account_menu_html(
             f'target="_blank" rel="noopener noreferrer">@{safe_user}</a></p>'
         )
         signout = (
-            '<div class="menu-section menu-actions">'
-            '<button type="button" id="account-signout" class="btn btn-danger">Sign out</button>'
+            '<div class="menu-section menu-signout">'
+            '<button type="button" id="account-signout" class="btn btn-danger">'
+            f"Sign out of @{safe_user}</button>"
             "</div>"
         )
         signed_class = ""
@@ -110,7 +131,7 @@ def account_menu_html(
             '<div class="account-chip">'
             '<button type="button" class="account-open account-settings-open" id="settings-open" '
             'aria-expanded="false" aria-controls="settings-panel" aria-haspopup="dialog" '
-            'aria-label="Account and languages">'
+            'aria-label="Account">'
             f"{chip_avatar}"
             '<span class="account-caret" aria-hidden="true"></span></button>'
             '<button type="button" class="account-name" id="account-switch-open" '
@@ -138,17 +159,22 @@ def account_menu_html(
         f'<div class="account{signed_class}">'
         f"{account_open}"
         '<div id="settings-panel" class="settings-panel" role="dialog" '
-        'aria-label="Account and languages" hidden>'
+        'aria-label="Account" hidden>'
         f'<div class="menu-section">{who}{_profile_form(user, signed_in)}</div>'
-        '<div class="menu-section"><fieldset class="settings-languages">'
+        f"{_program_check_html(program_read_label)}"
+        f"{signout}"
+        "</div>"
+        '<div id="languages-panel" class="settings-panel languages-panel" role="dialog" '
+        'aria-label="Languages you follow" hidden>'
+        '<fieldset class="settings-languages">'
         "<legend>Languages I follow</legend>"
         f'<div class="lang-options">{boxes}</div>'
         '<p class="settings-hint">Original versions count for these languages. '
-        "Every other film needs English subtitles.</p>"
+        "Every other film needs English subtitles. "
+        "OmeU is the screening with English subtitles.</p>"
         "</fieldset>"
-        '<p><button type="button" id="settings-reset" class="btn">Reset languages</button></p>'
-        "</div>"
-        f"{signout}"
+        '<p class="languages-reset"><button type="button" id="settings-reset" class="btn">'
+        "Reset languages</button></p>"
         "</div></div>"
     )
 
@@ -173,6 +199,7 @@ def render_page(
     styles: tuple[str, ...],
     extra_json: str = "",
     footer: str = "",
+    program_read_label: str = "",
 ) -> str:
     """Compose one page: top bar, header, tab bar, tools row, panels."""
 
@@ -220,7 +247,7 @@ def render_page(
         {switch("nonstop", NONSTOP_HREF, "Nonstop Kino")}
         {switch("account", ACCOUNT_HREF, "My Letterboxd")}
       </nav>
-      {account_menu_html(user, signed_in, choices, selected, following_user=following, avatar_url=avatar_url)}
+      {account_menu_html(user, signed_in, choices, selected, following_user=following, avatar_url=avatar_url, program_read_label=program_read_label)}
     </div>
   </header>
   <section class="page-head">

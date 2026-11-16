@@ -478,6 +478,7 @@ def resolve_watchlist_streaming(
     *,
     refresh: bool = False,
     cache_path: Path = STREAMING_CACHE,
+    network: bool = True,
 ) -> list[dict[str, object]]:
     """Look up each watchlist film. A failed lookup stays unchecked so the next run retries it."""
     cache = load_streaming_cache(cache_path)
@@ -507,7 +508,10 @@ def resolve_watchlist_streaming(
                 services = "service" if count == 1 else "services"
                 print(f"  {count} {services} (cached).", file=sys.stderr)
         checked = True
-        if offers is None:
+        if offers is None and not network:
+            offers = []
+            checked = False
+        elif offers is None:
             try:
                 offers = search_austria_offers(title, year)
             except (RuntimeError, TimeoutError) as exc:

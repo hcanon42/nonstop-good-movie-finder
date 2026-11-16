@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import urllib.parse
 from datetime import date, timedelta
 
@@ -15,6 +16,12 @@ LOVED_RATING = 4.0
 UNDERSTOOD_AUDIO_VERSIONS = frozenset({"OV", "OmdU", "OmeU"})
 ENGLISH_SUBTITLE_VERSIONS = frozenset({"OmeU"})
 VERSION_ORDER = ("OV", "OmdU", "OmeU", "DF")
+VERSION_PHRASE = {
+    "OV": "original version",
+    "OmdU": "original with German subtitles",
+    "OmeU": "original with English subtitles",
+    "DF": "German dubbed",
+}
 # Letterboxd label for dialogue-free films; any Nonstop version is fine.
 NO_SPOKEN_LANGUAGE_KEY = "no spoken language"
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -51,12 +58,22 @@ def ordered_versions(codes: set[str]) -> list[str]:
     return known + extra
 
 
+_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _decode_title(value: str) -> str:
+    """Turn a literal ``\\u2013`` left in a cached title into the character it names."""
+    if "\\u" not in value:
+        return value
+    return _UNICODE_ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), value)
+
+
 def film_title(movie: Movie) -> str:
     """English Letterboxd title, or the French original for French and Quebec films."""
     language = (movie.original_language or "").casefold()
     if language.startswith("fr") and movie.original_title:
-        return movie.original_title
-    return movie.letterboxd_title or movie.title
+        return _decode_title(movie.original_title)
+    return _decode_title(movie.letterboxd_title or movie.title)
 
 
 def attach_program(movie: Movie, film: ProgramFilm) -> None:
@@ -224,6 +241,14 @@ def venue_label(screening: Screening) -> str:
     if screening.venue_name and screening.city:
         return f"{screening.venue_name}, {screening.city}"
     return screening.venue_name or screening.city or screening.venue_slug or "Cinema"
+
+
+def version_phrase(code: str, *, sentence_start: bool = False) -> str:
+    """Plain-language name for a Nonstop version code."""
+    phrase = VERSION_PHRASE.get(code, code)
+    if sentence_start and phrase:
+        return phrase[:1].upper() + phrase[1:]
+    return phrase
 
 
 def format_screening_date(weekday: str) -> str:

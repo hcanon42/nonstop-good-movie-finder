@@ -434,8 +434,29 @@
         .replace(/"/g, "&quot;");
     }
 
+    function formatPlanDate(iso) {
+      const parts = iso.split("-").map(Number);
+      if (parts.length < 3 || parts.some((part) => !Number.isFinite(part))) return iso;
+      const day = new Date(parts[0], parts[1] - 1, parts[2]);
+      const weekday = PLAN_WEEKDAYS[day.getDay()] || "";
+      const month = PLAN_MONTHS[parts[1] - 1] || "";
+      return `${weekday} ${String(parts[2]).padStart(2, "0")} ${month}`.trim();
+    }
+
+    function versionPhrase(code) {
+      if (code === "OV") return "original version";
+      if (code === "OmdU") return "original with German subtitles";
+      if (code === "OmeU") return "original with English subtitles";
+      if (code === "DF") return "German dubbed";
+      return code;
+    }
+
+    function slotPlace(row) {
+      const version = row.language ? ` · ${versionPhrase(row.language)}` : "";
+      return `${venueHtml(row)}${version}`;
+    }
+
     function cellFilmHtml(row) {
-      const language = row.language ? ` · ${escapeHtml(row.language)}` : "";
       const assumed = row.assumed
         ? '<span class="plan-assumed">Runtime unknown, using 2.5 hours.</span>'
         : "";
@@ -443,9 +464,42 @@
         `<div class="plan-cell-film">` +
         `<span class="plan-time">${escapeHtml(row.time)}</span>` +
         `<span class="plan-cell-title">${escapeHtml(row.title)}</span>` +
-        `<span class="plan-meta">${venueHtml(row)}${language}</span>` +
+        `<span class="plan-meta">${slotPlace(row)}</span>` +
         `${assumed}</div>`
       );
+    }
+
+    function planListHtml(rows) {
+      if (!rows.length) return "";
+      const items = rows.map((row) => (
+        `<li class="plan-screening">` +
+        `<span class="plan-screening-title">${escapeHtml(row.title)}</span>` +
+        `<span class="plan-screening-place">${formatPlanDate(row.date)} · ${escapeHtml(row.time)} · ${slotPlace(row)}</span>` +
+        `</li>`
+      )).join("");
+      return `<ol class="plan-screenings">${items}</ol>`;
+    }
+
+    function calendarTargetName() {
+      const pressed = [...document.querySelectorAll("[data-calendar][aria-pressed='true']")];
+      const names = pressed.map((button) => (
+        button.getAttribute("data-calendar") === "apple" ? "Apple Calendar" : "Google Calendar"
+      ));
+      if (!names.length) return "your calendar";
+      if (names.length === 1) return names[0];
+      return `${names[0]} and ${names[1]}`;
+    }
+
+    function saveLabel(rows) {
+      const target = calendarTargetName();
+      if (rows.length === 1) {
+        const row = rows[0];
+        const version = row.language ? ` · ${versionPhrase(row.language)}` : "";
+        const venue = row.venue || "the cinema";
+        return `Add ${formatPlanDate(row.date)} · ${row.time} · ${venue}${version} to ${target}`;
+      }
+      const count = rows.length === 1 ? "1 screening" : `${rows.length} screenings`;
+      return `Add ${count} to ${target}`;
     }
 
     function planMonthHtml(year, month, byDate, todayIso) {
@@ -466,11 +520,12 @@
           continue;
         }
         const kind = films.length ? " has" : " is-busy";
+        const filmsHtml = films.map((row) => cellFilmHtml(row)).join("");
         cells.push(
           `<div class="plan-cell${kind}${todayClass}">` +
           `<span class="plan-cell-num">${day}</span>` +
-          `${busyHtml(busy)}` +
-          `${films.map(cellFilmHtml).join("")}</div>`,
+          `${filmsHtml}` +
+          `${busyHtml(busy)}</div>`,
         );
       }
       while (cells.length % 7) cells.push('<span class="plan-cell pad"></span>');
@@ -516,7 +571,7 @@
           year += 1;
         }
       }
-      return `<div class="plan-months">${months.join("")}</div>`;
+      return `<div class="plan-board-body">${planListHtml(rows)}${`<div class="plan-months">${months.join("")}</div>`}</div>`;
     }
 
     function venueHtml(slot) {
@@ -679,6 +734,8 @@
       summary.hidden = false;
       summary.textContent = result.summary;
       plannedRows = result.rows;
+      const save = document.getElementById("plan-save");
+      if (save) save.textContent = saveLabel(result.rows);
       if (actions) actions.hidden = result.rows.length === 0;
       if (saveStatus && !saveStatus.textContent) saveStatus.hidden = true;
       if (result.rows.length || planBusy.length) {
@@ -719,8 +776,25 @@
       renderPlan();
     }
 
+    function disarmClearPlan() {
+      const button = document.getElementById("plan-clear");
+      if (!button || button.dataset.armed !== "1") return;
+      button.dataset.armed = "";
+      button.textContent = "Clear all";
+    }
+
     function clearPlan() {
+      const button = document.getElementById("plan-clear");
       if (!planSelected.length) return;
+      if (!button || button.dataset.armed !== "1") {
+        if (button) {
+          button.dataset.armed = "1";
+          button.textContent = "Clear the plan?";
+        }
+        return;
+      }
+      button.dataset.armed = "";
+      button.textContent = "Clear all";
       planSelected = [];
       const cap = document.getElementById("plan-cap");
       if (cap) cap.hidden = true;
@@ -871,6 +945,12 @@
     }
     const planClear = document.getElementById("plan-clear");
     if (planClear) planClear.addEventListener("click", clearPlan);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") disarmClearPlan();
+    });
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest("#plan-clear")) disarmClearPlan();
+    });
     const planSave = document.getElementById("plan-save");
     if (planSave) planSave.addEventListener("click", savePlan);
     const planRefresh = document.getElementById("plan-refresh");

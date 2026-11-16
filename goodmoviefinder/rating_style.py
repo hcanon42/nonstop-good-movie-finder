@@ -5,8 +5,8 @@ from __future__ import annotations
 # Text and badge colors blend between these scores. Stops past 4.2 and below
 # 2.6 keep the ends of the Letterboxd scale from collapsing to one shade.
 _RATING_COLOR_STOPS: tuple[tuple[float, tuple[int, int, int], tuple[int, int, int, float]], ...] = (
-    (0.5, (220, 96, 86), (176, 58, 48, 0.28)),
-    (2.6, (232, 138, 122), (196, 92, 74, 0.22)),
+    (0.5, (255, 236, 232), (120, 42, 36, 0.55)),
+    (2.6, (255, 228, 220), (140, 58, 48, 0.42)),
     (3.0, (232, 200, 90), (201, 162, 39, 0.20)),
     (3.4, (212, 222, 122), (168, 184, 74, 0.20)),
     (3.8, (159, 216, 106), (106, 171, 74, 0.22)),

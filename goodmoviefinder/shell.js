@@ -24,9 +24,8 @@
       document.querySelectorAll("[data-tools]").forEach((el) => {
         el.hidden = !(el.getAttribute("data-tools") || "").split(/\s+/).includes(view);
       });
-      const label = document.getElementById("nav-pills-label");
-      if (label) label.textContent = view === "calendar" ? "Show only" : "Jump to";
-      if (view !== "calendar") sectionFilter = null;
+      if (view !== "calendar") pressSectionFilter("");
+      if (typeof syncFriendsSearch === "function") syncFriendsSearch();
       if (searchField) {
         const input = document.getElementById("search");
         if (input) {
@@ -69,13 +68,19 @@
     });
     document.querySelectorAll("[data-wl-filter]").forEach((button) => {
       button.addEventListener("click", () => {
-        watchlistFilter = button.getAttribute("data-wl-filter") || "all";
         document.querySelectorAll("[data-wl-filter]").forEach((other) => {
           other.setAttribute("aria-pressed", other === button ? "true" : "false");
         });
         applySearch();
       });
     });
+    const platformSelect = document.getElementById("wl-platform");
+    if (platformSelect) {
+      platformSelect.addEventListener("change", () => {
+        platformSelect.classList.toggle("is-active", platformSelect.value !== "");
+        applySearch();
+      });
+    }
     document.querySelectorAll("[data-day]").forEach((button) => {
       button.addEventListener("click", () => toggleDay(button));
     });
@@ -125,7 +130,7 @@
     let followingLoad = null;
 
     function selectedLanguageNames() {
-      return [...document.querySelectorAll('#settings-panel input[name="language"]:checked')].map(
+      return [...document.querySelectorAll('#languages-panel input[name="language"]:checked')].map(
         (box) => box.value
       );
     }
@@ -162,7 +167,7 @@
 
     function applyCheckboxSelection(names) {
       const wanted = new Set(names.map((name) => String(name).toLowerCase()));
-      document.querySelectorAll('#settings-panel input[name="language"]').forEach((box) => {
+      document.querySelectorAll('#languages-panel input[name="language"]').forEach((box) => {
         box.checked = wanted.has(box.value.toLowerCase());
       });
     }
@@ -335,9 +340,23 @@
       panel.hidden = !open;
       button.setAttribute("aria-expanded", open ? "true" : "false");
       if (open) {
+        setLanguagesOpen(false);
         setAccountSwitchOpen(false);
         const input = panel.querySelector('input[name="letterboxd"]');
         if (input && !viewerConfig.letterboxdUser) input.focus();
+      }
+    }
+
+    function setLanguagesOpen(open) {
+      const panel = document.getElementById("languages-panel");
+      if (!panel) return;
+      panel.hidden = !open;
+      document.querySelectorAll("[data-open-languages]").forEach((button) => {
+        button.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+      if (open) {
+        setSettingsOpen(false);
+        setAccountSwitchOpen(false);
       }
     }
 
@@ -349,6 +368,7 @@
       button.setAttribute("aria-expanded", open ? "true" : "false");
       if (open) {
         setSettingsOpen(false);
+        setLanguagesOpen(false);
         ensureFollowingList();
       }
     }
@@ -486,7 +506,7 @@
           setSettingsOpen(!panel || panel.hidden);
         });
       }
-      document.querySelectorAll('#settings-panel input[name="language"]').forEach((box) => {
+      document.querySelectorAll('#languages-panel input[name="language"]').forEach((box) => {
         box.addEventListener("change", () => {
           persistLanguages();
           applyLanguageFilter();
@@ -505,6 +525,12 @@
       document.querySelectorAll("[data-open-account]").forEach((link) => {
         link.addEventListener("click", () => setSettingsOpen(true));
       });
+      document.querySelectorAll("[data-open-languages]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const panel = document.getElementById("languages-panel");
+          setLanguagesOpen(!panel || panel.hidden);
+        });
+      });
       const signOut = document.getElementById("account-signout");
       if (signOut) signOut.addEventListener("click", signOutUser);
       document.addEventListener("click", (event) => {
@@ -512,7 +538,18 @@
         const switchPanel = document.getElementById("account-switch-panel");
         if (settingsPanel && !settingsPanel.hidden) {
           if (!event.target.closest(".account") && !event.target.closest("[data-open-account]")) {
+            const signOut = document.getElementById("account-signout");
+            if (signOut && signOut.dataset.armed === "1") {
+              signOut.dataset.armed = "";
+              signOut.textContent = signOut.dataset.label || "Sign out";
+            }
             setSettingsOpen(false);
+          }
+        }
+        const languagesPanel = document.getElementById("languages-panel");
+        if (languagesPanel && !languagesPanel.hidden) {
+          if (!event.target.closest("#languages-panel") && !event.target.closest("[data-open-languages]")) {
+            setLanguagesOpen(false);
           }
         }
         if (switchPanel && !switchPanel.hidden) {
@@ -523,6 +560,18 @@
       });
       document.addEventListener("keydown", (event) => {
         if (event.key !== "Escape") return;
+        const signOut = document.getElementById("account-signout");
+        if (signOut && signOut.dataset.armed === "1") {
+          signOut.dataset.armed = "";
+          signOut.textContent = signOut.dataset.label || "Sign out";
+        }
+        const languagesPanel = document.getElementById("languages-panel");
+        if (languagesPanel && !languagesPanel.hidden) {
+          setLanguagesOpen(false);
+          const opener = document.querySelector("[data-open-languages]");
+          if (opener) opener.focus();
+          return;
+        }
         const panel = document.getElementById("settings-panel");
         if (!panel || panel.hidden) return;
         setSettingsOpen(false);
@@ -672,6 +721,17 @@
 
 
     async function signOutUser() {
+      const button = document.getElementById("account-signout");
+      if (!button || button.dataset.armed !== "1") {
+        if (button) {
+          button.dataset.label = button.textContent;
+          button.dataset.armed = "1";
+          button.textContent = "Sign out?";
+        }
+        return;
+      }
+      button.dataset.armed = "";
+      button.textContent = button.dataset.label || "Sign out";
       setProfileLoading(true);
       let navigating = false;
       try {

@@ -17,8 +17,90 @@ from goodmoviefinder.html import (
 from goodmoviefinder.layout import NONSTOP_HREF, render_page, sign_in_card
 from goodmoviefinder.letterboxd import letterboxd_backdrop_url, letterboxd_poster_url
 from goodmoviefinder.models import Movie
-from goodmoviefinder.program import format_screening_date
+from goodmoviefinder.program import format_screening_date, letterboxd_slug_from_url
 from goodmoviefinder.viewer import canonical_languages, settings_stamp
+
+
+# Splits service names on a watchlist row. Names from JustWatch never contain it.
+_PLATFORM_SEP = "\x1f"
+_PLATFORM_KIND_ORDER = ("subscription", "free", "with ads", "rent", "buy")
+_PLATFORM_KIND_LABEL = {
+    "subscription": "Subscription",
+    "free": "Free",
+    "with ads": "With ads",
+    "rent": "Rent",
+    "buy": "Buy",
+}
+
+
+def _offer_names(offers: list[object]) -> list[tuple[str, str]]:
+    """Unique streaming services on one film, with how each one is offered."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+        name = offer.get("name")
+        if not isinstance(name, str):
+            continue
+        name = name.strip()
+        url = offer.get("url")
+        if not name or _PLATFORM_SEP in name or name in seen:
+            continue
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+            continue
+        seen.add(name)
+        kind = offer.get("kind")
+        kind_name = kind.strip() if isinstance(kind, str) else ""
+        found.append((name, kind_name))
+    return found
+
+
+def _platform_filter_html(films: list[dict[str, object]]) -> str:
+    """A menu of services that actually appear on this watchlist."""
+    kind_counts: dict[str, dict[str, int]] = {}
+    for film in films:
+        raw = film.get("offers")
+        offers = raw if isinstance(raw, list) else []
+        for name, kind in _offer_names(offers):
+            bucket = kind if kind in _PLATFORM_KIND_LABEL else ""
+            per_kind = kind_counts.setdefault(name, {})
+            per_kind[bucket] = per_kind.get(bucket, 0) + 1
+    if not kind_counts:
+        return ""
+    grouped: dict[str, list[tuple[str, int]]] = {}
+    for name, per_kind in kind_counts.items():
+        total = sum(per_kind.values())
+        kind = min(
+            per_kind,
+            key=lambda item: (
+                -per_kind[item],
+                _PLATFORM_KIND_ORDER.index(item)
+                if item in _PLATFORM_KIND_ORDER
+                else len(_PLATFORM_KIND_ORDER),
+            ),
+        )
+        grouped.setdefault(kind, []).append((name, total))
+    options = ['<option value="">Any platform</option>']
+    kind_order = [kind for kind in _PLATFORM_KIND_ORDER if grouped.get(kind)]
+    if grouped.get(""):
+        kind_order.append("")
+    for kind in kind_order:
+        rows = sorted(grouped[kind], key=lambda item: (-item[1], item[0].casefold()))
+        choices = "".join(
+            f'<option value="{html.escape(name, quote=True)}">'
+            f"{html.escape(name)} ({count})</option>"
+            for name, count in rows
+        )
+        label = _PLATFORM_KIND_LABEL.get(kind, "Other")
+        options.append(
+            f'<optgroup label="{html.escape(label, quote=True)}">{choices}</optgroup>'
+        )
+    return (
+        '<label class="platform-filter">'
+        '<span class="visually-hidden">Streaming platform</span>'
+        '<select id="wl-platform">' + "".join(options) + "</select></label>"
+    )
 
 
 def _stream_offer_html(offer: object) -> str:
@@ -54,7 +136,33 @@ def _stream_rating(film: dict[str, object]) -> float | None:
     return float(rating)
 
 
-def _stream_detail_html(film: dict[str, object], detail_id: str, title: str, film_url: str) -> str:
+def _availability_markup(
+    film: dict[str, object] | None,
+    next_day: str | None,
+) -> str:
+    """Services, a Nonstop date, or an explicit unchecked state."""
+    offers: list[object] = []
+    checked = False
+    if isinstance(film, dict):
+        raw = film.get("offers")
+        offers = raw if isinstance(raw, list) else []
+        checked = bool(film.get("checked"))
+    offer_html = "".join(_stream_offer_html(offer) for offer in offers)
+    parts: list[str] = []
+    if offer_html:
+        parts.append(f'<span class="stream-offers">{offer_html}</span>')
+    elif checked:
+        parts.append('<span class="where-note">Not streaming in Austria</span>')
+    else:
+        parts.append('<span class="where-note">Could not check</span>')
+    if next_day:
+        parts.append(
+            f'<span class="where-note">Nonstop · {html.escape(format_screening_date(next_day))}</span>'
+        )
+    return f'<p class="where-line">{"".join(parts)}</p>'
+
+
+def _stream_detail_html(film: dict[str, object], detail_id: str, title: str, film_url: str, next_day: str | None = None) -> str:
     poster_url = letterboxd_poster_url(film.get("poster"))
     poster = ""
     if poster_url:
@@ -97,11 +205,26 @@ def _stream_detail_html(film: dict[str, object], detail_id: str, title: str, fil
         f'<div class="detail-main">'
         f"{poster}"
         f'<div class="detail-body">'
-        f'<div class="detail-about">{facts_html}{synopsis}'
+        f'<div class="detail-about">{facts_html}{synopsis}{_availability_markup(film, next_day)}'
         f'<p class="detail-links">{letterboxd}</p></div>'
         f'<div class="detail-columns">{friends}</div>'
         f"</div></div></div>"
     )
+
+
+def _watch_sort_key(
+    film: dict[str, object],
+    nonstop_next: dict[str, str],
+) -> tuple[int, str, str]:
+    slug = str(film.get("slug") or "")
+    title = str(film.get("title") or slug).casefold()
+    offers = film.get("offers")
+    has_offers = isinstance(offers, list) and bool(offers)
+    if nonstop_next.get(slug):
+        return (0, nonstop_next[slug], title)
+    if has_offers:
+        return (1, "", title)
+    return (2, "", title)
 
 
 def _watchlist_html(
@@ -112,7 +235,8 @@ def _watchlist_html(
     rows: list[str] = []
     streamable = 0
     at_nonstop = 0
-    for index, film in enumerate(films):
+    ordered = sorted(films, key=lambda film: _watch_sort_key(film, nonstop_next))
+    for index, film in enumerate(ordered):
         slug = str(film.get("slug") or "")
         title = str(film.get("title") or slug)
         year = film.get("year")
@@ -125,6 +249,11 @@ def _watchlist_html(
         sort_rating = f"{rating:.4f}" if rating is not None else ""
         raw_offers = film.get("offers")
         offers = raw_offers if isinstance(raw_offers, list) else []
+        offer_names = _offer_names(offers)
+        platform_attr = ""
+        if offer_names:
+            joined = _PLATFORM_SEP.join(name for name, _kind in offer_names)
+            platform_attr = f' data-platforms="{html.escape(joined, quote=True)}"'
         offer_html = "".join(_stream_offer_html(offer) for offer in offers)
         if offer_html:
             streamable += 1
@@ -156,9 +285,10 @@ def _watchlist_html(
         rows.append(
             f'<tr data-stream-row class="row-watchlist" data-stream-id="{safe_slug}" data-search="{search}"'
             f' data-streamable="{1 if offer_html else 0}" data-nonstop="{1 if next_day else 0}"'
+            f"{platform_attr}"
             f' data-sort-rating="{sort_rating}" data-sort-year="{sort_year}"'
             f' data-sort-title="{sort_title}">'
-            f'<td class="col-rating">{_rating_badge(rating, rating_text, title="Letterboxd rating")}</td>'
+            f'<td class="col-rating">{_rating_badge(rating, rating_text, title="Letterboxd community score. This watchlist was read separately from the Nonstop program, so the number can differ slightly.")}</td>'
             f'<td class="col-year">{year_html}</td>'
             f'<td class="col-title"><span class="title-line">{row_poster}<button type="button" class="expand" '
             f'aria-expanded="false" aria-controls="{html.escape(detail_id, quote=True)}">'
@@ -167,14 +297,20 @@ def _watchlist_html(
             f'<td class="col-stream">{services}</td>'
             f'<td class="col-nonstop">{nonstop}</td></tr>'
             f'<tr class="detail-row" data-stream-detail hidden>'
-            f'<td colspan="5">{_stream_detail_html(film, detail_id, title, film_url)}</td>'
+            f'<td colspan="5">{_stream_detail_html(film, detail_id, title, film_url, next_day)}</td>'
             f"</tr>"
         )
     table = (
         '<div class="table-wrap panel">'
         "<table>"
         "<thead><tr>"
-        + _sortable_header("Rating", "rating", "number", extra_class="col-rating")
+        + _sortable_header(
+            "Rating",
+            "rating",
+            "number",
+            extra_class="col-rating",
+            title="Letterboxd community score. This watchlist was read separately from the Nonstop program, so the number can differ slightly.",
+        )
         + _sortable_header("Year", "year", "number", extra_class="col-year")
         + _sortable_header("Film", "title", "text", extra_class="col-title")
         + "<th>Streaming in Austria</th><th>Nonstop</th>"
@@ -198,6 +334,7 @@ def _watchlist_panel(
         f'<button type="button" class="btn filter-chip" data-wl-filter="all" aria-pressed="true">All ({len(films)})</button>'
         f'<button type="button" class="btn filter-chip" data-wl-filter="stream" aria-pressed="false">Streaming in Austria ({streamable})</button>'
         f'<button type="button" class="btn filter-chip" data-wl-filter="nonstop" aria-pressed="false">Playing at Nonstop ({at_nonstop})</button>'
+        f"{_platform_filter_html(films)}"
         "</div>"
     )
     body = (
@@ -292,6 +429,33 @@ def _taste_group(kind: str, label: str, phrases: list[str]) -> str:
     )
 
 
+def _confidence_sentence(note: str) -> str:
+    """One sentence for the model check. The films themselves stay above this."""
+    stats, caveats = _taste_readout(note)
+    if stats is None:
+        return note.strip()
+    parts: list[str] = []
+    folded = ("not confident enough", "under the usual bar")
+    if any("not confident enough" in item.lower() for item in caveats):
+        parts.append("Not confident enough to recommend a film.")
+    elif any("under the usual bar" in item.lower() for item in caveats):
+        parts.append("Under the usual bar.")
+    for label, value, caption, _count in stats:
+        if value == "—":
+            lowered = caption[:1].lower() + caption[1:] if caption else caption
+            parts.append(f"{label}: {lowered}.")
+            continue
+        if label == "Your ratings":
+            parts.append(f"You rated earlier predictions 4 or higher {value} of the time.")
+        elif label == "Similar members":
+            parts.append(f"You rated similar members' picks 4 or higher {value} of the time.")
+    for item in caveats:
+        if any(phrase in item.lower() for phrase in folded):
+            continue
+        parts.append(item if item.endswith(".") else f"{item}.")
+    return " ".join(parts)
+
+
 def _taste_intro_html(
     paragraph: str,
     note: str,
@@ -300,14 +464,16 @@ def _taste_intro_html(
     *,
     loved_are_themes: bool,
 ) -> str:
-    stats, caveats = _taste_readout(note)
     parts: list[str] = [
-        '<section class="taste-intro" id="taste">',
-        '<header class="taste-head">',
-        '<p class="taste-kicker">Your taste</p>',
+        '<details class="taste-intro" id="taste">',
+        "<summary>Your taste</summary>",
         '<p class="taste-scope">From across Letterboxd, not only what is playing now.</p>',
-        "</header>",
     ]
+    sentence = _confidence_sentence(note)
+    if sentence:
+        parts.append(f'<p class="taste-sentence">{html.escape(sentence)}</p>')
+    elif paragraph:
+        parts.append(f'<p class="taste-lead">{html.escape(paragraph)}</p>')
     if loved or lower:
         groups: list[str] = []
         if loved:
@@ -317,32 +483,7 @@ def _taste_intro_html(
             groups.append(_taste_group("lower", "Sits lower", lower))
         single = " is-single" if len(groups) == 1 else ""
         parts.append(f'<div class="taste-groups{single}">{"".join(groups)}</div>')
-        if loved:
-            skip = " It skips what sits lower." if lower else ""
-            parts.append(
-                '<p class="taste-aside">A step outside is a nanogenre you have liked only once or twice.'
-                f"{skip}</p>"
-            )
-    elif paragraph:
-        parts.append(f'<p class="taste-lead">{html.escape(paragraph)}</p>')
-    if stats:
-        tiles = []
-        for label, value, caption, count in stats:
-            empty = " is-empty" if value == "—" else ""
-            count_html = f'<span>{html.escape(count)}</span>' if count else ""
-            tiles.append(
-                '<div class="taste-stat">'
-                f'<p class="taste-stat-label">{html.escape(label)}{count_html}</p>'
-                f'<p class="taste-stat-value{empty}">{html.escape(value)}</p>'
-                f'<p class="taste-stat-caption">{html.escape(caption)}</p>'
-                "</div>"
-            )
-        parts.append(f'<div class="taste-readout">{"".join(tiles)}</div>')
-        if caveats:
-            parts.append(f'<p class="taste-caveat">{html.escape(" ".join(caveats))}</p>')
-    elif note.strip():
-        parts.append(f'<p class="taste-note">{html.escape(note.strip())}</p>')
-    parts.append("</section>")
+    parts.append("</details>")
     return "".join(parts)
 
 
@@ -356,26 +497,23 @@ def format_taste_panel_html(
     loved: list[str] | None = None,
     lower: list[str] | None = None,
     loved_are_themes: bool = False,
+    availability: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     """Recommendations tab body and nav-pill links (without the Jump to label)."""
     known: frozenset[str] = frozenset()
-    sections: list[str] = [
-        _taste_intro_html(
-            paragraph,
-            note,
-            list(loved or []),
-            list(lower or []),
-            loved_are_themes=loved_are_themes,
-        )
-    ]
-    for section_id, title, sub, movies, row_class in (
-        ("see-first", "See this first", "The strongest prediction that clears the bar", see_first, "row-recommend"),
+    score_line = (
+        "Rating is Letterboxd's community score. "
+        "For you is the score this model expects from you."
+    )
+    blocks: list[tuple[str, str, str, list[Movie], str, bool]] = [
+        ("see-first", "See this first", score_line, see_first, "row-recommend", False),
         (
             "like-you",
             "More like what you love",
             "Close to directors, themes, and countries you rate highly",
             like_you,
             "row-recommend",
+            False,
         ),
         (
             "step-outside",
@@ -383,24 +521,43 @@ def format_taste_panel_html(
             "A nanogenre you have liked only once or twice",
             step_outside,
             "row-outside",
+            bool(see_first or like_you),
         ),
-    ):
-        if movies:
-            sections.append(
-                _html_table_section(
-                    section_id,
-                    title,
-                    sub,
-                    movies,
-                    known,
-                    row_class=row_class,
-                    show_predicted=True,
-                    show_follow_badge=False,
-                    show_because=False,
-                    because_in_detail=True,
-                )
-            )
-    if len(sections) == 1:
+    ]
+    primary: list[str] = []
+    outside: list[str] = []
+    for section_id, title, sub, movies, row_class, folded in blocks:
+        if not movies:
+            continue
+        if section_id == "like-you" and not see_first:
+            sub = score_line
+        table = _html_table_section(
+            section_id,
+            title,
+            sub,
+            movies,
+            known,
+            row_class=row_class,
+            show_predicted=True,
+            show_follow_badge=False,
+            show_because=False,
+            because_in_detail=True,
+            availability=availability,
+            start_folded=folded,
+        )
+        if section_id == "step-outside":
+            outside.append(table)
+        else:
+            primary.append(table)
+    taste = _taste_intro_html(
+        paragraph,
+        note,
+        list(loved or []),
+        list(lower or []),
+        loved_are_themes=loved_are_themes,
+    )
+    sections = primary + [taste] + outside
+    if not primary and not outside:
         sections.append('<p class="empty-hint">No film cleared the bar.</p>')
     panel = "\n".join(sections) + (
         '\n<p class="empty-hint" id="list-empty" hidden>No films match this search.</p>'
@@ -437,13 +594,15 @@ def format_account_html(
     following_user: str | None = None,
     letterboxd_avatar: str = "",
     vm: bool = False,
+    program_read_label: str = "",
+    recommendation_streams: list[dict[str, object]] | None = None,
 ) -> str:
     """The account page. Signed out, each tab asks for a Letterboxd username."""
     selected = list(DEFAULT_KNOWN_LANGUAGES if known_languages is None else known_languages)
     choices = list(language_options or selected)
     selected = canonical_languages(selected, choices)
     stats: list[str] = []
-    friends_label = "For friends"
+    friends_label = "Friends"
     if not signed_in:
         watchlist_panel = sign_in_card()
         taste_panel = sign_in_card()
@@ -452,12 +611,30 @@ def format_account_html(
         tagline = "Sign in with a Letterboxd username to see your watchlist and recommendations."
         tools_html = ""
     else:
-        body, count, streamable, at_nonstop = _watchlist_panel(
+        body, _count, _streamable, _at_nonstop = _watchlist_panel(
             letterboxd_user, stream_films, nonstop_next
         )
         watchlist_panel = body
-        watch_label = f"Watchlist ({count})" if count else "Watchlist"
-        taste_label = "Recommendations"
+        watch_label, taste_label = "Watchlist", "Recommendations"
+        availability: dict[str, str] | None = None
+        if see_first or like_you or step_outside:
+            streams = {
+                str(row.get("slug") or ""): row
+                for row in (recommendation_streams or [])
+                if isinstance(row, dict)
+            }
+            availability = {}
+            for movie in (*see_first, *like_you, *step_outside):
+                slug = (
+                    letterboxd_slug_from_url(movie.letterboxd_url)
+                    if movie.letterboxd_url
+                    else ""
+                )
+                if not slug or slug in availability:
+                    continue
+                record = streams.get(slug)
+                film = record if isinstance(record, dict) else {"checked": False, "offers": []}
+                availability[slug] = _availability_markup(film, nonstop_next.get(slug))
         taste_panel, pills = format_taste_panel_html(
             see_first=see_first,
             like_you=like_you,
@@ -467,6 +644,7 @@ def format_account_html(
             loved=loved,
             lower=lower,
             loved_are_themes=loved_are_themes,
+            availability=availability,
         )
         tagline = (
             f"@{letterboxd_user}'s Letterboxd watchlist, films picked for you, "
@@ -478,11 +656,6 @@ def format_account_html(
             '    <div id="gift-board"></div>\n'
             '    <p class="empty-hint" id="gift-empty" hidden>No films match.</p>'
         )
-        stats = [
-            f"<strong>{count}</strong> on your watchlist",
-            f"<strong>{streamable}</strong> streaming in Austria",
-            f"<strong>{at_nonstop}</strong> playing at Nonstop",
-        ]
         refresh_button = ""
         if not vm:
             refresh_button = (
@@ -490,6 +663,11 @@ def format_account_html(
                 "Refresh recommendations</button>\n"
             )
         tools_html = (
+            '      <button type="button" class="btn lang-chip" data-open-languages '
+            'aria-expanded="false" aria-controls="languages-panel" aria-haspopup="dialog" '
+            'title="Change the languages you follow">Languages: '
+            f'<strong id="lang-summary">{html.escape(", ".join(selected) or "English subtitles only")}</strong>'
+            "</button>\n"
             '      <div class="search-field" data-tools="watchlist recommendations for-friends">\n'
             '        <input type="search" id="search" placeholder="Filter your watchlist by title…" '
             'autocomplete="off" aria-describedby="search-count">\n'
@@ -542,6 +720,7 @@ def format_account_html(
         },
         scripts=("page.js", "shell.js"),
         styles=("base.css", "account.css"),
+        program_read_label=program_read_label,
         footer=(
             "Generated by goodmoviefinder. Ratings and themes from Letterboxd. "
             "Streaming in Austria from JustWatch."
